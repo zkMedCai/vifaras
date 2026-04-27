@@ -106,3 +106,57 @@ Motivazione: "Config morta è debt, non resilienza."
 - `sync_engine` (psycopg) → scaffold, Alembic, test.
 
 La coesistenza è intenzionale, non disordine. Documentata in docstring del modulo. Pattern unificato eventualmente in V1 se diventa fastidioso.
+
+---
+
+## DQ-8 — Placeholder valori per `attributes_*` a tier=0 (DECIDED)
+
+**Contesto.** La migration di task 2.1 (e25338f5705c) doveva permettere lo storage di utenti tier=0. Le 2 alter approvate dal founder (`ADD tier`, `DROP NOT NULL` su `nullifier_hash`) coprono `tier` e `nullifier_hash`. Ma `users.attributes_proven` / `attributes_verified_at` / `attributes_expires_at` restano `NOT NULL` per design dello scaffold §5 — e a tier=0 il Self proof non c'è ancora, quindi semanticamente questi campi non hanno valore "vero".
+
+Due strade:
+- (A) Estendere la migration a 5 alter (DROP NOT NULL anche su quei 3) → schema più "onesto" ma scope creep oltre la lista esplicita del founder.
+- (B) Mantenere lo schema invariato e mettere placeholder nei campi a tier=0 → 2 alter come da piano.
+
+**Decisione.** Strada (B). A tier=0 il `auth_service` popola:
+- `attributes_proven = {}` (dict vuoto)
+- `attributes_verified_at = NOW`
+- `attributes_expires_at = NOW + 1 day`
+
+Questi valori vengono **sovrascritti** in 2.3 quando arriva la verifica Self del proof. Sono placeholder, non semantica reale — non vanno mai letti come prova di qualcosa a tier=0.
+
+**Motivazione.**
+- Match con la lista esplicita del founder (2 alter).
+- Schema-purity meno importante della scope discipline in V0.
+- Il rischio è che qualcuno legga `attributes_verified_at` di un utente tier=0 e pensi "Self verificato" — mitigato dal docstring sul model + il check di tier= 0 prima di leggere.
+
+**Helper centrale.** `app/services/auth_service.py::_tier_0_attribute_placeholders(now)` è l'unico posto dove vengono generati. Se in futuro si vuole switchare alla strada (A), questo è il singolo punto di rimozione.
+
+---
+
+## DQ-9 — Email uniqueness app-level, non DB-level (DEFERRED → 2.2 o 7.x)
+
+**Contesto.** A tier=0, l'email è l'identificatore di login (visto che non c'è ancora `nullifier_hash`). Lo schema `users.notification_email` è `nullable=True` senza unique constraint. Il `auth_service.begin_registration` fa una check `select` prima di inserire — race condition possibile tra 2 begin/complete simultanei sulla stessa email.
+
+**Decisione (2026-04-27).** Per V0 accettiamo la race app-level. Mitigation:
+- Check ridondante anche in `complete_registration` (l'ultima difesa app-level).
+- Se serve hardening: aggiungere `CREATE UNIQUE INDEX ix_users_notification_email ON users (notification_email) WHERE notification_email IS NOT NULL` (partial unique). NULLs multipli sono OK perché Postgres tratta NULL ≠ NULL già.
+
+Da rivalutare se: si arriva a 100+ utenti registrati, oppure si aggiunge un job che pulisce duplicati. Tracciato ma non bloccante.
+
+---
+
+## DQ-10 — Test event loop scope = "session" (DECIDED)
+
+**Contesto.** I test async di 2.1 (httpx AsyncClient + ASGITransport) hanno cominciato a fallire sul secondo test consecutivo con `RuntimeError: Event loop is closed` durante teardown della connection. Causa: l'async engine di `app.core.db` ha un connection pool che persiste per la lifetime del modulo; le connessioni asyncpg si legano al loop in cui sono create; pytest-asyncio default dà un loop fresco per ogni test → connessioni pool create in test 1 sono morte quando test 2 prova a usarle.
+
+**Decisione.** `pyproject.toml [tool.pytest.ini_options]` setta:
+```toml
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+```
+
+Tutti i test async in una test run condividono lo stesso event loop. Il pool dell'engine è coerente.
+
+**Trade-off.** Niente parallelismo a livello di loop (pytest-xdist richiederebbe loop separati per worker — affrontabile in 7.x se il numero di test cresce). V0 single-process è OK.
+
+**Alternativa scartata.** `NullPool` sull'async engine in fase test: avrebbe richiesto override di `app.core.db` solo per test, fragile. Loop-scope=session è una linea di config.

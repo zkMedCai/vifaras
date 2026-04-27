@@ -233,7 +233,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 
 > **Importante**: l'onboarding non è più un flow unico, ma tre upgrade progressivi (vedi sezione 2.5). Ogni tier è un endpoint separato che si attiva solo quando serve.
 
-#### 🔲 2.1 Tier 0 — Anonymous onboarding (solo email + passkey)
+#### ✅ 2.1 Tier 0 — Anonymous onboarding (solo email + passkey)
 - `services/auth_service.py`
 - Endpoint `POST /api/auth/register/begin` riceve email, ritorna challenge WebAuthn
 - Endpoint `POST /api/auth/register/complete` verifica firma WebAuthn, crea user con `tier=0`, `nullifier_hash=NULL`

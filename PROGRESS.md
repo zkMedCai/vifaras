@@ -127,3 +127,58 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 2.1 Tier 0 — Anonymous onboarding (email + WebAuthn passkey). **Attendo via libera.**
 
 > **Promemoria del founder per 2.1**: la libreria Python `webauthn` ha helper per generare credentials sintetiche per i test (registrazione/verifica WebAuthn). Vale la pena guardare la docs della libreria *prima* di partire — il mocking sarà più pulito che rollare CBOR sintetici a mano.
+
+---
+
+## [2.1] tier 0 anonymous onboarding (email + passkey) — 2026-04-27
+
+### Cosa è stato fatto
+- **Migration `e25338f5705c_add_tier_and_relax_nullifier.py`**: 2 alter come da brief del founder.
+  - `ADD users.tier INTEGER NOT NULL DEFAULT 0` (`server_default=text("0")` → backfill automatico delle 3 righe seed esistenti a tier=0).
+  - `ALTER users.nullifier_hash DROP NOT NULL`.
+  - Niente partial-unique index: l'index esistente `ix_users_nullifier_hash` è un Postgres unique INDEX di colonna, NULLs sono trattati come distinti per default → multipli NULL OK senza modifiche. Verificato sul migration originale 5ef3a914c6e6.
+  - Docstring esplicito che ricapitola brief §2.5, semantica del backfill, e perché non si tocca l'unique index.
+- **`schema.py`** edit minimale: aggiunto `User.tier`, `nullifier_hash` ora `nullable=True`. Tutti gli altri campi invariati. Docstring del modello aggiornato per ricapitolare i tre tier.
+- **`pyproject.toml`**: aggiunto `pyjwt>=2.8`. Aggiunto `asyncio_default_fixture_loop_scope = "session"` + `asyncio_default_test_loop_scope = "session"` per evitare cross-loop pool errors sull'async engine (vedi DQ-10).
+- **`app/core/security.py`**: tre famiglie di JWT con `kind` claim distinto e TTL diversi:
+  - `create_access_token(user_id, tier)` — 15m, payload `{sub, tier, kind="access", iat, exp}`.
+  - `create_refresh_token(user_id)` — 30d, payload `{sub, kind="refresh", jti, iat, exp}`.
+  - `create_challenge_token(challenge, user_id, email, purpose)` — 5m, payload `{challenge_b64, user_id, email, purpose, kind="challenge", iat, exp}`. Stateless seam tra `/begin` e `/complete` — niente Redis, niente race conditions.
+  - `decode_*_token` controlla il `kind` e (per il challenge) il `purpose`.
+- **`app/services/auth_service.py`** — async pure, `select()`, niente `query()`. Quattro funzioni:
+  - `begin_registration(db, email)`: check email duplicata via `select(User).where(notification_email==email)`, genera `user_id` (uuid4), chiama `webauthn.generate_registration_options(user_verification=PREFERRED)`, ritorna `(options_json_dict, challenge_token)`.
+  - `complete_registration(db, credential, challenge_token)`: decodifica challenge token, chiama `verify_registration_response(require_user_verification=False)`, persiste `User(tier=0, nullifier_hash=None, attributes_*=placeholders DQ-8, passkey_credential_id=b64url(verified.credential_id), passkey_pubkey=b64url(verified.credential_public_key), passkey_sign_count=verified.sign_count)`, ritorna `(user_id, access, refresh)`.
+  - `begin_login(db, email)`: trova user, genera auth options con `allow_credentials=[user.passkey_credential_id]`, `user_verification=PREFERRED`, ritorna `(options, challenge_token)`.
+  - `complete_login(db, credential, challenge_token)`: decodifica token, trova user, `verify_authentication_response(credential_public_key=..., credential_current_sign_count=...)`, aggiorna `passkey_sign_count = verified.new_sign_count` e `last_active_at`, ritorna nuovi access+refresh.
+  - Errori: `EmailAlreadyRegistered` (409), `UserNotFound` (404), `InvalidCredential` (401), `InvalidChallengeToken` (401). Tutti subclass di `AuthError`.
+- **`app/api/auth.py`** — `APIRouter(prefix="/api/auth")` con 4 endpoint POST. Pydantic v2 schemas (`RegisterBeginRequest`, `RegisterCompleteRequest`, `LoginBeginRequest`, `LoginCompleteRequest`, `BeginResponse`, `TokenResponse`). Mapper `_to_http(AuthError) → HTTPException(http_status, {code, message})`. `Depends(get_db)` → AsyncSession. Wired in `main.py` via `app.include_router(auth_routes.router)`.
+- **`backend/tests/conftest.py`** — aggiunte 2 fixture:
+  - `async_db_session`: AsyncSession con `engine.connect()` + `transaction.begin()` + `join_transaction_mode="create_savepoint"`. Rollback al teardown.
+  - `http_client`: `httpx.AsyncClient(transport=ASGITransport(app=app))`. Override `app.dependency_overrides[get_db]` per yieldare la stessa `async_db_session` → reads dopo l'API call vedono ciò che l'API ha scritto, e il rollback teardown li wipa via.
+- **`backend/tests/test_auth.py`** — 2 test:
+  - `test_register_tier_0_returns_jwt_and_persists_anonymous_user`: monkeypatch `verify_registration_response` → fake `VerifiedRegistration`. POST `/begin` → POST `/complete`. Assert: User row con `tier==0`, **`nullifier_hash IS None`** (assertion critica del founder), `attributes_proven=={}`. JWT access decoda con `sub=user_id, tier=0, kind=access`. Refresh decoda con `kind=refresh, jti` non vuoto.
+  - `test_register_rejects_duplicate_email`: registra bob, poi prova un secondo `/begin` con stessa email → 409 con `detail.code == email_already_registered`.
+
+### Decisioni prese non esplicite nel brief
+- **DQ-8 — Placeholder per `attributes_*` a tier=0** invece di estendere la migration a 5 alter. Founder aveva listato 2 alter; ho mantenuto quella scope. `_tier_0_attribute_placeholders(now)` è l'unico posto dove i placeholder sono generati — pivot facile a migration estesa se in futuro si decide diversamente.
+- **DQ-9 — Email uniqueness app-level**, non DB-level. Check ridondante in `begin_registration` + `complete_registration`. Per V0 accettabile; partial-unique index suggerito in 2.2 o 7.x.
+- **DQ-10 — Loop scope session-wide nei test**. Cross-test pool stale connections risolte settando `asyncio_default_fixture_loop_scope=session` + `asyncio_default_test_loop_scope=session`. Niente parallelism a livello di loop (problematico se in futuro pytest-xdist).
+- **WebAuthn**: `user_verification='preferred'` (default lib + raccomandazione founder), `require_user_verification=False` sul verify (matcha "preferred", non "required"). Permette Touch ID consumer senza forzare biometric.
+- **Challenge stateless via JWT** invece di Redis/in-memory. Pattern: il challenge token è un JWT firmato con `kind=challenge, purpose=register|login` che il client rimanda al `/complete`. 5min TTL. Niente race condition, niente cleanup, multi-worker safe per quando arriveremo a CI/prod.
+- **`user_id` generato a `/register/begin`** (uuid4) e propagato via challenge token. Quando `/complete` crea il User, l'`id` è già noto e usato per il `sub` del JWT. La WebAuthn library accetta `user_id: bytes` come user handle — usiamo l'UUID stringa encoded in UTF-8.
+- **`b64url` encoding senza padding** per `passkey_credential_id` e `passkey_pubkey` storati come Text. Decodifica con padding restore per `verify_authentication_response(credential_public_key=...)`.
+- **EmailStr non usato**: Pydantic v2 `EmailStr` richiede `email-validator` extra. Per V0 uso `str` e validazione semantica delegata al WebAuthn / DB. Se in 2.x si vuole strict validation, basta `pip install email-validator` + flip a `EmailStr`.
+- **Test approach**: monkeypatch `verify_registration_response` al boundary invece di costruire un fake authenticator (CBOR/COSE). py-webauthn 2.7.1 non espone helper sintetici e ricostruirne uno è scope creep. Documentato in test docstring.
+
+### Test scritti / coverage
+- 4 test totali nel test suite ora: 2 mandate_verifier + 2 auth.
+- `pytest -v` → `4 passed in 6.00s` (~5s container+migration setup, ~1s i 4 test).
+- Coverage non misurata (target 80% in 2.6+; 2.1 chiedeva solo "test happy path + nullifier IS NULL").
+
+### Blocker / dubbi
+- **WebAuthn login flow non testato** (solo registration). 2.1 chiedeva esplicitamente "Test happy path + nullifier IS NULL" — login completo richiederebbe un fake `verify_authentication_response` su una sessione registrata. Lo aggiungo se vuoi, oppure quando 2.6 farà coverage completa MandateVerifier che rifletteremo anche su auth.
+- **JWT secret di default in `.env.example`** = "change-me-in-dev-and-always-rotate-in-prod". Per V0 dev OK. Per prod va rotato — promemoria pre-launch (7.4).
+- **Refresh token JTI non persistito**: V0 non ha revocation list. Refresh token rubato resta valido fino a `exp` (30d). Per V0 acceptabile; in V1 si aggiunge una `refresh_tokens` table o una blocklist per JTI revocati.
+
+### Prossima task
+2.2 Tier-based gating middleware (`require_tier(min_tier)` dependency, 402 Tier Upgrade Required, test su endpoint dummy con tutti e tre i tier). **Attendo via libera.**

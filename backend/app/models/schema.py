@@ -30,16 +30,26 @@ class User(Base):
     """
     L'utente è solo un nullifier + passkey.
     Niente nome, niente email obbligatoria, niente CF.
+
+    v1.1 (brief §2.5): tier-based onboarding posticipato.
+      tier=0 anonymous (email + passkey),
+      tier=1 identified (Self ZK proof verified),
+      tier=2 mandated (mandate signed, agent active).
+    nullifier_hash è nullable a tier=0, popolato a tier=1.
     """
     __tablename__ = "users"
-    
+
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
-    
-    # Identità ZK
-    nullifier_hash = Column(Text, unique=True, nullable=False, index=True)
-    
+
+    # Tier corrente di onboarding. Monotonicamente crescente: 0 → 1 → 2.
+    tier = Column(Integer, nullable=False, default=0)
+
+    # Identità ZK (popolato a tier ≥ 1)
+    nullifier_hash = Column(Text, unique=True, nullable=True, index=True)
+
     # Attributi dimostrati via Self (selective disclosure)
     # Solo flag, mai dati personali. Es: {"adult": true, "country": "IT", "valid": true}
+    # A tier=0 viene popolato con placeholder ({}, NOW, NOW+1d). Sovrascritto a tier=1.
     attributes_proven = Column(JSONB, nullable=False)
     attributes_verified_at = Column(DateTime, nullable=False)
     attributes_expires_at = Column(DateTime, nullable=False)  # = scadenza documento

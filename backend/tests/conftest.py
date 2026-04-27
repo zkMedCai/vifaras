@@ -107,6 +107,62 @@ def db_session(_pg_container: PostgresContainer) -> Iterator[Any]:
 
 
 # ---------------------------------------------------------------------------
+# Async DB session + FastAPI httpx client (for endpoint tests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def async_db_session(_pg_container: PostgresContainer):
+    """Async equivalent of `db_session`: outer transaction + savepoint commits.
+
+    Use this in endpoint tests via the `http_client` fixture, which overrides
+    the FastAPI `get_db` dependency to yield this same session — so reads
+    after the API call see what the API wrote, and rollback on teardown
+    wipes everything.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.core.db import engine
+
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        try:
+            async with AsyncSession(
+                bind=connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            ) as session:
+                yield session
+        finally:
+            await transaction.rollback()
+
+
+@pytest.fixture
+async def http_client(async_db_session):
+    """httpx AsyncClient wired into the FastAPI app via ASGITransport.
+
+    Overrides `get_db` so the API uses the same `async_db_session` as the test.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from app.core.db import get_db
+    from app.main import app
+
+    async def _override_get_db():
+        yield async_db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            yield client
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+# ---------------------------------------------------------------------------
 # Mock: Anthropic client (canned responses)
 # ---------------------------------------------------------------------------
 
