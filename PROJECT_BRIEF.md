@@ -218,7 +218,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - `backend/app/main.py` con FastAPI app + healthcheck endpoint
 - Configurazione logging strutturato (structlog → JSON)
 
-#### 🔲 1.2 Migrazioni database
+#### ✅ 1.2 Migrazioni database
 - Setup Alembic
 - Prima migration che crea tutto lo schema da `models/schema.py`
 - Script `scripts/seed_dev.py` con: 3 utenti finti, 5 intent (mix BUY/SELL), 1 match potenziale
