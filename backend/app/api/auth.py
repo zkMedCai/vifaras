@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 class RegisterBeginRequest(BaseModel):
-    email: str
+    email: EmailStr
 
 
 class RegisterCompleteRequest(BaseModel):
@@ -23,7 +23,7 @@ class RegisterCompleteRequest(BaseModel):
 
 
 class LoginBeginRequest(BaseModel):
-    email: str
+    email: EmailStr
 
 
 class LoginCompleteRequest(BaseModel):

@@ -162,6 +162,43 @@ async def http_client(async_db_session):
         app.dependency_overrides.pop(get_db, None)
 
 
+@pytest.fixture
+async def authenticated_client(http_client):
+    """Factory fixture: `authenticated_client(tier=N)` → (client, ctx).
+
+    Mints a fresh JWT access token at the requested tier and installs it as
+    `Authorization: Bearer ...` on the shared `http_client`. Skips the full
+    register/login dance — `require_tier` decodes the JWT only, no DB touch.
+
+    Returns the same `http_client` (auth header now set) plus a context
+    dict `{user_id, tier, access_token}`. Auth header is removed at fixture
+    teardown so the next test starts clean.
+
+    For tests that need a real registered user (e.g. login coverage), do
+    the registration explicitly inside the test — this fixture is for the
+    common case of "I just need a valid JWT at tier N".
+    """
+    import uuid as _uuid
+
+    from app.core.security import create_access_token
+
+    def _factory(tier: int = 0, user_id: str | None = None) -> tuple[Any, dict[str, Any]]:
+        if user_id is None:
+            user_id = str(_uuid.uuid4())
+        token = create_access_token(user_id=user_id, tier=tier)
+        http_client.headers["Authorization"] = f"Bearer {token}"
+        return http_client, {
+            "user_id": user_id,
+            "tier": tier,
+            "access_token": token,
+        }
+
+    try:
+        yield _factory
+    finally:
+        http_client.headers.pop("Authorization", None)
+
+
 # ---------------------------------------------------------------------------
 # Mock: Anthropic client (canned responses)
 # ---------------------------------------------------------------------------

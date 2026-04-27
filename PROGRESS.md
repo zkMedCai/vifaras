@@ -182,3 +182,59 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 
 ### Prossima task
 2.2 Tier-based gating middleware (`require_tier(min_tier)` dependency, 402 Tier Upgrade Required, test su endpoint dummy con tutti e tre i tier). **Attendo via libera.**
+
+---
+
+## [2.2] tier-based gating + login test + auth fixtures — 2026-04-27
+
+### Cosa è stato fatto
+
+**Pre-cleanup richiesto in review** (pulizia prima del lavoro 2.2):
+- `_tier_0_attribute_placeholders` docstring estesa: spiega esplicitamente che i valori sono **sentinel, non significato** (DQ-8 aggiornata di conseguenza). Bias futuro: chi legge `attributes_proven={}` su utente tier=0 capisce subito che è "nessuna proof" e non "user provò set vuoto".
+- `_normalize_email(email) = email.strip().lower()` aggiunto come prima istruzione di `begin_registration` e `begin_login` di `auth_service`. `User@gmail.com` e `user@gmail.com` collassano alla stessa identità prima del lookup.
+- `email-validator>=2.1` aggiunto a deps. `RegisterBeginRequest.email` e `LoginBeginRequest.email` ora `EmailStr` (Pydantic v2). Validazione RFC 5322 al boundary, 422 automatico su input malformato.
+  - Side-effect: `email-validator` rifiuta TLD reserved `.test/.invalid/.local` per default. Test e seed migrati da `@example.test` → `@example.com`. Documentato.
+- DQ-8 e DQ-9 di `DESIGN_QUESTIONS.md` aggiornate (sentinel docstring esplicitato, normalizzazione email + threshold 7.4 in DQ-9).
+- Brief §7.4 esteso con 4 item nuovi:
+  - Email uniqueness DB-level (partial unique index su `lower(notification_email)`), trigger ~1k+ utenti.
+  - Refresh token revocation list (DB table o Redis blocklist), trigger ~500 utenti.
+  - JWT_SECRET rotation strategy (rolling key + `kid` claim), 2-3h di lavoro.
+  - Verify lowercase email normalization è applicata ovunque (defensive grep).
+
+**Implementazione 2.2:**
+- `backend/app/core/security.py` — aggiunto `CurrentUser` dataclass (frozen, solo `user_id` + `tier` — niente DB hit), e `require_tier(min_tier: int)` factory. Comportamento:
+  - Authorization header missing → 401 `missing_token`.
+  - Header malformato → 401 `invalid_authorization_header`.
+  - Token expired → 401 `token_expired` (ramo `jwt.ExpiredSignatureError`).
+  - Token invalido (kind mismatch, signature non valida, claims missing) → 401 `invalid_token`.
+  - Tier insufficiente → **402** `tier_upgrade_required` con `{required_tier, current_tier, next_step}`.
+  - `_NEXT_STEP_BY_TIER` static map: 0→`/api/identity/verify-self` (con copy mobile italiana brief §2.5), 1→`/api/mandates/draft`. Niente entry per tier=2 (è il tetto).
+  - 401 vs 402 sono failure class diverse: invalid/expired ≠ insufficient (esplicito da founder).
+- `backend/app/api/_test_endpoints.py` — `APIRouter(prefix="/api/_test")` con 3 GET (`/tier0`, `/tier1`, `/tier2`) ognuno guardato da `Depends(require_tier(N))`. Registrazione condizionale a `settings.app_env == "dev"` — in prod il router è vuoto e gli endpoint non esistono. Wired in `main.py`.
+- `backend/tests/conftest.py` — aggiunta fixture `authenticated_client` (factory pattern). Mint diretto di JWT via `create_access_token(user_id, tier)`, set su `http_client.headers["Authorization"]`. Niente registrazione/DB user — il gating decoda solo il JWT, non legge il DB. Cleanup: header rimosso al teardown della fixture.
+- `backend/tests/test_auth.py` — 2 test aggiunti:
+  - `test_login_flow_returns_valid_jwt` (recovery del lavoro non testato di 2.1): register → login → assert JWT con `kind=access, tier=0, sub=user_id_registered`.
+  - `test_email_normalization_lowercase_strip`: registra "  Dario@Example.COM" → user salvato come "dario@example.com" → secondo register con "dario@example.com" → 409 (gli equivalenti collassano).
+- `backend/tests/test_tier_gating.py` (nuovo) — 10 test:
+  - tier=0 user passa `/tier0` (200), bloccato su `/tier1` e `/tier2` (402 con next_step `/api/identity/verify-self`).
+  - tier=1 user passa `/tier0` e `/tier1` (200), bloccato su `/tier2` (402 con next_step `/api/mandates/draft`).
+  - tier=2 user passa tutti e tre (200).
+  - 4 failure modes su token: missing → 401 `missing_token`; malformed header → 401 `invalid_authorization_header`; garbage JWT → 401 `invalid_token`; **refresh token usato come access → 401 `invalid_token`** (verifica esplicita del kind discriminator).
+
+### Decisioni prese non esplicite nel brief / aggiornamenti
+- **EmailStr rifiuta `.test/.invalid/.local`**: scoperto runtime, non spec esplicita. Migrazione test+seed a `@example.com` (RFC 2606 reserved-for-docs ma valid syntax). Trade-off accettato: il dev seed ora usa email "real-looking" che però non hanno destinazione SMTP reale. Non blocker — V0 non manda email reali.
+- **`authenticated_client(tier=N)` mint diretto via JWT** invece di register-via-API + DB tier-patch. Il gating decoda solo il JWT (no DB read), quindi si può saltare l'overhead di registrazione. Test gating sono ~10ms invece di ~200ms ciascuno. Per test che richiedono User row reale (login coverage) si fa register inline.
+- **Cross-kind reuse test (`test_refresh_token_used_as_access_returns_401`)**: aggiunto come verifica esplicita che il `kind` claim discriminator funzioni. Founder ha ribadito nella review che è un guard importante — meglio un test specifico che fallisce subito se qualcuno per errore svedasse il claim.
+- **`/api/_test/tier{0,1,2}` esiste solo in env=dev**: registrazione condizionale al module level. In test (`app_env="dev"` di default) le route ci sono. In prod (env=prod) le route non vengono registrate, niente discovery via OpenAPI. Pattern leggero, niente flag complicato.
+
+### Test scritti / coverage
+- 16 test totali ora: 4 auth (register+login+normalization+duplicate), 2 mandate_verifier, 10 tier gating.
+- `pytest -v` → `16 passed in 6.11s` (~5s container+migration setup, ~1s i 16 test).
+- Coverage non misurata; target 80% in 2.6+.
+
+### Blocker / dubbi
+- **Rate-limiting su `/login/begin`**: nessuno V0. Un attaccante può enumerare email valide misurando 200 vs 404 (`UserNotFound` ritorna 404 non 401). Trade-off: leakage email-existence per UX (user typo → "email not found" sensato). Aggiungo a brief 7.1 (Rate limiting & abuse) come item esplicito.
+- **`refresh` endpoint non implementato**: 2.1 ha emesso refresh token ma non c'è `/api/auth/refresh` per swappare refresh→nuovo access. Brief 2.1 chiede solo "JWT session 15 min + refresh token", interpretato come "emit refresh, consumption later". Potrebbe servire in 2.5 (step-up) o quando il client mobile inizia a fare richieste reali. Da chiarire al primo bisogno.
+
+### Prossima task
+2.3 Tier 1 — Identity upgrade via Self Protocol. **Attendo brief esteso (Self provider decision, mock structure, atomic 0→1 transition) prima di partire.**

@@ -241,7 +241,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - JWT session 15 min + refresh token
 - Test: utente tier=0 può autenticarsi e ricevere JWT valido
 
-#### 🔲 2.2 Tier-based gating middleware
+#### ✅ 2.2 Tier-based gating middleware
 - `core/security.py` con dependency FastAPI `require_tier(min_tier: int)`
 - Quando tier insufficiente → solleva `HTTPException(402, detail={"required_tier": N, "next_step": "..."})`
 - Test: gating funziona su endpoint dummy con tutti i tre tier
@@ -379,6 +379,10 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - Backup DB automatico
 - Disaster recovery plan minimo
 - Soft launch con 5-10 amici prima della prima cohort
+- **Email uniqueness DB-level** (DQ-9): `CREATE UNIQUE INDEX ix_users_email_unique ON users (lower(notification_email)) WHERE notification_email IS NOT NULL`. Trigger ~1k+ utenti.
+- **Refresh token revocation list** (DB table o Redis blocklist per `jti` revocati). Trigger ~500 utenti registrati. 30gg di refresh non revocabile è acceptable V0, inacceptable launch.
+- **JWT_SECRET rotation strategy**: rolling key con `kid` claim. 2-3 ore di lavoro stimate. Rotate il secret default `change-me-in-dev-...` pre-launch.
+- **Verify email-normalization applicata ovunque** (defensive grep su `email.lower()` / `_normalize_email`). Aggiunto in 2.2 al boundary `auth_service`; controllare che future feature non bypassino.
 
 ---
 

@@ -129,7 +129,7 @@ Questi valori vengono **sovrascritti** in 2.3 quando arriva la verifica Self del
 - Schema-purity meno importante della scope discipline in V0.
 - Il rischio è che qualcuno legga `attributes_verified_at` di un utente tier=0 e pensi "Self verificato" — mitigato dal docstring sul model + il check di tier= 0 prima di leggere.
 
-**Helper centrale.** `app/services/auth_service.py::_tier_0_attribute_placeholders(now)` è l'unico posto dove vengono generati. Se in futuro si vuole switchare alla strada (A), questo è il singolo punto di rimozione.
+**Helper centrale.** `app/services/auth_service.py::_tier_0_attribute_placeholders(now)` è l'unico posto dove vengono generati. Il suo docstring spiega esplicitamente che i valori sono **sentinel, non significato** (es. `attributes_proven={}` non significa "user provò un set vuoto", significa "nessuna proof ancora"). Se in futuro si vuole switchare alla strada (A), questo è il singolo punto di rimozione.
 
 ---
 
@@ -139,9 +139,8 @@ Questi valori vengono **sovrascritti** in 2.3 quando arriva la verifica Self del
 
 **Decisione (2026-04-27).** Per V0 accettiamo la race app-level. Mitigation:
 - Check ridondante anche in `complete_registration` (l'ultima difesa app-level).
-- Se serve hardening: aggiungere `CREATE UNIQUE INDEX ix_users_notification_email ON users (notification_email) WHERE notification_email IS NOT NULL` (partial unique). NULLs multipli sono OK perché Postgres tratta NULL ≠ NULL già.
-
-Da rivalutare se: si arriva a 100+ utenti registrati, oppure si aggiunge un job che pulisce duplicati. Tracciato ma non bloccante.
+- `_normalize_email(email) = email.strip().lower()` chiamato come prima istruzione di ogni public function `auth_service` che riceve email — così `User@gmail.com` e `user@gmail.com` collassano alla stessa identità prima del lookup.
+- Tracciato come item di brief §7.4 (pre-launch checklist). Threshold: ~1k+ utenti, dove la race condition diventa statisticamente probabile. Migration prevista: `CREATE UNIQUE INDEX ix_users_email_unique ON users (lower(notification_email)) WHERE notification_email IS NOT NULL` (partial unique, lower-case). NULLs multipli OK (Postgres NULL ≠ NULL).
 
 ---
 

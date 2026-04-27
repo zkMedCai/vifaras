@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from app.api import auth as auth_routes
+from app.api import _test_endpoints, auth as auth_routes
 from app.core.config import settings
 from app.core.db import engine
 from app.core.logging import configure_logging, log
@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(auth_routes.router)
+app.include_router(_test_endpoints.router)
 
 
 @app.get("/health")

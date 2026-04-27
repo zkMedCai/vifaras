@@ -91,16 +91,40 @@ def _b64url_decode(data: str) -> bytes:
 
 
 def _tier_0_attribute_placeholders(now: datetime) -> dict[str, Any]:
-    """Tier=0 users have no Self proof yet; fields are NOT NULL by schema design.
+    """Sentinel values for the schema's NOT NULL Self-attributes columns at tier=0.
 
-    Values here are placeholders; they are overwritten in 2.3 when the Self
-    ZK proof verification lands. See DESIGN_QUESTIONS DQ-8.
+    These are NOT meaningful data — they exist only to satisfy the existing
+    NOT NULL constraints on `attributes_proven` / `attributes_verified_at` /
+    `attributes_expires_at`, which were designed for tier=1+ users with a real
+    Self ZK proof. At tier=0 there is no proof yet, so:
+
+      - `attributes_proven={}` — read as "nothing proven", NOT as "user proved
+        an empty set of attributes".
+      - `attributes_verified_at=NOW` — placeholder timestamp, NOT the time of
+        any real attribute verification.
+      - `attributes_expires_at=NOW+1d` — placeholder; treats the placeholder
+        cluster as "stale by tomorrow" so any accidental tier=0 read of these
+        fields will at least look obviously suspicious to a debugger.
+
+    All three are overwritten with real values in 2.3 (Self verification),
+    which is the only place a downstream service should treat them as data.
+    Until then, gating must check `User.tier` first.
+
+    See DESIGN_QUESTIONS DQ-8 for the rationale of placeholder vs schema
+    relax (5-alter migration was rejected to keep scope at 2 alters).
     """
     return {
         "attributes_proven": {},
         "attributes_verified_at": now,
         "attributes_expires_at": now + timedelta(days=1),
     }
+
+
+def _normalize_email(email: str) -> str:
+    """Lower-case + strip whitespace. Always called at the service boundary
+    so `User@gmail.com` and `user@gmail.com` collapse to the same identity
+    before any DB lookup or insert."""
+    return email.strip().lower()
 
 
 async def _email_taken(db: AsyncSession, email: str) -> bool:
@@ -119,6 +143,7 @@ async def begin_registration(
     db: AsyncSession, *, email: str
 ) -> tuple[dict[str, Any], str]:
     """Return WebAuthn registration options + a stateless challenge token."""
+    email = _normalize_email(email)
     if await _email_taken(db, email):
         raise EmailAlreadyRegistered(email)
 
@@ -210,6 +235,7 @@ async def complete_registration(
 async def begin_login(
     db: AsyncSession, *, email: str
 ) -> tuple[dict[str, Any], str]:
+    email = _normalize_email(email)
     user = await db.scalar(
         select(User).where(User.notification_email == email)
     )

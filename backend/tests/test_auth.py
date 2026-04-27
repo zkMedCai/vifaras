@@ -58,7 +58,7 @@ async def test_register_tier_0_returns_jwt_and_persists_anonymous_user(
     # /register/begin — receive options + challenge token
     begin = await http_client.post(
         "/api/auth/register/begin",
-        json={"email": "alice@example.test"},
+        json={"email": "alice@example.com"},
     )
     assert begin.status_code == 200
     begin_body = begin.json()
@@ -83,7 +83,7 @@ async def test_register_tier_0_returns_jwt_and_persists_anonymous_user(
 
     # User row is tier=0 with NO nullifier (the founder's critical assertion)
     user = await async_db_session.scalar(
-        select(User).where(User.notification_email == "alice@example.test")
+        select(User).where(User.notification_email == "alice@example.com")
     )
     assert user is not None
     assert user.id == body["user_id"]
@@ -116,7 +116,7 @@ async def test_register_rejects_duplicate_email(
     # First registration — succeeds
     begin1 = await http_client.post(
         "/api/auth/register/begin",
-        json={"email": "bob@example.test"},
+        json={"email": "bob@example.com"},
     )
     assert begin1.status_code == 200
     complete1 = await http_client.post(
@@ -131,7 +131,103 @@ async def test_register_rejects_duplicate_email(
     # Second begin with the same email — 409 at /begin (early reject)
     begin2 = await http_client.post(
         "/api/auth/register/begin",
-        json={"email": "bob@example.test"},
+        json={"email": "bob@example.com"},
     )
     assert begin2.status_code == 409
     assert begin2.json()["detail"]["code"] == "email_already_registered"
+
+
+@pytest.mark.db
+async def test_login_flow_returns_valid_jwt(
+    http_client, async_db_session, monkeypatch
+) -> None:
+    """register → login → JWT access carries (sub=user_id, tier=0, kind=access).
+
+    Recovery of the login coverage that was wired but not tested in 2.1.
+    Founder asked to add this in 2.2 since the gating tests rely implicitly
+    on the same JWT-mint path.
+    """
+    monkeypatch.setattr(
+        "app.services.auth_service.verify_registration_response",
+        lambda **_: _fake_verified_registration(),
+    )
+    monkeypatch.setattr(
+        "app.services.auth_service.verify_authentication_response",
+        lambda **_: SimpleNamespace(new_sign_count=1),
+    )
+    email = "carol@example.com"
+
+    # Register
+    begin_r = await http_client.post(
+        "/api/auth/register/begin", json={"email": email}
+    )
+    assert begin_r.status_code == 200
+    complete_r = await http_client.post(
+        "/api/auth/register/complete",
+        json={
+            "credential": _fake_credential_payload(),
+            "challenge_token": begin_r.json()["challenge_token"],
+        },
+    )
+    assert complete_r.status_code == 200
+    user_id = complete_r.json()["user_id"]
+
+    # Login with same email
+    begin_l = await http_client.post(
+        "/api/auth/login/begin", json={"email": email}
+    )
+    assert begin_l.status_code == 200
+    assert "options" in begin_l.json()
+    complete_l = await http_client.post(
+        "/api/auth/login/complete",
+        json={
+            "credential": _fake_credential_payload(),
+            "challenge_token": begin_l.json()["challenge_token"],
+        },
+    )
+    assert complete_l.status_code == 200
+    body = complete_l.json()
+    assert body["user_id"] == user_id
+
+    payload = decode_access_token(body["access_token"])
+    assert payload["sub"] == user_id
+    assert payload["tier"] == 0
+    assert payload["kind"] == "access"
+
+
+@pytest.mark.db
+async def test_email_normalization_lowercase_strip(
+    http_client, async_db_session, monkeypatch
+) -> None:
+    """Mixed-case + whitespace registration collapses to one canonical user."""
+    monkeypatch.setattr(
+        "app.services.auth_service.verify_registration_response",
+        lambda **_: _fake_verified_registration(),
+    )
+    # Register with weird casing + leading whitespace
+    begin1 = await http_client.post(
+        "/api/auth/register/begin",
+        json={"email": "  Dario@Example.COM"},
+    )
+    assert begin1.status_code == 200
+    complete1 = await http_client.post(
+        "/api/auth/register/complete",
+        json={
+            "credential": _fake_credential_payload(),
+            "challenge_token": begin1.json()["challenge_token"],
+        },
+    )
+    assert complete1.status_code == 200
+
+    # User stored as the normalized form
+    user = await async_db_session.scalar(
+        select(User).where(User.notification_email == "dario@example.com")
+    )
+    assert user is not None
+
+    # Second registration with canonical form is rejected as duplicate
+    begin2 = await http_client.post(
+        "/api/auth/register/begin",
+        json={"email": "dario@example.com"},
+    )
+    assert begin2.status_code == 409

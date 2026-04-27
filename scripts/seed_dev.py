@@ -70,7 +70,7 @@ USER_LABELS = ("alice", "bob", "carol")
 USERS = [
     {
         "label": label,
-        "notification_email": f"{label}+seed@example.test",
+        "notification_email": f"{label}+seed@example.com",
     }
     for label in USER_LABELS
 ]
