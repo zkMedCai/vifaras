@@ -223,7 +223,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - Prima migration che crea tutto lo schema da `models/schema.py`
 - Script `scripts/seed_dev.py` con: 3 utenti finti, 5 intent (mix BUY/SELL), 1 match potenziale
 
-#### 🔲 1.3 Test infrastructure
+#### ✅ 1.3 Test infrastructure
 - Fixture pytest per DB di test (SQLite in-memory)
 - Fixture per Anthropic client mockato (response canned)
 - Fixture per Self Protocol verifier mockato

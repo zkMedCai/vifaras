@@ -86,3 +86,44 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 
 ### Prossima task
 1.3 Test infrastructure (fixture pytest per DB di test, mock Anthropic, mock Self verifier, smoke test MandateVerifier). **Attendo via libera.**
+
+---
+
+## [1.3] Test infrastructure + mandate_verifier smoke tests — 2026-04-27
+
+### Cosa è stato fatto
+- **`pyproject.toml`**: aggiunto `testcontainers[postgres]>=4.0` ai dev deps. Registrato il marker `db` in `[tool.pytest.ini_options].markers`. Aggiunto `filterwarnings` per silenziare i `datetime.utcnow()` deprecation e i warning su `Query is being used as a legacy interface` — entrambi vengono dallo scaffold §5 che, per direttiva del founder, non riscriviamo.
+- **`backend/tests/conftest.py`**:
+  - `_pg_container` fixture session-scoped **lazy**: parte solo se un test richiede `db_session`. Booota `pgvector/pgvector:pg16`, setta `POSTGRES_*` env vars **prima** di importare `app.core.db` (engine creati con la URL del container, non con default localhost), runna `alembic upgrade head` una volta. Stop al session teardown.
+  - `db_session` fixture function-scoped: `connection.begin()` esterna + `Session(bind=connection, join_transaction_mode="create_savepoint")`. Rollback al teardown → zero state leak tra test.
+  - `anthropic_mock` factory fixture: `FakeAnthropicClient` con coda di `SimpleNamespace` canned, mimica `client.messages.create()` con `.content`/`.stop_reason`. Helper `text_block`, `tool_use_block`, `_make_message` esposti come attributi della factory. Pair col costruttore `AgentOrchestrator(db, anthropic_client=fake)` (l'orchestrator già accetta client iniettato — niente monkeypatch necessario).
+  - `self_verifier_mock` placeholder fixture: stand-in per il futuro `app.services.identity_service` (task 2.3). Espone `set_response()`, `calls`, `fake_post()` shape `httpx.Response`. Quando 2.3 atterra, il monkeypatch verrà fatto sul callsite reale.
+- **`backend/tests/test_mandate_verifier.py`**:
+  - `test_mandate_verifier_happy_path`: User+Agent+Mandate creati da factory inline, mandate.scope.allowed_actions include `send_offer`, max_price_per_deal_eur=€100. `verifier.authorize(agent.id, "send_offer", {"price_cents": 5000})` → ritorna il mandate (id confronto).
+  - `test_mandate_verifier_limit_exceeded`: stesso setup ma `max_price_per_deal_eur=€200`, chiamata con `price_cents=200_000` (€2000). Si aspetta `LimitExceeded`. Verifica anche che `record_usage()` NON sia stato chiamato sul rejection path: `mandate.spent_today_eur` invariato + nessuna riga `audit_log` con `success=True` per quell'`agent_id`.
+  - Entrambi marcati `@pytest.mark.db`. Helper di factory inline al file (non in conftest) — solo 2 test in 1.3, generalizzazione prematura.
+- **`DESIGN_QUESTIONS.md` creato a root del repo**: 7 voci che documentano le decisioni del founder fin qui. DQ-1 (legacy ↔ §7), DQ-2 (testcontainers > SQLite), DQ-3 (vector index → 4.3), DQ-4 (/ready → 7.x), DQ-5 (hard limits in services, non config), DQ-6 (no DROP EXTENSION), DQ-7 (doppio engine sync+async).
+
+### Decisioni prese non esplicite nel brief
+- **Container lazy invece di `pytest_configure`**: la prima implementazione bootava il container in `pytest_configure`, il che faceva pagare ~6s anche a `pytest -m "not db"`. Refactorato in fixture `_pg_container` session-scoped + `db_session` che la richiede. Ora `pytest -m "not db"` colleziona istantaneamente senza container. Costo: dipendenza esplicita da `_pg_container` su `db_session` (non un problema, la fixture chain pytest la risolve normalmente).
+- **Helpers di factory inline a `test_mandate_verifier.py`** invece di `backend/tests/factories.py`. Per 2 test l'estrazione sarebbe overhead. Quando 2.6 (test completo MandateVerifier) o 4.x avranno bisogno di factories riusate da più moduli, le promuovo allora.
+- **`filterwarnings` via pyproject** per le deprecation dello scaffold: il founder ha esplicitamente suggerito questa strada. Documentato in DQ-1.
+- **Eccezione SQLite-style** documentata in conftest e DQ-2: per test puramente computazionali (es. `_extract_country`, `_extract_price_eur`), niente fixture/container, plain `def test_xxx(): ...`. Da usare quando arriverà il caso (probabilmente 2.6).
+- **`session.commit()` test-side ≡ savepoint release** grazie a `join_transaction_mode="create_savepoint"`. Significa che il `MandateVerifier._reset_daily_counters_if_needed` può chiamare `db.commit()` senza compromettere l'isolation del test — l'outer transaction rolla back comunque a teardown.
+
+### Test scritti / coverage
+- `backend/tests/test_mandate_verifier.py`: 2 test, entrambi PASS.
+- `pytest -v` → `2 passed in 6.05s` (di cui ~5s container boot + alembic upgrade, ~50ms i due test).
+- `pytest -m "not db" --collect-only` → 0 collected, container non bootato.
+- `pytest -m db --collect-only` → 2 collected.
+- Coverage non misurata in 1.3 (target 80% sui service / 100% su mandate_verifier è obiettivo di 2.6, non di 1.3 che chiede solo "1 smoke test").
+
+### Blocker / dubbi
+- **`testcontainers` 4.x in CI**: localmente Docker è disponibile come daemon. In CI servirà un runner con Docker-in-Docker o socket Docker mounted. Non blocker per V0 dev locale, da affrontare quando si imposta CI in 7.x.
+- **First-run lentezza**: ~5s di boot container + alembic. Su 100+ test (futuri) il costo è amortizzato. Su pochi test è percepibile ma accettabile. Se diventa fastidioso, opzioni: (1) container always-on shared con dev (Postgres su 5432), (2) setup Postgres esterno via env var override.
+- **`db_session.refresh(mandate)` post-LimitExceeded**: nel verifier `_check_limits` non c'è side effect prima del raise (per il caso per-deal cap; daily/total cap leggono `mandate.spent_today_eur` ma non lo modificano). Test verifica che lo state non sia stato sporcato. OK.
+
+### Prossima task
+2.1 Tier 0 — Anonymous onboarding (email + WebAuthn passkey). **Attendo via libera.**
+
+> **Promemoria del founder per 2.1**: la libreria Python `webauthn` ha helper per generare credentials sintetiche per i test (registrazione/verifica WebAuthn). Vale la pena guardare la docs della libreria *prima* di partire — il mocking sarà più pulito che rollare CBOR sintetici a mano.
