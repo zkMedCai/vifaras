@@ -209,7 +209,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 
 ### FASE 1 — Foundations
 
-#### 🔲 1.1 Setup progetto
+#### ✅ 1.1 Setup progetto
 - `pyproject.toml` con dipendenze: fastapi, uvicorn, sqlalchemy>=2.0, pydantic>=2, anthropic, openai, pgvector, alembic, webauthn, structlog, pytest, pytest-asyncio, httpx, apscheduler
 - `.env.example` con tutte le variabili
 - `docker-compose.yml` con Postgres 15 + pgvector per dev locale
