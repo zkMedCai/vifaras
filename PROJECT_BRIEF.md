@@ -267,7 +267,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - Endpoint `POST /api/step-up/{action_id}/sign` per confermare azione step-up
 - Funzione `resume_pending_action(action_id, signature)` che riprende l'azione dell'agente in attesa
 
-#### 🔲 2.6 Test completo MandateVerifier
+#### ✅ 2.6 Test completo MandateVerifier
 - Coverage 100% di `mandate_verifier.py`
 - Casi: scope ok/ko, limit hit, step-up trigger, expired, revoked, daily reset, tier insufficiente
 

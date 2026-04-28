@@ -257,3 +257,146 @@ def fake_assertion_payload() -> dict[str, Any]:
             "userHandle": "factory-user-handle",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Granular sync factories (for `mandate_verifier` tests — task 2.6)
+# ---------------------------------------------------------------------------
+#
+# Pattern: one factory per entity, with surgical override kwargs. Test
+# bodies compose them — no all-or-nothing setup that obscures intent.
+
+
+from decimal import Decimal
+
+
+def make_user_sync(
+    db,
+    *,
+    tier: int = 2,
+    status: str = "active",
+    email: str | None = None,
+    label: str | None = None,
+) -> User:
+    """Insert a User row at the requested tier. Sync session."""
+    user_id = str(uuid.uuid4())
+    label = label or user_id[:8]
+    email = email or f"factory-{label}@example.com"
+
+    kwargs = default_user_kwargs(tier=tier, email=email)
+    kwargs["status"] = status
+    user = User(id=user_id, **kwargs)
+    db.add(user)
+    db.flush()
+    return user
+
+
+def make_agent_sync(
+    db,
+    *,
+    user: User,
+    status: str = "active",
+    label: str | None = None,
+) -> Agent:
+    """Insert an Agent row owned by `user`. Sync session."""
+    agent_id = str(uuid.uuid4())
+    label = label or agent_id[:8]
+    agent = Agent(
+        id=agent_id,
+        user_id=user.id,
+        name=f"Factory {label}",
+        pubkey=f"factory-pubkey-{label}",
+        privkey_kms_ref=f"file:.secrets/agent_keys/{agent_id}.json",
+        status=status,
+        created_at=datetime.utcnow(),
+    )
+    db.add(agent)
+    db.flush()
+    return agent
+
+
+def make_mandate_sync(
+    db,
+    *,
+    user: User,
+    agent: Agent,
+    scope_overrides: dict[str, Any] | None = None,
+    limits_overrides: dict[str, Any] | None = None,
+    step_up_overrides: list[dict[str, Any]] | None = None,
+    constraints_overrides: dict[str, Any] | None = None,
+    expires_in_days: int = 30,
+    revoked: bool = False,
+    expired: bool = False,
+    issued_offset_days: int = 0,
+    spent_today_eur: float = 0,
+    spent_total_eur: float = 0,
+    deals_count: int = 0,
+    last_reset_date: datetime | None = None,
+) -> Mandate:
+    """Insert a Mandate row with surgical overrides for verifier tests.
+
+    Defaults mirror V0_DEFAULT_*. Pass `expired=True` for an already-expired
+    mandate, `revoked=True` for a revoked one. `issued_offset_days` shifts
+    `issued_at` (negative = past) to test ordering / most-recent semantics.
+    Sync session.
+    """
+    from app.core import platform_limits as pl
+
+    scope = {
+        "allowed_actions": list(pl.V0_DEFAULT_ALLOWED_ACTIONS),
+        "forbidden_actions": list(pl.V0_DEFAULT_FORBIDDEN_ACTIONS),
+    }
+    if scope_overrides:
+        scope.update(scope_overrides)
+
+    limits = {
+        "max_price_per_deal_eur": 100,
+        "max_total_volume_eur_per_day": 200,
+        "max_total_volume_eur_per_mandate": 500,
+        "max_deals_per_day": 3,
+        "max_active_intents": 10,
+        "max_concurrent_negotiations": 5,
+    }
+    if limits_overrides:
+        limits.update(limits_overrides)
+
+    constraints = {
+        "geo_scope": ["IT"],
+        "categories_allowed": ["*"],
+        "categories_forbidden": list(pl.HARD_FORBIDDEN_CATEGORIES),
+        "operating_hours": "24/7",
+    }
+    if constraints_overrides:
+        constraints.update(constraints_overrides)
+
+    issued_at = datetime.utcnow() + timedelta(days=issued_offset_days)
+    if expired:
+        expires_at = issued_at - timedelta(days=1)
+    else:
+        expires_at = issued_at + timedelta(days=expires_in_days)
+
+    mandate = Mandate(
+        id=str(uuid.uuid4()),
+        agent_id=agent.id,
+        user_id=user.id,
+        version="1.0",
+        scope=scope,
+        limits=limits,
+        step_up_required_for=(
+            step_up_overrides if step_up_overrides is not None else []
+        ),
+        constraints=constraints,
+        spent_total_eur=Decimal(str(spent_total_eur)),
+        deals_count=deals_count,
+        spent_today_eur=Decimal(str(spent_today_eur)),
+        last_reset_date=last_reset_date or issued_at,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        revoked_at=datetime.utcnow() if revoked else None,
+        revocation_reason="test_revocation" if revoked else None,
+        signature={"algorithm": "factory"},
+        canonical_payload='{"test":true}',
+    )
+    db.add(mandate)
+    db.flush()
+    return mandate

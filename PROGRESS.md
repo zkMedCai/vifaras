@@ -554,3 +554,111 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 2.6 Test completo MandateVerifier (coverage 100%). **Attendo via libera.**
 
 > **Promemoria del founder per 2.6**: "dopo 2.5 hai il MandateVerifier che gestisce davvero step-up via step_up_service. 2.6 sarà coverage completo — ogni branch, ogni edge case, ogni interazione con i servizi esterni. Già ora il MandateVerifier ha test smoke (1.3), 2.6 lo porta a 100% coverage. Quando arrivi lì, ti scrivo brief breve."
+
+---
+
+## [2.6] mandate_verifier full coverage + factories module — 2026-04-28
+
+### Cosa è stato fatto
+
+**Bugfix scaffold log_failed (DQ-27).** `mandate_verifier.log_failed` provava a inserire `AuditLog(user_id=None, mandate_id=None, ...)` per il caso `NoActiveMandate`. Schema dichiara entrambi NOT NULL → INSERT crashava. Latente fino a 2.6 (path non esercitato prima). Fix: best-effort lookup del mandate via `agent_id`; se trovato scrive AuditLog completo, altrimenti emette `audit.action_denied_no_mandate` su structlog. Coerente con DQ-14 split.
+
+**Documentazione DQ-26.** `user.tier` non degrada mai post-revoke. Tier=2 + agent revoked = "credenziale verificata, niente operatività". V0 lascia l'utente in stato dormiente; V1 implementerà multi-agent re-creation (no re-verify Self).
+
+**`backend/tests/factories.py` esteso (founder pattern).** Factory granulari sync per `mandate_verifier` tests:
+- `make_user_sync(db, *, tier=2, status, email, label)` → User row.
+- `make_agent_sync(db, *, user, status, label)` → Agent row.
+- `make_mandate_sync(db, *, user, agent, scope_overrides, limits_overrides, step_up_overrides, constraints_overrides, expires_in_days, revoked, expired, issued_offset_days, spent_today_eur, spent_total_eur, deals_count, last_reset_date)` → Mandate con surgical override su ogni campo. Default V0 ovunque.
+
+Le factory async esistenti (`setup_active_mandate_async`, ecc.) restano per i test 2.4/2.5.
+
+**`backend/tests/test_mandate_verifier.py` riscritto da 2 smoke a 46 test:**
+
+Group 1 — `_get_active_mandate` (4 test):
+- `test_no_active_mandate_raises`
+- `test_expired_mandate_raises`
+- `test_revoked_mandate_excluded_raises_no_active_mandate` (test della SEMANTICA: revoked filtered out → NoActiveMandate; il post-check `MandateRevoked` è dead branch unreachable, marcato `# pragma: no cover` con docstring esplicativo)
+- `test_returns_most_recent_active_mandate` (3 mandate: revoked vecchio, attivo medio, attivo nuovo → seleziona il newest active)
+
+Group 2 — `_check_scope` (3 test):
+- `test_action_in_forbidden_raises`
+- `test_action_not_in_allowed_raises`
+- `test_action_in_allowed_passes`
+
+Group 3 — `_check_constraints` (6 test):
+- `test_geo_scope_match_passes` / `_mismatch_raises` / `_no_location_in_params_passes`
+- `test_category_forbidden_raises` / `_allowed_wildcard_passes` / `_not_in_explicit_allowlist_raises`
+
+Group 4 — `_check_limits` (8 test):
+- `test_per_deal_cap_exceeded_raises` (refactored from existing)
+- `test_per_deal_cap_at_boundary_passes` (price == cap is permitted)
+- `test_daily_volume_cap_exceeded_raises`
+- `test_daily_volume_increments_correctly`
+- `test_mandate_total_cap_exceeded_raises`
+- `test_deals_count_cap_per_day_exceeded`
+- `test_no_price_in_params_skips_price_checks`
+- `test_action_not_price_relevant_skips_volume_checks` (volume check fires only on accept_offer/create_deal)
+
+Group 5 — `_check_step_up` (6 test, +1 vs founder spec):
+- `test_step_up_required_when_above_threshold`
+- `test_step_up_passes_when_signature_present`
+- `test_step_up_always_required`
+- `test_step_up_below_threshold_passes`
+- `test_step_up_no_threshold_no_always_passes`
+- `test_step_up_rule_for_different_action_is_skipped` — extra test per coprire la `continue` line nel for loop (rule per accept_offer, autorizzo send_offer → loop continua, no raise)
+
+Group 6 — `_reset_daily_counters_if_needed` (2 test):
+- `test_counters_reset_on_new_day` (last_reset_date ieri → counters azzerati, last_reset_date aggiornata a today)
+- `test_counters_not_reset_same_day` (last_reset_date stesso giorno → counters preservati)
+
+Group 7 — `record_usage` (3 test):
+- `test_record_usage_increments_counters_on_success` (accept_offer → spent_today/spent_total/deals_count incrementati)
+- `test_record_usage_does_not_increment_on_failure` (success=False → counters invariati)
+- `test_record_usage_writes_audit_log` (verifica row con user_id, mandate_id, params, result)
+
+Group 8 — `log_failed` (2 test, post-DQ-27):
+- `test_log_failed_with_active_mandate_writes_audit_log` (mandate trovato → AuditLog row con error_code, success=False)
+- `test_log_failed_without_mandate_does_not_crash` (no mandate → niente AuditLog row, niente exception. Caso ex-bug)
+
+Group 9 — Helpers (parametrize, 2 funzioni × cases):
+- `test_extract_price_eur` parametrize 6 casi (price_cents, price_eur con int e str, vuoto, campo irrelevant)
+- `test_extract_country` parametrize 6 casi (Roma IT, Milan IT, paris fr → uppercase, no comma, trailing comma, 3-letter ITA)
+
+**Coverage gate.** `pytest --cov=app.services.mandate_verifier --cov-report=term-missing --cov-fail-under=100` → **100% coverage** (138 statements). Da preservare in CI a 7.x.
+
+### Decisioni prese non esplicite nel brief
+- **DQ-26** — post-revoke user.tier resta 2. Decisione architetturale: tier = credenziale, agent = operatività.
+- **DQ-27** — log_failed bug fix (analogo a DQ-21). Best-effort + fallback structlog.
+- **`# pragma: no cover` su line 141** — il post-filter `MandateRevoked` check è dead branch (la query già esclude i revoked). Non è dead code rimuovibile però — è defensive guardrail in caso di future modifica della query. Marcato esplicitamente per il coverage gate, docstring on the line spiega.
+- **+1 test sopra spec** (`test_step_up_rule_for_different_action_is_skipped`) — necessario per coprire la `continue` del for loop nel `_check_step_up`. Sposta la suite da 35 a 36 test (37 con i refactored).
+- **Boundary test `_per_deal_cap_at_boundary_passes`** — price == cap permesso (stretti `>`, non `>=`). Non era esplicitato nel brief ma è importante per chiarire la semantica.
+- **`test_action_not_price_relevant_skips_volume_checks`** — chiarisce che il volume cap fira solo su `accept_offer`/`create_deal`. send_offer con prezzo > daily cap passa (offers in flight non contano).
+- **Parametrize per helpers**: 6 casi `_extract_price_eur` + 6 casi `_extract_country` invece di 4+5 spec'ati. Coperti più edge case (price_cents=0, "Roma," trailing comma, "Roma, ITA" 3-letter).
+
+### Test scritti / coverage
+- **94 test totali** ora: 8 auth + 7 identity + **46 mandate_verifier** + 12 mandates + 5 revocation + 6 step_up + 10 tier_gating.
+- `pytest -v` → `94 passed in 6.99s` (~5s container+migration setup, ~2s i 94 test).
+- **Coverage `mandate_verifier.py`: 100%** (138/138 statements, 1 line con `# pragma: no cover` per dead defensive branch).
+
+### Blocker / dubbi
+- **`# pragma: no cover` come standard?** Per V0 lo uso solo dove giustificato (defensive code unreachable in pratica). Va valutato come policy a 7.x: alcune codebase preferiscono no-pragma + accept <100%, altre preferiscono pragma esplicito. Per ora pragma esplicito con docstring perché lascia traccia chiara nel codice.
+- **Non ho aggiunto coverage gate a `pyproject.toml` ancora**: il brief 2.6 dice "preservare in CI quando arriveremo lì". Per ora è eseguibile manualmente via `--cov-fail-under=100`. Quando configuriamo CI in 7.2 lo blindo.
+- **Il `_extract_country` con location vuota o con solo separatore**: testato i casi ragionevoli; edge cases come "  ,  " (whitespace only) non testati ma il codice gestisce graceful (parts=[",",""] → last="", len 0 → None).
+- **Mandate factory con limit `max_total_volume_eur_per_mandate=500` (default)**: alcuni test che testano i limiti devono ESPLICITAMENTE override per non sbattere su questo cap accidentalmente. Tutti i test che lo richiedono lo settano a 1_000+. Documented inline.
+- **AuditLog `user_id`/`mandate_id` NOT NULL post-fix `log_failed`**: la tabella ora è veramente "agent action under mandate". Identity-lifecycle events (revoke, tier upgrade, log_failed senza mandate) usano structlog. DQ-14 + DQ-27 cementano questa separazione.
+
+### Cosa significa "FASE 2 completa"
+Con 2.6 chiusa, la **FASE 2 (Identity & Auth) è completata al 100%**:
+- ✅ 2.1 Tier 0 anonymous onboarding (passkey + email)
+- ✅ 2.2 Tier-based gating middleware
+- ✅ 2.3 Tier 1 identity upgrade via Self Protocol
+- ✅ 2.4 Tier 2 mandate signing (WebAuthn)
+- ✅ 2.5 Mandate revocation + step-up + auth refresh
+- ✅ 2.6 MandateVerifier 100% coverage
+
+94 test verdi totali. 27 DQ documentate. 5 commit `[2.x]` ordinati. Lo schema reggerà 100 utenti V0 senza tweak.
+
+### Prossima task
+**4.1 Intent service (FASE 4 — Marketplace core)**. Cambio di mood: da identity/security a business logic + matching semantico. **Attendo brief esteso del founder** per partire bene su 4.1.
+
+> **Promemoria del founder pre-FASE 4**: "Fase 4 (Marketplace core) è tutto un altro lavoro: business logic, matching semantico, embedding, scoring algorithms. Più creativo, più 'let's see how it performs', più calibration su feedback reali. Ti scriverò un brief denso per 4.1 (Intent service) quando ci arriviamo, perché è il primo pezzo dove il prodotto inizia davvero a esistere."

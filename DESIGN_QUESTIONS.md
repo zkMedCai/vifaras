@@ -380,3 +380,43 @@ Questi servizi sono pianificati per FASE 4-5. A 2.5 non esistono ancora — l'im
 - Su ogni refresh: insert nuovo token, mark vecchio `revoked_at`. Se reuso un token già revoked → disable user, alert.
 
 Stima 4-6 ore di lavoro a 7.4. Threshold ~500 utenti registrati (founder l'aveva già messo nella checklist 7.4 a 2.2).
+
+---
+
+## DQ-26 — Post-revoke user state: tier resta 2, agent revoked (DECIDED)
+
+**Contesto.** Dopo `POST /api/mandates/{id}/revoke/submit`, il mandate è `revoked`, l'agent è `status='revoked'`, ma `user.tier` resta a 2. È coerente?
+
+**Decisione del founder (2026-04-28).** Sì, **`user.tier` non degrada mai**. Il tier rappresenta lo stato di onboarding completato:
+- Tier 0 = email + passkey verificate
+- Tier 1 = identità ZK verificata via Self
+- Tier 2 = ha firmato almeno un mandate (operatività piena dimostrata)
+
+L'agent rappresenta l'**operatività corrente**. Tier è "credenziale", agent è "stato attivo".
+
+**Conseguenza pratica.**
+- Utente tier=2 + agent revoked → resta tier=2, l'identità è verificata. Non deve ri-verificare CIE.
+- V1 implementerà flow di "ri-creazione agent + nuovo mandate" senza re-attraversare 2.3.
+- V0 = stato dormiente: tier=2 ma niente agent attivo. UI mostra "il tuo agente non è attivo, configurane uno nuovo" (richiede V1).
+
+**V0 limbo accettato.** Per V0 tutti i 100 utenti previsti completeranno il primo mandate; i revocati saranno casi rari (lost device, suspicious activity) e accettano lo stato dormiente fino a V1. Documentato esplicitamente per evitare panico in caso di support ticket "ho revocato e ora non posso fare niente".
+
+---
+
+## DQ-27 — Bug nello scaffold log_failed (DECIDED + FIX)
+
+**Contesto.** `mandate_verifier.log_failed` (§5 scaffold) tenta di scrivere `AuditLog(user_id=None, mandate_id=None, ...)` per il caso `NoActiveMandate`. Lo schema `AuditLog` ha `user_id`, `agent_id`, `mandate_id` tutti `NOT NULL` → INSERT fallisce.
+
+Bug latente fino a 2.6 (test 1.3 e 2.x non esercitavano il path `log_failed` con NoActiveMandate). Stessa categoria di DQ-21.
+
+**Fix (2026-04-28).** `log_failed` ora fa **best-effort lookup del mandate attivo via `agent_id`**:
+- Se trova un mandate (caso `ActionNotAllowed`, `LimitExceeded`, `ConstraintViolation`, ecc.): scrive AuditLog completo con `mandate_id`/`user_id` reali.
+- Se non trova (caso `NoActiveMandate`): emette evento structlog `audit.action_denied_no_mandate` con `agent_id`, `action`, `error_code`, `message`. Niente DB write.
+
+Coerente con DQ-14 (split AuditLog table per agent actions con mandate, structlog per identity-lifecycle senza mandate).
+
+**Test.**
+- `test_log_failed_with_active_mandate_writes_audit_log` — verifica row con error_code, success=False.
+- `test_log_failed_without_mandate_does_not_crash` — chiamata su agent senza mandate non solleva, structlog event captured (monkey-patch).
+
+Scaffold cambiato di ~10 righe (best-effort query + branch). Motivato (bug fix, raise di scaffold), come DQ-21.

@@ -136,10 +136,13 @@ class MandateVerifier:
         
         if mandate.expires_at < datetime.utcnow():
             raise MandateExpired(f"Mandate {mandate.id} expired at {mandate.expires_at}")
-        
-        if mandate.revoked_at is not None:
+
+        # Defensive — the query above already filters `revoked_at IS NULL`,
+        # so this branch is unreachable in practice. Kept as a guardrail
+        # against a future query change accidentally dropping the filter.
+        if mandate.revoked_at is not None:  # pragma: no cover
             raise MandateRevoked(f"Mandate {mandate.id} revoked: {mandate.revocation_reason}")
-        
+
         return mandate
     
     def _check_scope(self, mandate: Mandate, action: str):
@@ -279,20 +282,50 @@ class MandateVerifier:
         self.db.commit()
     
     def log_failed(self, agent_id: str, action: str, error: MandateError):
-        """Logga tentativi falliti anche se non c'è un mandate."""
-        # Per casi NoActiveMandate non abbiamo mandate_id, log degraded
-        log_entry = AuditLog(
-            user_id=None,
-            agent_id=agent_id,
-            mandate_id=None,
-            action=action,
-            success=False,
-            error_code=error.code,
-            params={"error": str(error)},
-            timestamp=datetime.utcnow(),
+        """Logga tentativi falliti.
+
+        Best-effort: cerca un mandate attivo per `agent_id` e scrive un
+        AuditLog completo se lo trova (caso ActionNotAllowed, LimitExceeded,
+        ConstraintViolation: il mandate esiste ma l'azione è stata negata).
+
+        Se nessun mandate è attivo (caso NoActiveMandate) NON tocca AuditLog
+        — la tabella richiede `user_id`/`mandate_id` NOT NULL. Emette invece
+        un evento structlog `audit.action_denied_no_mandate` (canale audit
+        identity-lifecycle, coerente con DQ-14).
+        """
+        mandate = (
+            self.db.query(Mandate)
+            .filter(Mandate.agent_id == agent_id)
+            .filter(Mandate.revoked_at.is_(None))
+            .order_by(Mandate.issued_at.desc())
+            .first()
         )
-        self.db.add(log_entry)
-        self.db.commit()
+
+        if mandate is not None:
+            log_entry = AuditLog(
+                user_id=mandate.user_id,
+                agent_id=agent_id,
+                mandate_id=mandate.id,
+                action=action,
+                success=False,
+                error_code=error.code,
+                params={"error": str(error)},
+                timestamp=datetime.utcnow(),
+            )
+            self.db.add(log_entry)
+            self.db.commit()
+            return
+
+        # No mandate context — fall back to structlog audit channel.
+        from app.core.logging import log
+
+        log.info(
+            "audit.action_denied_no_mandate",
+            agent_id=agent_id,
+            action=action,
+            error_code=error.code,
+            message=str(error),
+        )
     
     # ------------------------------------------------------------------------
     # Helpers
