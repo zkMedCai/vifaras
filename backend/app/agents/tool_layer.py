@@ -194,9 +194,10 @@ class ToolHandler:
         except StepUpRequired as step:
             # Mette in coda la richiesta di step-up, ritorna a Claude
             # un risultato che spiega che serve attendere
-            self._queue_step_up(step)
+            step_up_id = self._queue_step_up(step)
             return {
                 "status": "step_up_required",
+                "step_up_id": step_up_id,
                 "message": (
                     "Step-up dell'utente richiesto. "
                     "Notifica push inviata. "
@@ -332,13 +333,50 @@ class ToolHandler:
     # ------------------------------------------------------------------------
     # Step-up handling
     # ------------------------------------------------------------------------
-    
+
     def _queue_step_up(self, step: StepUpRequired):
-        from app.services import notification_service
+        """Persist a StepUpRequest row + push notification.
+
+        Returns the step_up_id so `execute()` can surface it to Claude.
+        Looks up the agent's active mandate (sync, scaffold-style) to
+        bind user_id + mandate_id on the new row. Robust to missing
+        mandate (returns None) — the verifier wouldn't have raised
+        StepUpRequired without an active mandate, but we don't crash if
+        the upstream contract is broken.
+        """
+        from app.models.schema import Mandate, User
+        from app.services import notification_service, step_up_service
+
+        mandate = (
+            self.db.query(Mandate)
+            .filter(Mandate.agent_id == self.agent_id)
+            .filter(Mandate.revoked_at.is_(None))
+            .order_by(Mandate.issued_at.desc())
+            .first()
+        )
+        if mandate is None:
+            return None
+        user = self.db.get(User, mandate.user_id)
+        if user is None:
+            return None
+
+        step_up_id = step_up_service.create_pending_request_sync(
+            self.db,
+            agent_id=self.agent_id,
+            mandate_id=mandate.id,
+            user_id=user.id,
+            nullifier_hash=user.nullifier_hash or "",
+            action=step.action,
+            action_params=step.params,
+            reason=step.reason,
+        )
+
         notification_service.push_step_up_request(
             self.db,
             agent_id=self.agent_id,
             action=step.action,
             params=step.params,
             reason=step.reason,
+            step_up_id=step_up_id,
         )
+        return step_up_id

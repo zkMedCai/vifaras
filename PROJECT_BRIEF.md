@@ -262,7 +262,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - Validazione hard limits di piattaforma (sezione 3)
 - Test: utente tier=1 firma mandate e passa a tier=2; agente diventa `active`
 
-#### 🔲 2.5 Mandate revocation & step-up
+#### ✅ 2.5 Mandate revocation & step-up
 - Endpoint `POST /api/mandates/{id}/revoke` (richiede tier ≥ 2)
 - Endpoint `POST /api/step-up/{action_id}/sign` per confermare azione step-up
 - Funzione `resume_pending_action(action_id, signature)` che riprende l'azione dell'agente in attesa

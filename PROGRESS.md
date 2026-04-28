@@ -440,3 +440,117 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 2.5 Mandate revocation & step-up. **Attendo brief esteso del founder.**
 
 > **Promemoria del founder per 2.5**: "richiederà 2.5: endpoint POST /api/mandates/{id}/revoke con stessa logica WebAuthn signing; concept di pending step-up actions (table, push notification, /api/step-up/{action_id}/sign endpoint); endpoint /api/auth/refresh per rinnovare access token. Niente di tutto questo va costruito in 2.4."
+
+---
+
+## [2.5] mandate revocation + step-up + auth refresh — 2026-04-28
+
+### Cosa è stato fatto
+
+**Bugfix scaffold (DQ-21).** `mandate_verifier.py` — `StepUpRequired` era `@dataclass`, ma il codice fa `raise StepUpRequired(...)`. Bug latente fino a 2.5 (test 1.3 non esercitavano il path step-up). Fix: ora eredita da `Exception` con `__init__` esplicito che assegna `action`, `params`, `reason`. Cambio minimo, scaffold preservato.
+
+**Stub vuoti scaffold (DQ-23).** Creati stub minimi (1-3 righe ciascuno) per `services/{intent,match,negotiation,deal}_service.py`. Importabili da `tool_layer.py` senza crash; verranno sostituiti in FASE 4-5.
+
+**Migration `52b8a8ddb144`**: due tabelle nuove.
+- `mandate_revocation_drafts`: id, user_id FK, mandate_id FK, canonical_payload BYTEA, challenge BYTEA, expires_at, consumed (server_default false), created_at. Index `ix_revocation_drafts_user_expires`.
+- `step_up_requests`: id, agent_id FK, mandate_id FK, user_id FK, action, action_params JSONB, reason, challenge BYTEA, canonical_payload BYTEA, status (server_default 'pending'), expires_at, resolved_at, signature JSONB nullable, created_at. Partial index `ix_step_up_pending_user` su `(user_id, status) WHERE status='pending'`.
+- Migration pulita degli alter spuri di drift autogenerate.
+
+**`schema.py`**: aggiunti `MandateRevocationDraft` e `StepUpRequest` modelli (legacy style coerente con file-internal consistency, DQ-1).
+
+**`services/notification_service.py` (V0 stub).** Sync interface `push_step_up_request(db, agent_id, action, params, reason, step_up_id=None)` e `push_question(db, agent_id, question, context)`. Niente raise. structlog su stdout. APNs/FCM è V1+.
+
+**`services/step_up_service.py`.** Async API + sync helper.
+- `create_pending_request_sync(db, agent_id, mandate_id, user_id, nullifier_hash, action, action_params, reason)` — usato da `tool_layer._queue_step_up`. Genera challenge 32 byte + canonicalizza payload (`step_up_approval` action). TTL 600s. Ritorna step_up_id.
+- `get_pending_for_user(db, user_id)` async — non-expired, status=pending, ordered by created_at.
+- `get_for_signing(db, user_id, step_up_id)` async — ritorna payload dict + challenge b64url + expires_at.
+- `sign(db, user_id, step_up_id, assertion)` async — `SELECT FOR UPDATE`, verify_authentication_response, status='approved' + signature blob persistita. Bumps user.passkey_sign_count.
+- `reject(db, user_id, step_up_id)` async — status='rejected'.
+- `mark_expired(db)` async — sweep cleanup per cron 7.x.
+- Errori tipizzati: `StepUpNotFound (404)`, `StepUpAlreadyResolved (409)`, `StepUpExpired (410)`, `StepUpVerificationFailed (422)`.
+
+**`services/mandate_revocation_service.py`.** Async, draft + submit.
+- `create_revocation_draft(db, user_id, mandate_id, reason)` — valida reason ∈ V0 list (`user_requested`, `suspicious_activity`, `lost_device`), genera challenge + canonicalizza `revoke_mandate` payload. Idempotente: se `mandate.revoked_at != None` ritorna `already_revoked=True` con campi vuoti.
+- `submit_revocation(db, user_id, mandate_id, draft_id, assertion)` — verify WebAuthn, marca `mandate.revoked_at` + `revocation_reason`, `agent.status='revoked'`, **cascade** delle cancellazioni:
+  - Negotiations attive di intents dell'agente → status=`cancelled_revoked` (17 char per stare nel `String(20)` schema, DQ-24).
+  - Deals pending_buyer/pending_seller del user → status=`cancelled_revoked`. **Confirmed deals invariati** (test 5).
+  - Active intents dell'agente → status=`paused`.
+  - Pending mandate_drafts del user/agent → consumed=True.
+  - Pending step_up_requests del mandate → status=`expired`.
+  - Audit log via structlog `audit.mandate_revoked` con counts.
+- Idempotente al submit anche con draft fresco: se `mandate.revoked_at != None`, marca draft consumed e ritorna `already_revoked=True` con `cancellations` zero.
+
+**`services/auth_service.py`** esteso.
+- `refresh_access_token(db, refresh_token)` async → `(access_token, ttl_seconds)`. Decode refresh JWT, load user (DB), check user.status=='active', mint nuovo access con **tier corrente da DB** (non dal payload del JWT — fix critico per utenti promossi mid-session, test 14).
+- Errori nuovi: `InvalidRefreshToken (401)`, `UserNotActive (403)`.
+- Refresh token NON rinnovato (V0, DQ-25). Rotation rinviata a 7.4.
+
+**`agents/tool_layer.py` extension.** `_queue_step_up` ora carica il mandate attivo dell'agente, prende user.nullifier_hash, chiama `step_up_service.create_pending_request_sync` per inserire la row, poi chiama `notification_service.push_step_up_request` (esistente). Ritorna `step_up_id` che `execute()` include nella response a Claude. Estensione di ~25 righe, scaffold preservato per il resto.
+
+**Endpoints.**
+- `POST /api/mandates/{id}/revoke/draft` (require_tier(2)) — `RevokeDraftResponse` con payload + challenge + already_revoked flag.
+- `POST /api/mandates/{id}/revoke/submit` (require_tier(2)) — `RevokeSubmitResponse` con cancellation counts.
+- `GET /api/step-up/pending` (require_tier(2)) — list di pending con agent_id/action/reason.
+- `GET /api/step-up/{id}/draft` (require_tier(2)) — payload + challenge.
+- `POST /api/step-up/{id}/sign` (require_tier(2)) — verify + approve.
+- `POST /api/step-up/{id}/reject` (require_tier(2)) — explicit cancel.
+- `POST /api/auth/refresh` (no auth, refresh nel body) — new access_token + ttl.
+- Tutti wired in `main.py`.
+
+**Test factories** (`backend/tests/factories.py`). Nuovo file. Helper riutilizzabili tra test sync/async:
+- `default_user_kwargs(tier, email)` — User row a tier ≥ 1 con tutti i campi.
+- `build_mandate_payload_dict(...)` — payload mandate per fixture, accetta `step_up_rules` custom.
+- `setup_active_mandate_sync(db_session, ...)` — User+Agent+Mandate completi via Session sync.
+- `setup_active_mandate_async(db, ...)` — equivalente async.
+- `fake_assertion_payload()` — assertion WebAuthn finta.
+
+**`tests/test_revocation.py`** (5 test):
+1. `test_revoke_mandate_with_valid_signature_succeeds` — happy path: draft + submit, mandate.revoked_at set, agent.status='revoked'.
+2. `test_revoke_with_invalid_signature_fails` — webauthn raise → 422 `revocation_verification_failed`. Mandate untouched.
+3. `test_revoke_already_revoked_is_idempotent` — secondo /draft → 200 con `already_revoked=true`, draft_id null. revoked_at preservato.
+4. `test_revoke_cancels_active_negotiations_and_pending_deals` — setup buyer+seller agents, intents, match, negotiation active, deal pending + deal confirmed. Revoke. Counts: 1/1/1. DB-side: nego status='cancelled_revoked', pending deal 'cancelled_revoked', buy intent 'paused'.
+5. `test_revoke_does_not_affect_confirmed_deals` — confirmed deal resta `confirmed` post-revoke.
+
+**`tests/test_step_up.py`** (6 test):
+6. `test_step_up_request_created_when_action_above_threshold` — sync via `ToolHandler`, send_offer €100 con threshold €50 → step_up_request inserted con status='pending', mandate_id, action_params['price_cents']=10_000.
+7. `test_step_up_sign_with_valid_signature_approves` — pending row inserted manually, /sign endpoint, status='approved', signature blob persistita.
+8. `test_step_up_sign_with_invalid_signature_fails` — webauthn raise → 422 `step_up_verification_failed`. Status untouched.
+9. `test_step_up_reject_marks_as_rejected_and_cancels_action` — /reject → status='rejected', resolved_at set.
+10. `test_step_up_expired_after_ttl` — expired pending + fresh pending; `mark_expired` sweep returns 1, expired row → status='expired', fresh row untouched.
+11. `test_step_up_resume_action_with_approved_signature` — sync MandateVerifier: senza signature in params → raises StepUpRequired; con `step_up_signature` truthy → mandate ritornato.
+
+**`tests/test_auth.py`** + 4 refresh test:
+12. `test_refresh_returns_new_access_token` — register → refresh → JWT decoda con tier=0, kind=access. ttl=900s.
+13. `test_refresh_with_invalid_token_fails` — garbage token → 401 `invalid_refresh_token`.
+14. `test_refresh_returns_current_tier_not_token_tier` — register tier=0, mutate user.tier=1 in DB, refresh → access JWT con tier=1.
+15. `test_refresh_for_banned_user_fails` — user.status='banned' → 403 `user_not_active`.
+
+### Decisioni prese non esplicite nel brief
+- **DQ-21** — bugfix `StepUpRequired` Exception. Latent bug, motivato.
+- **DQ-22** — V0 accetta più pending step-up per (agent, action). Hard-enforce solo se vediamo abuse.
+- **DQ-23** — stub vuoti per intent/match/negotiation/deal_service. Path-neutral.
+- **DQ-24** — `cancelled_revoked` (17 char) invece di `cancelled_due_to_revocation` (28 char) per stare nel `String(20)` scaffold.
+- **DQ-25** — refresh token NO rotation in V0. Aggiunto a 7.4 hardening.
+- **Cascade revoca esecuzione**: scan delle negotiations attive con per-row check sulla relazione match→intent→agent. Per V0 100 utenti il full scan è cheap; in 7.x con più volume si può aggiungere `agent_id` denormalizzato su Negotiation per query diretta.
+- **Test pattern `populate_existing=True`**: i test che leggono dal DB DOPO una API call (che usa una sessione separata) devono forzare il refresh dell'identity map del test. `populate_existing=True` come execution_option è pulito.
+- **`step_up_service.create_pending_request_sync`** prende `nullifier_hash` come parametro esplicito (non lo carica dal DB) — il caller (`tool_layer`) ha già il User loaded. Riduce query.
+- **API revoke chiamabile solo a tier=2**: l'utente deve essere completamente "mandated" per poter revocare. Coerente: tier 0/1 non hanno mandate da revocare.
+- **Step-up endpoints richiedono tier=2**: solo utenti mandated possono avere agent attivo che genera step-up.
+
+### Test scritti / coverage
+- 50 test totali ora: 8 auth (4 nuovi refresh) + 7 identity + 2 mandate_verifier + 12 mandates + 5 revocation + 6 step_up + 10 tier_gating.
+- `pytest -v` → `50 passed in 6.60s` (~5s container+migration setup, ~1.5s i 50 test).
+- Coverage non misurata; target 100% di `mandate_verifier.py` in 2.6.
+
+### Blocker / dubbi
+- **Notification service è solo log**: nessuna integrazione con APNs/FCM. Il client mobile dovrà fare polling su `/api/step-up/pending`. Documentato nel docstring del service. V1 cambio drop-in di `push_step_up_request`.
+- **Step-up resume sincrona NON testata end-to-end**: il test 11 verifica che MandateVerifier accetti la signature. Il flow completo (orchestrator riprova action al prossimo tick, tool_layer carica step_up_request approved, attacca signature) richiede agent runtime FASE 6. Per ora coperta a livello di componenti separati.
+- **Refresh non rotato (DQ-25)**: refresh stolen → 30 giorni di danno potenziale. Acceptable V0, hardening prima del launch reale.
+- **Tier=2 per /step-up endpoints**: se un utente revoca il mandate (tier 2 → ?), questo ricade in ambito 2.5+. Per ora il founder spec dice "revoca è irreversibile per V0 — l'utente deve ricreare il mandate, ricominciando dal tier 1 di fatto". Ma `user.tier` resta 2 nel DB? Da chiarire: post-revoke l'utente è tier=2 ma agent è revoked → endpoint /step-up/* non ha senso (no pending step-up generabili senza agent attivo). Implicit handling: pending list è vuota, ma chiamare /sign su step-up vecchi (pre-revoca) è OK (sono in stato 'expired' dopo cascade).
+- **Validazione `revocation_draft` mandate_id consistency**: l'URL ha `mandate_id`, il body ha `revocation_draft_id`. Il service verifica che `draft.mandate_id == url.mandate_id` → se no, `RevocationDraftNotFound`. Test esplicito non c'è (caso edge); il codice path è coperto da revisione.
+- **Refresh token con user_id in JWT ma user assente in DB**: il refresh fallisce con `invalid_refresh_token` (404→401 mapping interno). Test esplicito non c'è ma il code path è coperto.
+
+### Prossima task
+2.6 Test completo MandateVerifier (coverage 100%). **Attendo via libera.**
+
+> **Promemoria del founder per 2.6**: "dopo 2.5 hai il MandateVerifier che gestisce davvero step-up via step_up_service. 2.6 sarà coverage completo — ogni branch, ogni edge case, ogni interazione con i servizi esterni. Già ora il MandateVerifier ha test smoke (1.3), 2.6 lo porta a 100% coverage. Quando arrivi lì, ti scrivo brief breve."

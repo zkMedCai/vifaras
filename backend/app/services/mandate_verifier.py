@@ -49,12 +49,19 @@ class ConstraintViolation(MandateError):
     code = "constraint_violation"
 
 
-@dataclass
-class StepUpRequired:
-    """Non è un errore: indica che serve step-up dell'utente."""
-    action: str
-    params: dict
-    reason: str
+class StepUpRequired(Exception):
+    """Non è un errore semantico: indica che serve step-up dell'utente.
+
+    Eredita da Exception perché il flusso del verifier la solleva con
+    `raise` (vedi `_check_step_up`). Mantiene i campi action/params/reason
+    accessibili come attributi (compat col pattern dataclass originario).
+    """
+
+    def __init__(self, *, action: str, params: dict, reason: str) -> None:
+        self.action = action
+        self.params = params
+        self.reason = reason
+        super().__init__(reason)
 
 
 # ============================================================================

@@ -76,6 +76,16 @@ class InvalidChallengeToken(AuthError):
     http_status = 401
 
 
+class InvalidRefreshToken(AuthError):
+    code = "invalid_refresh_token"
+    http_status = 401
+
+
+class UserNotActive(AuthError):
+    code = "user_not_active"
+    http_status = 403
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -301,3 +311,43 @@ async def complete_login(
     access = create_access_token(user_id=user.id, tier=user.tier)
     refresh = create_refresh_token(user_id=user.id)
     return user.id, access, refresh
+
+
+# ---------------------------------------------------------------------------
+# Refresh access token (brief task 2.5)
+# ---------------------------------------------------------------------------
+
+
+async def refresh_access_token(
+    db: AsyncSession, *, refresh_token: str
+) -> tuple[str, int]:
+    """Exchange a refresh token for a fresh access token.
+
+    Returns `(new_access_token, ttl_seconds)`. The refresh token itself
+    is unchanged in V0 (rotation deferred to V1 — DESIGN_QUESTIONS DQ-25).
+
+    Crucially the new access token carries the *current* `user.tier` from
+    the DB, not the tier embedded in the refresh JWT. Otherwise a user
+    promoted to tier 1 mid-session via Self verification would keep being
+    issued tier-0 tokens until their refresh expires.
+    """
+    from app.core.security import decode_refresh_token
+
+    try:
+        payload = decode_refresh_token(refresh_token)
+    except Exception as exc:
+        raise InvalidRefreshToken(str(exc)) from exc
+
+    user_id: str | None = payload.get("sub")
+    if not user_id:
+        raise InvalidRefreshToken("missing sub claim")
+
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if user is None:
+        raise InvalidRefreshToken("user no longer exists")
+    if user.status != "active":
+        raise UserNotActive(f"user.status={user.status!r}")
+
+    new_access = create_access_token(user_id=user.id, tier=user.tier)
+    ttl_seconds = settings.jwt_access_ttl_min * 60
+    return new_access, ttl_seconds

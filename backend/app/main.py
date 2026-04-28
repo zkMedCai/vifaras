@@ -10,6 +10,7 @@ from app.api import (
     auth as auth_routes,
     identity as identity_routes,
     mandates as mandate_routes,
+    step_up as step_up_routes,
 )
 from app.core.config import settings
 from app.core.db import engine
@@ -31,6 +32,7 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(auth_routes.router)
 app.include_router(identity_routes.router)
 app.include_router(mandate_routes.router)
+app.include_router(step_up_routes.router)
 app.include_router(_test_endpoints.router)
 
 

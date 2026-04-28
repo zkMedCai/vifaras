@@ -195,6 +195,144 @@ async def test_login_flow_returns_valid_jwt(
     assert payload["kind"] == "access"
 
 
+# ---------------------------------------------------------------------------
+# Refresh access token (brief task 2.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+async def test_refresh_returns_new_access_token(
+    http_client, async_db_session, monkeypatch
+) -> None:
+    """Happy path: register, then exchange refresh → fresh access token."""
+    monkeypatch.setattr(
+        "app.services.auth_service.verify_registration_response",
+        lambda **_: _fake_verified_registration(),
+    )
+
+    begin = await http_client.post(
+        "/api/auth/register/begin", json={"email": "refresh@example.com"}
+    )
+    complete = await http_client.post(
+        "/api/auth/register/complete",
+        json={
+            "credential": _fake_credential_payload(),
+            "challenge_token": begin.json()["challenge_token"],
+        },
+    )
+    assert complete.status_code == 200
+    body = complete.json()
+
+    # The original access token is tier=0; we'll mint a fresh one.
+    refresh_resp = await http_client.post(
+        "/api/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    rbody = refresh_resp.json()
+    assert rbody["token_type"] == "bearer"
+    assert rbody["expires_in_seconds"] == 15 * 60
+    decoded = decode_access_token(rbody["access_token"])
+    assert decoded["sub"] == body["user_id"]
+    assert decoded["tier"] == 0  # current tier
+    assert decoded["kind"] == "access"
+
+
+@pytest.mark.db
+async def test_refresh_with_invalid_token_fails(http_client) -> None:
+    """A garbage refresh token is rejected with 401."""
+    resp = await http_client.post(
+        "/api/auth/refresh", json={"refresh_token": "not-a-jwt"}
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "invalid_refresh_token"
+
+
+@pytest.mark.db
+async def test_refresh_returns_current_tier_not_token_tier(
+    http_client, async_db_session, monkeypatch
+) -> None:
+    """If user.tier was promoted after refresh issuance, refresh sees the new tier.
+
+    Refresh tokens don't carry the user's tier (tier-agnostic), but the
+    access token re-issued from a refresh must reflect `User.tier` AS-OF
+    refresh time. Otherwise a tier-1 user (just upgraded via Self) would
+    still get tier-0 access tokens for the rest of their refresh lifetime.
+    """
+    from sqlalchemy import select
+
+    from app.models.schema import User
+
+    monkeypatch.setattr(
+        "app.services.auth_service.verify_registration_response",
+        lambda **_: _fake_verified_registration(),
+    )
+
+    begin = await http_client.post(
+        "/api/auth/register/begin", json={"email": "promoted@example.com"}
+    )
+    complete = await http_client.post(
+        "/api/auth/register/complete",
+        json={
+            "credential": _fake_credential_payload(),
+            "challenge_token": begin.json()["challenge_token"],
+        },
+    )
+    body = complete.json()
+
+    # Bump the user's tier directly (mimics 2.3 verify-self success).
+    user = await async_db_session.scalar(
+        select(User).where(User.id == body["user_id"])
+    )
+    user.tier = 1
+    await async_db_session.commit()
+
+    # Refresh — should see tier=1 in the new access token.
+    refresh_resp = await http_client.post(
+        "/api/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+    assert refresh_resp.status_code == 200, refresh_resp.text
+    decoded = decode_access_token(refresh_resp.json()["access_token"])
+    assert decoded["tier"] == 1
+
+
+@pytest.mark.db
+async def test_refresh_for_banned_user_fails(
+    http_client, async_db_session, monkeypatch
+) -> None:
+    """A user with status='banned' cannot refresh → 403."""
+    from sqlalchemy import select
+
+    from app.models.schema import User
+
+    monkeypatch.setattr(
+        "app.services.auth_service.verify_registration_response",
+        lambda **_: _fake_verified_registration(),
+    )
+    begin = await http_client.post(
+        "/api/auth/register/begin", json={"email": "banned@example.com"}
+    )
+    complete = await http_client.post(
+        "/api/auth/register/complete",
+        json={
+            "credential": _fake_credential_payload(),
+            "challenge_token": begin.json()["challenge_token"],
+        },
+    )
+    body = complete.json()
+
+    user = await async_db_session.scalar(
+        select(User).where(User.id == body["user_id"])
+    )
+    user.status = "banned"
+    await async_db_session.commit()
+
+    resp = await http_client.post(
+        "/api/auth/refresh", json={"refresh_token": body["refresh_token"]}
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "user_not_active"
+
+
 @pytest.mark.db
 async def test_email_normalization_lowercase_strip(
     http_client, async_db_session, monkeypatch

@@ -108,3 +108,38 @@ async def login_complete(
     return TokenResponse(
         user_id=user_id, access_token=access, refresh_token=refresh
     )
+
+
+# ---------------------------------------------------------------------------
+# Refresh access token (brief task 2.5)
+# ---------------------------------------------------------------------------
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    expires_in_seconds: int
+    token_type: str = "bearer"
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+async def refresh(
+    body: RefreshRequest,
+    db: AsyncSession = Depends(get_db),
+) -> RefreshResponse:
+    """Exchange a refresh token for a fresh access token.
+
+    The new access token reflects the user's CURRENT tier (read from DB),
+    not the tier embedded in the refresh JWT — so a user promoted via
+    Self verification mid-session gets the right token without re-login.
+    """
+    try:
+        new_access, ttl = await auth_service.refresh_access_token(
+            db, refresh_token=body.refresh_token
+        )
+    except auth_service.AuthError as exc:
+        raise _to_http(exc) from exc
+    return RefreshResponse(access_token=new_access, expires_in_seconds=ttl)

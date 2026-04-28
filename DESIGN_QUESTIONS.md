@@ -313,3 +313,70 @@ Suggerimento del founder esplicito (2026-04-28): "silently log-and-continue per 
 **Perché non riscrivere Text → BYTEA.** Lo scaffold §5 (DQ-1) non si tocca. Modificare ora richiede migration + change downstream (mandate_verifier che legge canonical_payload). Costo>beneficio per V0.
 
 **V1**: in unificazione legacy/modern, valutare BYTEA + storage come bytes nativi. Per ora il cast UTF-8 è esplicito e documentato.
+
+---
+
+## DQ-21 — Bug nello scaffold StepUpRequired (DECIDED + FIX MINIMO)
+
+**Contesto.** `mandate_verifier.py` (§5 scaffold) definiva `StepUpRequired` come `@dataclass`. Il codice circostante però fa `raise StepUpRequired(...)` e `except StepUpRequired as step:` — entrambi richiedono che la classe erediti da `BaseException` / `Exception`. Un `raise` di un `@dataclass` puro fallisce con `TypeError: exceptions must derive from BaseException`.
+
+Il bug era **latente** fino a 2.5: i test 1.3 (mandate_verifier smoke) non esercitavano il path step-up, quindi non si era visto.
+
+**Fix (2026-04-28).** Cambiato `@dataclass class StepUpRequired:` in `class StepUpRequired(Exception)` con `__init__` esplicito che assegna `action`, `params`, `reason` come attributi e chiama `super().__init__(reason)`. Compat con il dataclass-pattern originale: i tre attributi sono ancora accessibili.
+
+**Perché motivato il fix dello scaffold (overrid DQ-1).** DQ-1 dice "non riscrivere senza motivo esplicito". Un `raise` che crasha è motivo esplicito. Il cambiamento è di una riga + un `__init__` di 4 righe — minima invasività, massimo guadagno (ora 2.5 ha tool_layer integration funzionante).
+
+---
+
+## DQ-22 — Step-up: una pending request per (agent, action) (DECIDED, V0 SOFT)
+
+**Contesto.** Niente DB constraint impedisce a un agente di avere più step_up_requests pending per la stessa action contemporaneamente (es. due `accept_offer` sopra threshold mentre il primo è ancora pending). Il client mobile dovrebbe deduplicare; ma se non lo fa?
+
+**Decisione.** V0 accetta la possibilità — la lista in `GET /api/step-up/pending` mostra tutte le pending. Il client può presentarle separatamente o consolidare. Quando l'agente ri-tenta sul prossimo tick, prende la più recente approved e usa quella.
+
+**Trigger di hard-enforcement.** Se in produzione vediamo abuse (agente che genera N step-up sulla stessa action in cascata), aggiungiamo:
+- Partial unique index: `CREATE UNIQUE INDEX uq_one_pending_step_up_per_action ON step_up_requests(agent_id, action) WHERE status = 'pending'`
+- O check applicativo prima di INSERT in `create_pending_request_sync`.
+
+V0 documenta la limitazione ma non hard-enforce.
+
+---
+
+## DQ-23 — Stub vuoti per intent/match/negotiation/deal_service (DECIDED)
+
+**Contesto.** Lo scaffold §5 `tool_layer.py` importa al module top:
+```python
+from app.services import (
+    intent_service, match_service, negotiation_service, deal_service
+)
+```
+
+Questi servizi sono pianificati per FASE 4-5. A 2.5 non esistono ancora — l'import fallisce, e qualunque test che importa `tool_layer` (es. test 6 di step-up) non parte.
+
+**Decisione (2026-04-28).** Creati stub vuoti — file `services/{intent,match,negotiation,deal}_service.py` con solo docstring "placeholder until brief task X.Y, real implementation lands in FASE Z". Importabili, ma se una funzione viene mai chiamata fallisce con `AttributeError`. Path-neutral: quando i servizi reali atterrano, sostituiscono lo stub completamente.
+
+**Perché non un import lazy in tool_layer.** Modifying tool_layer per fare lazy import (es. dentro ogni handler) è "rewrite" del scaffold (DQ-1 violation). Stub vuoti sono additivi — niente tocca lo scaffold.
+
+---
+
+## DQ-24 — Revocation cascade status string `cancelled_revoked` (DECIDED)
+
+**Contesto.** Il founder spec'a `cancelled_due_to_revocation` (28 char) come status string per negotiations e deals al revoke. Lo schema scaffold ha `status = Column(String(20))` su entrambi: 28 > 20 → IntegrityError.
+
+**Decisione.** Uso `cancelled_revoked` (17 char) per stare nel limite. Semantica preservata. Conviene **non** ALTER lo schema (rewrite scaffold proibito) per estendere il varchar — la stringa più corta è equivalente.
+
+**V1+ pivot.** Quando si tocca lo schema in modo strutturato (es. unify legacy/modern in 1.x V1), valutare `String(50)` su tutti i campi `status` per più head-room. Per ora `cancelled_revoked` è universale tra negotiations e deals revocati.
+
+---
+
+## DQ-25 — Refresh token rotation rinviata (V0 SOFT, V1 HARDENING)
+
+**Contesto.** `POST /api/auth/refresh` (2.5) ritorna un nuovo access_token ma **lascia il refresh_token invariato**. Best practice security è rotation: ad ogni refresh emetti un nuovo refresh_token, invalida il vecchio (one-time-use). Se un attaccante usa due volte lo stesso refresh, la "rotation reuse detection" invalida la famiglia di token.
+
+**Decisione (founder, 2026-04-28).** V0 senza rotation. Il refresh_token resta valido fino a `exp` (30gg). Una sessione rubata fa danno per max 30 giorni.
+
+**Trigger di hardening (brief §7.4).** Aggiunto come pre-launch item:
+- Tabella `refresh_tokens` con `jti`, `user_id`, `revoked_at`, `replaced_by_jti`. 
+- Su ogni refresh: insert nuovo token, mark vecchio `revoked_at`. Se reuso un token già revoked → disable user, alert.
+
+Stima 4-6 ore di lavoro a 7.4. Threshold ~500 utenti registrati (founder l'aveva già messo nella checklist 7.4 a 2.2).

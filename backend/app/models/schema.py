@@ -171,6 +171,87 @@ class MandateDraft(Base):
     )
 
 
+class MandateRevocationDraft(Base):
+    """
+    Pending revocation draft awaiting WebAuthn signature (brief task 2.5).
+
+    Same shape as MandateDraft but binds to the specific mandate being
+    revoked via `mandate_id` FK. Carries the canonical bytes (action:
+    revoke_mandate) + a 32-byte challenge that doubles as WebAuthn challenge.
+    `consumed=True` is the replay guard.
+    """
+    __tablename__ = "mandate_revocation_drafts"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    mandate_id = Column(UUID(as_uuid=False), ForeignKey("mandates.id"), nullable=False)
+
+    canonical_payload = Column(LargeBinary, nullable=False)
+    challenge = Column(LargeBinary, nullable=False)
+
+    expires_at = Column(DateTime, nullable=False)
+    consumed = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_revocation_drafts_user_expires", "user_id", "expires_at"
+        ),
+    )
+
+
+class StepUpRequest(Base):
+    """
+    Step-up request: a paused agent action awaiting biometric confirmation.
+
+    Created by `tool_layer.ToolHandler` when `MandateVerifier.authorize`
+    raises `StepUpRequired` (action exceeds a step-up rule). The user
+    sees it via `GET /api/step-up/pending`, signs it via
+    `POST /api/step-up/{id}/sign`, or rejects via `/reject`. After
+    approval, the agent re-attempts the original action with the
+    captured signature attached (V0 sync resume).
+
+    Status transitions:
+        pending → approved   (user signed)
+        pending → rejected   (user explicitly rejected)
+        pending → expired    (TTL elapsed, ~10 min)
+    Once non-pending, the row is read-only history.
+    """
+    __tablename__ = "step_up_requests"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+    mandate_id = Column(UUID(as_uuid=False), ForeignKey("mandates.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+
+    # The blocked action: agent re-tries it with this name + params (+ signature)
+    # once the user approves.
+    action = Column(String(50), nullable=False)
+    action_params = Column(JSONB, nullable=False)
+    reason = Column(Text, nullable=False)  # human-readable, e.g. "Price €120 above threshold €100"
+
+    # Crypto seam — exact same pattern as MandateDraft.
+    challenge = Column(LargeBinary, nullable=False)
+    canonical_payload = Column(LargeBinary, nullable=False)
+
+    status = Column(String(16), nullable=False, default="pending")
+    expires_at = Column(DateTime, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+
+    # Populated when status='approved': the verified WebAuthn assertion
+    # the agent attaches to the resumed tool call.
+    signature = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_step_up_pending_user", "user_id", "status",
+            postgresql_where=(status == "pending"),
+        ),
+    )
+
+
 # ============================================================================
 # MARKETPLACE LAYER
 # ============================================================================
