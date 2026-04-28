@@ -238,3 +238,94 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 
 ### Prossima task
 2.3 Tier 1 — Identity upgrade via Self Protocol. **Attendo brief esteso (Self provider decision, mock structure, atomic 0→1 transition) prima di partire.**
+
+---
+
+## [2.3] tier 1 identity upgrade via self protocol — 2026-04-28
+
+### Cosa è stato fatto
+
+**Config + env (DQ-13).**
+- `core/config.py`: `self_verifier_url` default a `https://api.self.xyz/v1/verify` (era localhost stub); aggiunti `self_verifier_scope="marketplace-it-v0"`, `self_verifier_timeout_seconds=10.0`, `kms_keys_dir=".secrets/agent_keys"`.
+- `.env.example`: sezione Self Protocol allargata con scope + timeout, sezione nuova KMS.
+- `.gitignore`: aggiunta `.secrets/` (mai committare le privkey degli agent).
+
+**`services/kms_service.py` (DQ-13).** Stub V0 file-based.
+- `generate_agent_keypair()` → ed25519 via `cryptography`. Persiste `{alg, key_id, private_key_b64, public_key_b64}` in `.secrets/agent_keys/<uuid>.json`. Ritorna `(pubkey_b64_url, "file:<path>")`.
+- `sign(kms_ref, message)` placeholder per 5.x.
+- `load_pubkey(b64)` per la verifica firme future.
+- `KMSError` distinct da network/HTTP (→ 500 + rollback identity-side).
+- Path traversal guard sul `key_id`.
+- I/O sync dentro async: file scriviture piccole + V0 = 100 utenti, blocco loop trascurabile. V1 con KMS reale è off-process comunque.
+
+**`services/audit_service.py` (DQ-14).** Audit identity-events via structlog.
+- `log_tier_upgrade(user_id, from_tier, to_tier, nullifier_hash, agent_id)` async, **mai raise**. Try/except interno + warn fallback.
+- Doc esplicita: la tabella `AuditLog` (mandate_id NOT NULL) è riservata alle azioni agente sotto mandate (5.x); il tier upgrade pre-mandate va sul canale structlog (`audit.tier_upgrade`).
+
+**`services/identity_service.py` (DQ-11, 15).** Cuore del task.
+- `SelfProofPayload` (Pydantic v2) — input dal mobile (`proof`, `publicSignals`).
+- `VerifiedIdentity` (frozen dataclass) — output server-validato di `verify_self_proof`.
+- `Tier1UpgradeResult` — output di `upgrade_user_to_tier_1`.
+- Errori tipizzati: `SelfVerifierUnavailable` (500), `SelfVerificationFailed` (422), `NullifierCollision` (409), `InvalidTierTransition` (409), `UserNotFound` (404). Ogni classe ha `code` + `http_status`; il code di `SelfVerificationFailed` è `self.<error_code_lowercase>` (es. `self.proof_invalid`, `self.isadult_required`).
+- `_post_to_self_verifier(payload)` — async httpx POST con timeout da settings, raise_for_status. **Solo seam mockabile** dei test.
+- `verify_self_proof(proof, public_signals, user_identifier)` — costruisce request canonica (proof, publicSignals, scope, userIdentifier, disclosureRequirements: `{minimumAge:18, issuingState:["IT"], documentValidity:true}`), chiama il seam, mappa errori httpx→`SelfVerifierUnavailable`. Su risposta valida applica **invariants server-side**: `verified=true`, scope echo match, userIdentifier echo match, `attributes.isAdult is True`, `issuingState=="IT"`, `documentValid is True`, `documentExpiry > now`. Belt-and-suspenders.
+- `upgrade_user_to_tier_1(db, user_id, proof)` — sequenza atomica:
+  1. `verify_self_proof` (no DB)
+  2. `SELECT user FOR UPDATE` (lock anti double-click)
+  3. Idempotency: `tier ≥ 1` → ritorna `already_upgraded=True` con agent esistente
+  4. Tier guard: `tier != 0` → `InvalidTierTransition`
+  5. Nullifier collision → `NullifierCollision`
+  6. KMS keygen (prima delle mutazioni: KMSError lascia tx vuota)
+  7. Mutate user (tier=1, nullifier_hash, attributes_proven, attributes_verified_at, attributes_expires_at)
+  8. INSERT agent (`status='pending_mandate'`)
+  9. COMMIT
+  10. Audit (post-commit, fire-and-forget)
+
+**`api/identity.py`.** `POST /api/identity/verify-self`.
+- Auth: `Depends(require_tier(0))` — tutti gli utenti registrati.
+- Pydantic `VerifySelfRequest` con `populate_by_name=True` (accetta sia `public_signals` snake che `publicSignals` camel da Self).
+- `VerifySelfResponse` con `next_step.action="configure_mandate"` + `endpoint="/api/mandates/draft"` (copy mobile italiana).
+- Mapper `_to_http(IdentityError)` come in 2.1. `NullifierCollision` ha next_step custom (`login_with_existing_account`). `KMSError` mappa a 500 `kms_error`.
+- Wired in `main.py` con `app.include_router(identity_routes.router)`.
+
+**`tests/conftest.py` (DQ-12).** Fixture refactor (rivelato bug `with_for_update()` + sessione condivisa + savepoint mode in 2.3).
+- Nuovo `_async_db_connection`: apre connection + outer tx + rollback teardown.
+- `async_db_session` ora binda alla connection del fixture sopra (per le assert di test).
+- `http_client` apre una sessione fresca **per ogni request HTTP** (mirror del `get_db` produzione). Tutte le sessioni condividono la connection → outer tx → scritture visibili. Le `assert` post-API leggono via `async_db_session` (stessa tx).
+- Mock `self_verifier_mock` esteso: auto-patcha `_post_to_self_verifier`, `set_response`/`set_error`/`reset`/`calls`, presets `valid_italian_adult_proof`, `expired_document_proof`, `non_italian_proof`, `minor_proof`, `invalid_proof`, `nullifier_reuse_proof`, e `TimeoutException` come shortcut a `httpx.TimeoutException`.
+
+**`tests/test_identity.py`.** 7 test, tutti verdi.
+1. `test_tier_0_can_upgrade_to_tier_1_happy_path` — registra tier 0, verify-self con `valid_italian_adult_proof`, asserts: 200, tier=1, agent_id, agent_pubkey, nullifier_hash. DB: `User.tier=1`, `attributes_proven` con isAdult/issuingState/documentValid; `Agent` con `status="pending_mandate"`, `pubkey == response.agent_pubkey`, `privkey_kms_ref` startswith `file:`. Verifica anche payload sent al verifier (scope + userIdentifier + disclosureRequirements).
+2. `test_upgrade_fails_with_invalid_proof` — `invalid_proof()` → 422 `self.proof_invalid`. User stays tier=0, no agent.
+3. `test_upgrade_fails_with_minor_user` — `minor_proof()` → 422 `self.isadult_required`. User stays tier=0.
+4. `test_upgrade_idempotent_for_already_tier_1` — due call sequenziali; seconda ritorna 200 `already_upgraded=true` con stesso agent_id; DB ha esattamente 1 agent.
+5. `test_nullifier_collision_returns_409` — A upgrade con nullifier X; B upgrade con stesso nullifier → 409 `nullifier_collision` con next_step `login_with_existing_account`. B resta tier=0.
+6. `test_verifier_timeout_returns_500` — `set_error(TimeoutException)` → 500 `verifier_unavailable`. User stays tier=0.
+7. `test_atomic_rollback_on_agent_creation_failure` — proof valida + monkeypatch `kms_service.generate_agent_keypair` raise → 500 `kms_error`. **User row untouched** (tier=0, nullifier_hash=None), no agent. Conferma atomicità.
+
+### Decisioni prese non esplicite nel brief
+- **DQ-11** (sequenza atomica) — sequenza esatta dettata dal founder, replicata. Niente `db.begin_nested()` esplicito (autobegin gestisce). Document expiry server-side aggiunto come belt-and-suspenders.
+- **DQ-12** (fixture refactor) — bug scoperto in implementazione: `with_for_update()` + sessione condivisa tra request + savepoint mode = `MissingGreenlet` su seconda request. Soluzione: sessione fresca per request. Refactor minimale, no api change, tutti i test 2.1/2.2 ancora verdi.
+- **DQ-13** (KMS V0) — file locali in `.secrets/agent_keys/`, ed25519. Founder ha lasciato la decisione a me, ho scelto quella più chiara per dev.
+- **DQ-14** (audit channel) — structlog per identity events (no mandate_id), tabella AuditLog riservata a 5.x.
+- **DQ-15** (camelCase persistito) — `attributes_proven` mantiene il formato Self verbatim, niente translation layer.
+- **`_post_to_self_verifier` come unico seam mock** — confermato dal founder. Tutte le altre funzioni (verify_self_proof, upgrade_user_to_tier_1) sono testate end-to-end senza mock interno.
+- **Validazione cross-kind (scope echo, userIdentifier echo)** — server-side anche se Self dovrebbe garantirla. Costo: 2 if extra, valore: protezione da Self misconfigurato/replay.
+- **`InvalidTierTransition` distinto da `NullifierCollision`** — entrambi 409 ma codici diversi. Il primo è "stato corrotto" (non dovrebbe succedere), il secondo è "collisione legittima".
+
+### Test scritti / coverage
+- 23 test totali ora: 4 auth + 7 identity + 2 mandate_verifier + 10 tier_gating.
+- `pytest -v` → `23 passed in 6.19s` (~5s container+migration setup, ~1s i 23 test).
+- Coverage non misurata; target 80% in 2.6+ (mandate_verifier completo).
+
+### Blocker / dubbi
+- **`SELF_VERIFIER_URL` default**: ho messo `https://api.self.xyz/v1/verify` come da brief, ma è "placeholder finché non confermo l'URL preciso". Quando verifichi col team Self, basta aggiornare `.env.example` e il default in `config.py`.
+- **Refresh token re-emit non incluso in 2.3**: dopo l'upgrade a tier 1, il client ha ancora il vecchio JWT con `tier=0`. La prossima chiamata gated `require_tier(1)` fallirebbe finché il client non rilogga (o usa refresh). Brief 2.3 non lo richiede esplicitamente, ma è UX da chiarire: opzione A = client logout-login dopo verify-self; opzione B = response include access_token aggiornato; opzione C = endpoint `/api/auth/refresh` esplicito (manca, suggerito in 2.5 o quando serve). Da decidere prima del frontend integration.
+- **Test atomic rollback (test 7)**: il test conferma che user.tier resta 0 quando KMS fallisce. Ma il test sfrutta che KMS è chiamato **prima** delle mutazioni, quindi non c'è niente da rollback davvero. Per testare un rollback **dopo** mutazioni servirebbe simulare un fallimento al `db.commit()` o al flush dell'agent — overhead non giustificato in 2.3. Il path è coperto a livello di code review (try/except sul commit nel servizio).
+- **`webauthn` ancora monkeypatcha verify_registration_response** in `_register_tier_0` helper di test 2.3, copia-incollato da test 2.1. Quando 2.6 farà coverage completa, conviene estrarre helper unico in `tests/factories.py`.
+- **Locks held by outer transaction in test**: con `with_for_update()` + outer tx in test, il row lock di una request viene rilasciato solo al rollback finale del fixture (non al "commit" del servizio = savepoint release). Non è un problema per i 7 test attuali (sequenziali) ma diventerebbe rilevante se in futuro test parallelizzassero. V0 single-process è OK.
+
+### Prossima task
+2.4 Tier 2 — Mandate signing. **Attendo brief esteso del founder.**
+
+> **Promemoria del founder per 2.4**: "mentre lavori, prepara mentalmente il payload del mandate (struttura JSON canonicalizzato, fields, scope). A 2.4 dovrai costruire `mandate_service.create_mandate_payload()` che genera il JSON da firmare. Il payload deve includere riferimento al `nullifier_hash` (per audit) e all'`agent_id` (per binding). Quando arrivi lì, ti scrivo il brief 2.4 esteso."

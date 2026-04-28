@@ -64,3 +64,6 @@ logs/
 # Project-local scratch
 .scratch/
 tmp/
+
+# Local KMS stub (V0): per-agent ed25519 private keys live here. NEVER commit.
+.secrets/

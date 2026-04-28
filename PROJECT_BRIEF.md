@@ -246,7 +246,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - Quando tier insufficiente → solleva `HTTPException(402, detail={"required_tier": N, "next_step": "..."})`
 - Test: gating funziona su endpoint dummy con tutti i tre tier
 
-#### 🔲 2.3 Tier 1 — Identity upgrade via Self Protocol
+#### ✅ 2.3 Tier 1 — Identity upgrade via Self Protocol
 - `services/identity_service.py`
 - Endpoint `POST /api/identity/verify-self` (richiede tier ≥ 0)
 - Riceve la ZK proof generata dall'app mobile via Self SDK

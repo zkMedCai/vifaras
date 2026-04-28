@@ -159,3 +159,84 @@ Tutti i test async in una test run condividono lo stesso event loop. Il pool del
 **Trade-off.** Niente parallelismo a livello di loop (pytest-xdist richiederebbe loop separati per worker — affrontabile in 7.x se il numero di test cresce). V0 single-process è OK.
 
 **Alternativa scartata.** `NullPool` sull'async engine in fase test: avrebbe richiesto override di `app.core.db` solo per test, fragile. Loop-scope=session è una linea di config.
+
+---
+
+## DQ-11 — Tier 0→1 atomic upgrade: ordering & rollback shape (DECIDED)
+
+**Contesto.** Task 2.3 chiede che `upgrade_user_to_tier_1` sia atomica: o tutto (Self verified + nullifier + attributi + tier=1 + agent keypair) o niente. Sequenza dettata dal founder, replicata in `identity_service.upgrade_user_to_tier_1`:
+
+1. Verifica Self proof **fuori** da qualunque transazione DB (HTTP call lenta dentro tx tiene il pool occupato).
+2. `SELECT user FOR UPDATE` per evitare race condition di doppio click sull'app.
+3. Idempotency: se `tier ≥ 1` torna `already_upgraded=true` con l'agent esistente.
+4. Tier guard: se `tier != 0` raise (stato corrotto).
+5. Nullifier collision check (other user → 409).
+6. KMS keygen — fatto **dopo** i check ma **prima** delle mutazioni: una KMSError lascia la transazione vuota, rollback è no-op.
+7. Mutazioni user (tier, nullifier, attributes, timestamps).
+8. INSERT agent con `status='pending_mandate'`.
+9. COMMIT.
+10. Audit (post-commit, fire-and-forget — vedi DQ-14).
+
+**Perché niente `db.begin_nested()` esplicito**: l'AsyncSession in autobegin (default) apre una transazione al primo execute; l'esplicito `nested` complica il path test (savepoint dentro savepoint dentro outer rollback) senza vantaggi. La transazione singola con commit finale è chiara.
+
+**Document expiry server-side**: anche quando Self risponde `verified=true`, ricontrolliamo `attributes.documentExpiry > now`. Belt-and-suspenders contro un Self che restituisse "verified" su un documento scaduto. Stesso pattern per `isAdult`, `issuingState=="IT"`, `documentValid=true`, scope/userIdentifier echo.
+
+---
+
+## DQ-12 — Test fixture: connection condivisa, sessione fresca per request (DECIDED)
+
+**Contesto.** Task 2.3 ha rivelato un bug nel pattern del fixture `http_client` di 2.1/2.2: con `with_for_update()` nel servizio + sessione condivisa tra più request HTTP nello stesso test, la **seconda** request fallisce con `sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called` durante la creazione del savepoint. La race condition è interna a SQLAlchemy 2.0 async: dopo un `db.commit()` in `join_transaction_mode="create_savepoint"`, il prossimo `execute()` deve auto-aprire un nuovo savepoint, ma l'auto-begin non si trova nel greenlet di `await_only` quando arriva via `with_for_update()`.
+
+**Decisione.** Refactor di `conftest.py`:
+- Nuovo fixture `_async_db_connection` (function-scoped): apre `engine.connect()` + `connection.begin()`, yielda la connection, rollback al teardown.
+- `async_db_session` ora binda alla connection del fixture sopra (non l'engine). Una sessione, riservata alle assert di test.
+- `http_client` apre una **sessione fresca per ogni request HTTP**, sempre bindata alla stessa connection. Mirror del pattern produzione (`get_db` → `AsyncSessionLocal()` per request).
+
+Le scritture restano dentro l'outer transaction → visibili a `async_db_session`. Il rollback al teardown wipa tutto. `with_for_update()` funziona perché ogni request ha autobegin pulito.
+
+**Trade-off.** Più fixture, leggermente più verboso. Ma allinea i test al ciclo di vita reale della session in produzione, eliminando una classe di "funziona in test ma rompe in prod" e viceversa.
+
+---
+
+## DQ-13 — KMS stub V0: file locali ed25519 (DECIDED)
+
+**Contesto.** `Agent.privkey_kms_ref` è `Text NOT NULL` per design — la privkey **non** sta in DB. Per V0 serve un produttore di keypair che persista la privkey altrove e ritorni una reference opaca.
+
+**Decisione del founder (2026-04-28).** "Tu decidi, lo formalizzeremo a V1 con KMS reale." Scelto: file-based.
+
+- `services/kms_service.py` genera ed25519 keypair via `cryptography`. La privkey raw (32B) viene serializzata come b64 in un JSON `{alg, key_id, private_key_b64, public_key_b64}` salvato in `.secrets/agent_keys/<uuid>.json`.
+- `kms_ref` ritornato è `file:<path>` — opaco al chiamante (un futuro `arn:aws:kms:...` userebbe lo stesso campo).
+- Path traversal guard: refuse se `key_id` contiene `/` o `..`.
+- `.secrets/` aggiunta a `.gitignore`.
+- KMS_KEYS_DIR configurabile via env var (default `.secrets/agent_keys`).
+
+**Migrazione V1.** Sostituire `kms_service.generate_agent_keypair()` con chiamata AWS/GCP KMS. `kms_ref` diventa `arn:aws:kms:...` o equivalente. Niente data migration (gli ed25519 esistenti restano leggibili dal file system fino a rotazione).
+
+**Sync I/O dentro async** (file write): per V0 file piccoli + 100 utenti il blocco del loop è negligibile. V1 con KMS reale è off-process via HTTP comunque, niente da rifare.
+
+---
+
+## DQ-14 — Audit channel split: structlog vs AuditLog table (DECIDED)
+
+**Contesto.** Schema `AuditLog` ha `mandate_id NOT NULL`. Ha senso: l'AuditLog è specifico per **azioni dell'agente** sotto un mandate attivo (FASE 5+). Ma il tier upgrade succede **prima** che esista un mandate — non c'è mandate_id da scrivere.
+
+**Decisione.** Due canali di audit coesistenti:
+1. **Tabella `AuditLog`** — riservata alle azioni agente con `mandate_id`. Verrà popolata dal tool_layer in 5.x.
+2. **structlog event `audit.*`** — per eventi identity/lifecycle pre-mandate (tier upgrade, mandate revoke futuro, login se serve). JSON su stdout, namespace `audit.*` filtrabile da log aggregator.
+
+`audit_service.log_tier_upgrade(...)` usa il canale (2). Mai raise: try/except interno + warn fallback. Audit secondario rispetto al commit dell'upgrade.
+
+Suggerimento del founder esplicito (2026-04-28): "silently log-and-continue per V0".
+
+---
+
+## DQ-15 — Persistenza attributes_proven con keys camelCase di Self (DECIDED)
+
+**Contesto.** Self ritorna `{isAdult, issuingState, documentValid, documentExpiry}`. Nello scaffold lo schema parla di `{adult, country, valid}`. Conversione `isAdult→adult`, `issuingState→country`, `documentValid→valid` sembra naturale.
+
+**Decisione.** Persistere il blob **come arriva da Self** (camelCase), niente translation layer. Motivazione:
+1. Il JSONB è opaco per il DB; il consumer (servizi futuri di gating) leggerà esattamente quello che Self ha emesso → meno mapping da debuggare.
+2. Se Self aggiunge nuovi attributi, il blob li accoglie senza schema change.
+3. La docstring dello schema (`{"adult": true, "country": "IT", "valid": true}`) è un esempio non un contratto — DESIGN_QUESTIONS supera quei commenti dove c'è conflitto.
+
+**Conseguenza pratica.** Servizi futuri che leggono `attributes_proven` devono usare `attributes_proven.get("isAdult")` etc. Test 2.3 verifica le keys camelCase persistite. Documentato in commento dello schema in 4.x se necessario.

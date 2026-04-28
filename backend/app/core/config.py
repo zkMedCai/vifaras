@@ -41,7 +41,14 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"
 
-    self_verifier_url: str = "http://localhost:9000/verify"
+    self_verifier_url: str = "https://api.self.xyz/v1/verify"
+    self_verifier_scope: str = "marketplace-it-v0"
+    self_verifier_timeout_seconds: float = 10.0
+
+    # V0 stub for the agent-keypair custody seam. Real KMS (AWS/GCP) is V1.
+    # File-based: per-agent JSON in `.secrets/agent_keys/<agent_id>.json`.
+    # Path is relative to the repo root (cwd at uvicorn boot).
+    kms_keys_dir: str = ".secrets/agent_keys"
 
     @cached_property
     def database_url_async(self) -> str:

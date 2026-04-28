@@ -112,44 +112,71 @@ def db_session(_pg_container: PostgresContainer) -> Iterator[Any]:
 
 
 @pytest.fixture
-async def async_db_session(_pg_container: PostgresContainer):
-    """Async equivalent of `db_session`: outer transaction + savepoint commits.
+async def _async_db_connection(_pg_container: PostgresContainer):
+    """Async connection wrapped in an outer transaction (rollback on teardown).
 
-    Use this in endpoint tests via the `http_client` fixture, which overrides
-    the FastAPI `get_db` dependency to yield this same session — so reads
-    after the API call see what the API wrote, and rollback on teardown
-    wipes everything.
+    Both `async_db_session` (test-side reads) and the per-request sessions
+    minted by `http_client` bind to this same connection — so all writes
+    are visible across both sides, and the outer rollback wipes the test
+    cleanly.
     """
-    from sqlalchemy.ext.asyncio import AsyncSession
-
     from app.core.db import engine
 
     async with engine.connect() as connection:
         transaction = await connection.begin()
         try:
-            async with AsyncSession(
-                bind=connection,
-                expire_on_commit=False,
-                join_transaction_mode="create_savepoint",
-            ) as session:
-                yield session
+            yield connection
         finally:
             await transaction.rollback()
 
 
 @pytest.fixture
-async def http_client(async_db_session):
+async def async_db_session(_async_db_connection):
+    """Test-side AsyncSession for reading state after API calls.
+
+    Each test gets one session here for assertions. API requests use their
+    own (fresh) sessions minted by `http_client` — sharing one session
+    across the whole test breaks `with_for_update()` (savepoint+greenlet
+    interaction in SQLAlchemy 2.0 async).
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    async with AsyncSession(
+        bind=_async_db_connection,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    ) as session:
+        yield session
+
+
+@pytest.fixture
+async def http_client(_async_db_connection, async_db_session):
     """httpx AsyncClient wired into the FastAPI app via ASGITransport.
 
-    Overrides `get_db` so the API uses the same `async_db_session` as the test.
+    Each API request gets a **fresh** AsyncSession bound to the test's
+    connection (so writes are inside the outer transaction and visible to
+    `async_db_session`'s reads, but each request has its own session
+    lifecycle). This mirrors production where `get_db` mints a new session
+    per request via `AsyncSessionLocal()`.
+
+    Why fresh-per-request: sharing one session across requests breaks
+    sequences like `commit → with_for_update`, because SQLAlchemy's async
+    savepoint creation drops out of the greenlet bridge after a commit
+    on the same session. Per-request sessions auto-begin cleanly.
     """
     from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.core.db import get_db
     from app.main import app
 
     async def _override_get_db():
-        yield async_db_session
+        async with AsyncSession(
+            bind=_async_db_connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        ) as session:
+            yield session
 
     app.dependency_overrides[get_db] = _override_get_db
     transport = ASGITransport(app=app)
@@ -271,47 +298,202 @@ def anthropic_mock() -> Callable[..., FakeAnthropicClient]:
 
 
 # ---------------------------------------------------------------------------
-# Mock: Self Protocol verifier (placeholder until task 2.3 lands)
+# Mock: Self Protocol verifier (task 2.3+)
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_SELF_RESPONSE: dict[str, Any] = {
-    "verified": True,
-    "nullifier_hash": "mock-self-nullifier",
-    "attributes": {"adult": True, "country": "IT", "valid": True},
-}
+def _self_response_template(
+    *,
+    user_identifier: str,
+    nullifier: str,
+    attributes: dict[str, Any],
+    scope: str = "marketplace-it-v0",
+    verified: bool = True,
+    error_code: str | None = None,
+) -> dict[str, Any]:
+    """Build a Self verifier response in the canonical wire format."""
+    if not verified:
+        return {
+            "verified": False,
+            "errorCode": error_code or "PROOF_INVALID",
+            "errorMessage": f"mock: {error_code}",
+            "scope": scope,
+            "userIdentifier": user_identifier,
+        }
+    return {
+        "verified": True,
+        "nullifier": nullifier,
+        "attributes": attributes,
+        "scope": scope,
+        "userIdentifier": user_identifier,
+    }
 
 
 @pytest.fixture
-def self_verifier_mock() -> SimpleNamespace:
-    """Stand-in for the (future, task 2.3) Self Protocol HTTP verifier.
+def self_verifier_mock(monkeypatch) -> SimpleNamespace:
+    """Auto-patches `identity_service._post_to_self_verifier`.
 
-    Until `app.services.identity_service` exists this fixture exposes:
-      - `set_response(payload)`: declare what the verifier should return next
-      - `calls`: list of recorded calls
-      - `fake_post(*args, **kwargs)`: an httpx-shaped Response
+    Tests drive it via:
+        self_verifier_mock.set_response(payload)        # next call returns this
+        self_verifier_mock.set_error(httpx.TimeoutException("..."))  # next call raises
+        self_verifier_mock.calls                         # list of recorded payloads
+        self_verifier_mock.reset()                       # clear state
 
-    When 2.3 lands, the test will wire it into the real call site, e.g.:
-      monkeypatch.setattr(
-          "app.services.identity_service._post_to_verifier",
-          self_verifier_mock.fake_post,
-      )
+    Preset factories (return payloads ready for `set_response`):
+        valid_italian_adult_proof(user_identifier=..., nullifier=...)
+        expired_document_proof(user_identifier=...)
+        non_italian_proof(user_identifier=...)
+        minor_proof(user_identifier=...)
+        invalid_proof(user_identifier=...)        # verified=false
+        nullifier_reuse_proof(user_identifier=...) # verified=false NULLIFIER_REUSE
+
+    The patch is auto-installed on fixture entry — no explicit monkeypatch
+    in the test body. Tests that don't request the fixture pay nothing.
     """
+    import httpx
+
     state: dict[str, Any] = {
-        "response": dict(_DEFAULT_SELF_RESPONSE),
+        "response": None,
+        "error": None,
         "calls": [],
     }
 
-    def fake_post(*args: Any, **kwargs: Any) -> SimpleNamespace:
-        state["calls"].append({"args": args, "kwargs": kwargs})
-        return SimpleNamespace(
-            status_code=200,
-            json=lambda: dict(state["response"]),
-            raise_for_status=lambda: None,
+    async def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+        state["calls"].append(payload)
+        if state["error"] is not None:
+            raise state["error"]
+        if state["response"] is None:
+            raise RuntimeError(
+                "self_verifier_mock: no response set; call set_response() "
+                "or set_error() before invoking the verify-self endpoint"
+            )
+        return dict(state["response"])
+
+    monkeypatch.setattr(
+        "app.services.identity_service._post_to_self_verifier",
+        fake_post,
+    )
+
+    def set_response(payload: dict[str, Any]) -> None:
+        state["response"] = payload
+        state["error"] = None
+
+    def set_error(exc: BaseException) -> None:
+        state["error"] = exc
+        state["response"] = None
+
+    def reset() -> None:
+        state["response"] = None
+        state["error"] = None
+        state["calls"].clear()
+
+    # ------- preset factories -------
+
+    def valid_italian_adult_proof(
+        *,
+        user_identifier: str,
+        nullifier: str = "self_nullifier_valid_it_adult",
+        document_expiry: str = "2030-04-15",
+    ) -> dict[str, Any]:
+        return _self_response_template(
+            user_identifier=user_identifier,
+            nullifier=nullifier,
+            attributes={
+                "isAdult": True,
+                "issuingState": "IT",
+                "documentValid": True,
+                "documentExpiry": document_expiry,
+            },
+        )
+
+    def expired_document_proof(
+        *,
+        user_identifier: str,
+        nullifier: str = "self_nullifier_expired_doc",
+    ) -> dict[str, Any]:
+        # Verifier marks verified=true but the doc is expired; our service
+        # rejects belt-and-suspenders.
+        return _self_response_template(
+            user_identifier=user_identifier,
+            nullifier=nullifier,
+            attributes={
+                "isAdult": True,
+                "issuingState": "IT",
+                "documentValid": True,
+                "documentExpiry": "2020-01-01",
+            },
+        )
+
+    def non_italian_proof(
+        *,
+        user_identifier: str,
+        nullifier: str = "self_nullifier_fr_user",
+    ) -> dict[str, Any]:
+        return _self_response_template(
+            user_identifier=user_identifier,
+            nullifier=nullifier,
+            attributes={
+                "isAdult": True,
+                "issuingState": "FR",
+                "documentValid": True,
+                "documentExpiry": "2030-04-15",
+            },
+        )
+
+    def minor_proof(
+        *,
+        user_identifier: str,
+        nullifier: str = "self_nullifier_minor",
+    ) -> dict[str, Any]:
+        return _self_response_template(
+            user_identifier=user_identifier,
+            nullifier=nullifier,
+            attributes={
+                "isAdult": False,
+                "issuingState": "IT",
+                "documentValid": True,
+                "documentExpiry": "2030-04-15",
+            },
+        )
+
+    def invalid_proof(
+        *,
+        user_identifier: str,
+        error_code: str = "PROOF_INVALID",
+    ) -> dict[str, Any]:
+        return _self_response_template(
+            user_identifier=user_identifier,
+            nullifier="",
+            attributes={},
+            verified=False,
+            error_code=error_code,
+        )
+
+    def nullifier_reuse_proof(
+        *,
+        user_identifier: str,
+    ) -> dict[str, Any]:
+        return _self_response_template(
+            user_identifier=user_identifier,
+            nullifier="",
+            attributes={},
+            verified=False,
+            error_code="NULLIFIER_REUSE",
         )
 
     return SimpleNamespace(
-        set_response=lambda payload: state.update(response=payload),
+        set_response=set_response,
+        set_error=set_error,
+        reset=reset,
         calls=state["calls"],
-        fake_post=fake_post,
+        # presets
+        valid_italian_adult_proof=valid_italian_adult_proof,
+        expired_document_proof=expired_document_proof,
+        non_italian_proof=non_italian_proof,
+        minor_proof=minor_proof,
+        invalid_proof=invalid_proof,
+        nullifier_reuse_proof=nullifier_reuse_proof,
+        # Convenience: tests can pull the timeout exception class without
+        # importing httpx themselves.
+        TimeoutException=httpx.TimeoutException,
     )
