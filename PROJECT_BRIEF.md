@@ -255,7 +255,7 @@ Loop di Claude che gira un singolo "tick" per un agente. Costruisce system promp
 - Genera **automaticamente** keypair agente (privkey in KMS, status=`pending_mandate`)
 - Test: con proof mockata, l'utente passa da tier=0 a tier=1 e ha un agente associato
 
-#### 🔲 2.4 Tier 2 — Mandate signing
+#### ✅ 2.4 Tier 2 — Mandate signing
 - `services/mandate_service.py`
 - Endpoint `POST /api/mandates/draft` (richiede tier ≥ 1) ritorna JSON canonicalizzato + WebAuthn challenge
 - Endpoint `POST /api/mandates/submit` riceve firma, verifica, salva mandate, attiva agente, incrementa `tier=2`

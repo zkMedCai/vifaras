@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
+from app.core.security import decode_access_token
 from app.models.schema import Agent, User
 
 
@@ -119,6 +120,14 @@ async def test_tier_0_can_upgrade_to_tier_1_happy_path(
     assert body["attributes_proven"]["issuingState"] == "IT"
     assert body["next_step"]["action"] == "configure_mandate"
     assert body["next_step"]["endpoint"] == "/api/mandates/draft"
+
+    # Response carries a fresh access token bearing the new tier.
+    assert body["access_token"]
+    assert body["token_type"] == "bearer"
+    refreshed = decode_access_token(body["access_token"])
+    assert refreshed["sub"] == user_id
+    assert refreshed["tier"] == 1
+    assert refreshed["kind"] == "access"
 
     # DB-side: User row mutated as expected.
     user = await async_db_session.scalar(select(User).where(User.id == user_id))

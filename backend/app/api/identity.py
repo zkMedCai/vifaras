@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.security import CurrentUser, require_tier
+from app.core.security import CurrentUser, create_access_token, require_tier
 from app.services import identity_service
 from app.services.kms_service import KMSError
 
@@ -39,6 +39,11 @@ class VerifySelfResponse(BaseModel):
     attributes_proven: dict[str, Any]
     already_upgraded: bool
     next_step: NextStep
+    # Fresh access token reflecting the new tier — the caller's previous
+    # JWT carried `tier=0` and is now stale for `require_tier(1)` endpoints.
+    # Refresh token is unchanged (long-lived, tier-agnostic).
+    access_token: str
+    token_type: str = "bearer"
 
 
 def _to_http(exc: identity_service.IdentityError) -> HTTPException:
@@ -107,6 +112,9 @@ async def verify_self(
     except identity_service.IdentityError as exc:
         raise _to_http(exc) from exc
 
+    fresh_access_token = create_access_token(
+        user_id=result.user_id, tier=result.tier
+    )
     return VerifySelfResponse(
         tier=result.tier,
         user_id=result.user_id,
@@ -116,4 +124,5 @@ async def verify_self(
         attributes_proven=result.attributes_proven,
         already_upgraded=result.already_upgraded,
         next_step=_next_step_for_tier(result.tier),
+        access_token=fresh_access_token,
     )

@@ -240,3 +240,76 @@ Suggerimento del founder esplicito (2026-04-28): "silently log-and-continue per 
 3. La docstring dello schema (`{"adult": true, "country": "IT", "valid": true}`) è un esempio non un contratto — DESIGN_QUESTIONS supera quei commenti dove c'è conflitto.
 
 **Conseguenza pratica.** Servizi futuri che leggono `attributes_proven` devono usare `attributes_proven.get("isAdult")` etc. Test 2.3 verifica le keys camelCase persistite. Documentato in commento dello schema in 4.x se necessario.
+
+**Nota di consumer (founder, 2026-04-28).** Inconsistenza con il resto del codebase Python che è snake_case. Per V1: valutare normalizzazione a snake_case nel service layer **prima** di persistere, oppure helper di translation `attributes_proven_to_snake()` per i consumer. Per V0 (UI mobile + audit log) accettata l'inconsistenza in cambio di "blob fedele alla source of truth".
+
+---
+
+## DQ-16 — Atomic rollback test coverage limitato a pre-flush failure (DECIDED)
+
+**Contesto.** Task 2.3 test 7 (`test_atomic_rollback_on_agent_creation_failure`) verifica che se KMS fallisce durante l'upgrade, lo user resti `tier=0` e nessun agent venga creato. Ma il test sfrutta che KMS è chiamato **prima** delle mutazioni — il path "fallimento al `db.commit()` o al flush dell'agent" non è testato.
+
+**Decisione del founder (2026-04-28).** Limitazione consapevole. Il path post-flush è coperto solo via code review (try/except sul commit nel servizio + propagazione standard SQLAlchemy del rollback). Costo di simulare un fallimento al commit (es. constraint violation crafted, connection drop midway, transient DB error) supera il beneficio per V0.
+
+**Riapri quando**: un bug reale in produzione scopre un caso post-flush non rollback-ato. A quel punto: aggiungere fixture che inietta un `flush`/`commit` failure e estendere il test.
+
+---
+
+## DQ-17 — Un mandate attivo per agente alla volta in V0 (DECIDED)
+
+**Contesto.** Schema permette N mandate per agent (FK `mandates.agent_id → agents.id`, no unique). Brief §3 dice "Auto-revoke per inattività 30 giorni" ma non spec'a "mandate concorrenti". Domanda: cosa succede se un utente tier=2 prova a firmare un secondo mandate?
+
+**Decisione del founder (2026-04-28).** "Un mandate alla volta in V0. Se l'utente vuole modificarlo, prima revoca il vecchio (richiederà 2.5), poi crea nuovo. Niente rolling mandate o overlap."
+
+**Enforcement V0**:
+- `create_draft` rifiuta se `user.tier >= 2` → `InvalidTierTransition` (409). L'utente è già "fully mandated".
+- `submit_signed_mandate` rifiuta se `user.tier >= 2` → `InvalidTierTransition` (409). Defense post-draft anche se la pipe ha più punti d'ingresso in futuro.
+- L'agente passa `pending_mandate → active` una sola volta. 2.5 (revocation) lo riporterà a `pending_mandate` o `revoked` per riaprire la pipeline.
+
+**Conseguenza.** Schema NOT NULL su `signature` / `canonical_payload` / `expires_at` resta naturalmente OK. Niente rolling/version-2 mandate finché 2.5 non riapre la finestra.
+
+**V1+ pivot path.** Aggiungere `mandates.is_active` Boolean partial-unique constraint:  
+`CREATE UNIQUE INDEX uq_one_active_mandate_per_agent ON mandates(agent_id) WHERE revoked_at IS NULL`. Permette overlap solo se policy lo richiede.
+
+---
+
+## DQ-18 — V0 fixed mandate vocabulary (DECIDED)
+
+**Contesto.** Brief task 2.4 lascia all'utente solo limits + geo + expiry. Le altre parti del payload (`scope.allowed_actions`, `scope.forbidden_actions`, `step_up_required_for`, `categories_forbidden`, `revocation`, `operating_hours`) sono **fissate dal sistema** in V0.
+
+**Decisione.** Tutti i fixed values vivono in `core/platform_limits.py`:
+- `V0_DEFAULT_ALLOWED_ACTIONS` — 9 azioni: create_intent, search_intents, send_offer, send_counter_offer, accept_offer, reject_offer, send_message, read_inbox, check_state.
+- `V0_DEFAULT_FORBIDDEN_ACTIONS` — modify_reservation_price, delete_account.
+- `V0_DEFAULT_STEP_UP_REQUIRED_FOR` — accept_offer above €100, create_intent above €150, modify_reservation_price always.
+- `HARD_FORBIDDEN_CATEGORIES` — adult, weapons, alcohol, drugs, nft_crypto, pharmaceuticals, tobacco.
+- `REVOCATION_POLICY_V0` — revocable_anytime + auto_revoke 30gg + suspicious_pattern.
+- `MANDATE_SPEC_VERSION = "1.0"`.
+
+**Perché fissi.** Riduce surface area di errore: il client mobile non può mandare valori "creativi" che il backend deve validare con tassonomia. Ogni nuova azione richiede code change → review esplicito.
+
+**V1+ evoluzione.** Quando aggiungiamo TRADE/baratto: nuovi action codes (`create_trade_intent`, `propose_swap`) → bump `MANDATE_SPEC_VERSION` a "1.1" + extension del set. La canonicalizzazione si auto-aggiorna (JCS è stable).
+
+---
+
+## DQ-19 — UUID plain (no prefix) per ID di marketplace (DECIDED)
+
+**Contesto.** Brief 2.4 esempi response usano `mnd_01HXYZ...`, `usr_...`, `agt_...` — prefissi tipo Stripe. Lo schema usa `UUID(as_uuid=False)` plain.
+
+**Decisione.** V0 mantiene UUID plain ovunque. Niente prefissi. Motivazione:
+- Schema esistente (1.2) usa già UUID plain — re-prefissare richiede migration + changes ovunque.
+- I prefissi sono cosmetici per debug (`mnd_` vs `agt_` distingue), non funzionali.
+- V1 può aggiungere prefissi via display layer (API serializer) senza toccare il DB — pivot non costoso.
+
+**Conseguenza.** Test 2.4 e response API ritornano UUID plain. La docstring del response model lo nota dove utile. I prefissi negli esempi del brief sono esemplificativi, non normativi.
+
+---
+
+## DQ-20 — Mandate.canonical_payload come Text (UTF-8) invece di BYTEA (DECIDED)
+
+**Contesto.** `mandate_drafts.canonical_payload` è BYTEA (i bytes esatti che la passkey firma). `mandates.canonical_payload` è Text dallo scaffold §5.
+
+**Decisione.** Mantenere Text per `mandates.canonical_payload`, salvare il decode UTF-8 dei bytes JCS (che sono SEMPRE valid UTF-8 per spec RFC 8785). Per verifiche future (audit, replay), re-encodare a bytes con `.encode("utf-8")` — round-trip è bit-identico.
+
+**Perché non riscrivere Text → BYTEA.** Lo scaffold §5 (DQ-1) non si tocca. Modificare ora richiede migration + change downstream (mandate_verifier che legge canonical_payload). Costo>beneficio per V0.
+
+**V1**: in unificazione legacy/modern, valutare BYTEA + storage come bytes nativi. Per ora il cast UTF-8 è esplicito e documentato.

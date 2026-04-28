@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from sqlalchemy import (
     Column, String, Integer, Numeric, DateTime, Boolean,
-    ForeignKey, Text, JSON, BigInteger, Index, UniqueConstraint
+    ForeignKey, Text, JSON, BigInteger, Index, UniqueConstraint, LargeBinary
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
@@ -130,6 +130,45 @@ class Mandate(Base):
     
     user = relationship("User", back_populates="mandates")
     agent = relationship("Agent", back_populates="mandates")
+
+
+class MandateDraft(Base):
+    """
+    Pending mandate draft awaiting WebAuthn signature.
+
+    Created in /api/mandates/draft, consumed in /api/mandates/submit.
+    Short TTL (5 min) — forces the user to complete the flow promptly.
+    The `canonical_payload` bytes here are the EXACT bytes that will be
+    signed by the user's passkey; submit re-canonicalization MUST yield
+    the same bytes or the signature won't verify.
+
+    `consumed=True` is the replay guard: a draft can be redeemed once.
+    """
+    __tablename__ = "mandate_drafts"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+
+    # The canonical (RFC 8785 / JCS) JSON bytes of the mandate payload.
+    # WebAuthn challenge is `sha256(canonical_payload)`, so any byte-level
+    # divergence between draft-time and submit-time would invalidate the
+    # signature.
+    canonical_payload = Column(LargeBinary, nullable=False)
+
+    # Random 32 bytes generated server-side; doubles as the WebAuthn
+    # challenge for the assertion. Echoed inside the payload itself
+    # (payload.challenge field) so the signed blob proves binding to
+    # this specific draft.
+    challenge = Column(LargeBinary, nullable=False)
+
+    expires_at = Column(DateTime, nullable=False)
+    consumed = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_mandate_drafts_user_expires", "user_id", "expires_at"),
+    )
 
 
 # ============================================================================

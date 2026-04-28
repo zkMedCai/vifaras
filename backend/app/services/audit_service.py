@@ -67,3 +67,35 @@ async def log_tier_upgrade(
             )
         except Exception:
             pass
+
+
+async def log_mandate_signed(
+    *,
+    user_id: str,
+    mandate_id: str,
+    agent_id: str,
+) -> None:
+    """Audit a mandate signing event (tier 1 → 2 transition). Never raises.
+
+    Like `log_tier_upgrade`, this uses the structlog channel rather than
+    the `AuditLog` table — the table requires `mandate_id NOT NULL` which
+    is satisfied here, but for consistency we keep all *identity-lifecycle*
+    audit on structlog and reserve the table for *agent actions* under a
+    live mandate (5.x+).
+    """
+    try:
+        log.info(
+            "audit.mandate_signed",
+            user_id=user_id,
+            mandate_id=mandate_id,
+            agent_id=agent_id,
+        )
+    except Exception as exc:
+        try:
+            log.warning(
+                "audit.mandate_signed.emit_failed",
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+        except Exception:
+            pass

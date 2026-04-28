@@ -329,3 +329,114 @@ Nessun test pytest in 1.2 (test infra arriva in 1.3). Smoke manuale completo:
 2.4 Tier 2 — Mandate signing. **Attendo brief esteso del founder.**
 
 > **Promemoria del founder per 2.4**: "mentre lavori, prepara mentalmente il payload del mandate (struttura JSON canonicalizzato, fields, scope). A 2.4 dovrai costruire `mandate_service.create_mandate_payload()` che genera il JSON da firmare. Il payload deve includere riferimento al `nullifier_hash` (per audit) e all'`agent_id` (per binding). Quando arrivi lì, ti scrivo il brief 2.4 esteso."
+
+---
+
+## [2.4] mandate creation + signing + tier 2 upgrade — 2026-04-28
+
+### Cosa è stato fatto
+
+**Pre-cleanup richiesto in review 2.3:**
+- `api/identity.py` — la response di `POST /api/identity/verify-self` ora include `access_token` (JWT con `tier=1`) + `token_type="bearer"`. Il client può sostituire l'access token vecchio (tier=0) senza re-login. Refresh token resta lo stesso.
+- `tests/test_identity.py` — `test_tier_0_can_upgrade_to_tier_1_happy_path` aggiornato con assert su `access_token` decodato → `tier=1, kind=access, sub=user_id`.
+- `DESIGN_QUESTIONS.md` — aggiunto DQ-16 (limite copertura test rollback post-flush) ed esteso DQ-15 con nota consumer per V1.
+
+**`pyproject.toml`**: aggiunto `jcs>=0.2` (JSON Canonicalization Scheme RFC 8785, ~50 LOC, no transitive deps).
+
+**Migration `5765c48f21ea_add_mandate_drafts_table`**: tabella `mandate_drafts` per draft pendenti.
+- Colonne: `id (UUID)`, `user_id FK→users`, `agent_id FK→agents`, `canonical_payload (BYTEA)`, `challenge (BYTEA)`, `expires_at`, `consumed (Boolean default false)`, `created_at`.
+- Indice `ix_mandate_drafts_user_expires` su `(user_id, expires_at)` per cleanup futuro di draft scaduti.
+- Server default `false` su `consumed` per coerenza con default Python-side.
+- Migration rifiutato il "drift" autogenerate su `users.tier server_default=null` — non correlato a 2.4.
+
+**`schema.py`**: aggiunto `MandateDraft(Base)` (legacy style coerente con DQ-1: file-internal consistency). Aggiunto `LargeBinary` agli import.
+
+**`core/platform_limits.py`**: hard caps + V0 fixed vocabulary (DQ-18).
+- Hard caps: max_price_per_deal=€1000, max_total_volume_per_mandate=€5000, max_total_volume_per_day=€1000, max_deals_per_day=10, max_active_intents=20, max_concurrent_negotiations=10, max_mandate_duration_days=90.
+- Default V0: max_price_per_deal=€100, max_total_volume_per_mandate=€500, max_total_volume_per_day=€200, max_deals_per_day=3, max_active_intents=10, max_concurrent_negotiations=5, default_duration=30 giorni.
+- `GEO_SCOPE_V0=("IT",)`, `HARD_FORBIDDEN_CATEGORIES` (7 voci).
+- `V0_DEFAULT_ALLOWED_ACTIONS` (9 azioni allineate con `tool_layer.py` §5).
+- `V0_DEFAULT_FORBIDDEN_ACTIONS` = `(modify_reservation_price, delete_account)`.
+- `V0_DEFAULT_STEP_UP_REQUIRED_FOR` = `[accept_offer above €100, create_intent above €150, modify_reservation_price always]`.
+- `REVOCATION_POLICY_V0`, `V0_DEFAULT_OPERATING_HOURS = "24/7"`, `MANDATE_SPEC_VERSION = "1.0"`.
+
+**`core/canonicalization.py`**: wrapper su `jcs`.
+- `canonicalize(payload_dict) → bytes` (deterministic UTF-8 lex-sorted).
+- `digest(canonical_bytes) → bytes` (SHA-256).
+
+**`services/mandate_service.py`**: cuore del task.
+- Errori tipizzati: `UserNotFound (404)`, `AgentNotOwned (404)`, `AgentInWrongState (409)`, `LimitsExceedPlatformCap (422)`, `InvalidGeoScope (422)`, `InvalidExpiryWindow (422)`, `InvalidTierTransition (409)`, `DraftNotFound (404)`, `DraftExpired (410)`, `DraftAlreadyConsumed (409)`, `WebAuthnVerificationFailed (422)`. Tutti subclass di `MandateError`.
+- Pydantic input: `DraftLimitsInput` (subset modificabile dall'utente), `DraftConstraintsInput`, `WebAuthnAssertionPayload` (verbatim al verify).
+- Dataclass output: `DraftCreated`, `MandateSubmitResult`.
+- `create_draft(db, user_id, agent_id, user_limits, user_constraints, expires_in_days)`:
+  - Valida user (no tier ≥2), agent (owned, status=pending_mandate), limits ≤ caps, geo ⊆ V0, expiry ≤ 90gg.
+  - Genera `mandate_id` (uuid), `challenge` (32 random bytes), payload completo (DQ-18 fixed vocab + user customizations).
+  - Canonicalizza → bytes.
+  - Insert MandateDraft con TTL 5 minuti.
+  - Build payload_summary in italiano (helper `_format_italian_date`).
+  - Ritorna `DraftCreated` con challenge in b64url.
+- `submit_signed_mandate(db, user_id, draft_id, assertion)`:
+  - SELECT draft FOR UPDATE (race-safe vs double-submit; fixture session-per-request gestisce la cosa).
+  - Reject se consumed/expired.
+  - Reload user + agent (defensive).
+  - `verify_authentication_response` con challenge=draft.challenge, pubkey=user.passkey_pubkey.
+  - Bump passkey sign_count, last_active_at.
+  - Parse canonical_payload bytes → dict per ricreare Mandate row.
+  - Insert Mandate (signature blob, canonical_payload come UTF-8 string per DQ-20).
+  - Activate agent (pending_mandate → active).
+  - Tier upgrade 1 → 2.
+  - Mark draft consumed.
+  - Commit (try/except con rollback).
+  - Audit log `mandate_signed` (post-commit, fire-and-forget via `audit_service`).
+  - Mint nuovo access_token con tier=2.
+
+**`services/audit_service.py`**: aggiunto `log_mandate_signed(user_id, mandate_id, agent_id)` parallelo a `log_tier_upgrade`. Stesso pattern: structlog, mai raise.
+
+**`api/mandates.py`**: due endpoint, `Depends(require_tier(1))` su entrambi.
+- `POST /api/mandates/draft` — accetta `DraftRequest` (agent_id + opzionali limits/constraints/expires_in_days), ritorna `DraftResponse` (draft_id, payload, payload_summary, challenge b64url, expires_at_utc).
+- `POST /api/mandates/submit` — accetta `SubmitRequest` (draft_id + webauthn_assertion), ritorna `SubmitResponse` (mandate_id, agent_id, agent_status, expires_at, new_access_token, token_type, next_step).
+- Mapper `_to_http(MandateError) → HTTPException(http_status, {code, message})`.
+- Wired in `main.py`.
+
+**`tests/test_mandates.py`** — 12 test, tutti verdi al primo run:
+1. `test_draft_creation_with_default_limits` — assert payload V0 default + summary italiano ("€100", "Italia", date) + draft row con canonical_payload e challenge persisted.
+2. `test_draft_rejects_limits_above_platform_caps` — `max_price_per_deal_eur=2000` → 422 `limits_exceed_platform_cap`.
+3. `test_draft_rejects_invalid_geo_scope` — geo=`["FR"]` → 422 `invalid_geo_scope`.
+4. `test_submit_with_valid_signature_activates_agent` — happy path: mandate created, agent.status="active", user.tier=2, passkey_sign_count bumped, draft.consumed=True.
+5. `test_submit_with_invalid_signature_fails` — webauthn raise → 422 `webauthn_verification_failed`. Niente state change (mandates vuoto, agent pending_mandate, user tier=1, draft non consumed).
+6. `test_submit_with_expired_draft_fails` — draft.expires_at backdated → 410 `draft_expired`.
+7. `test_submit_with_consumed_draft_fails` — primo submit ok, secondo replay → 409 `draft_already_consumed` (il draft check fires prima del tier check).
+8. `test_submit_idempotent_for_already_tier_2` — user direttamente al tier=2 + draft inserito a mano → 409 `invalid_tier_transition` (DQ-17 enforcement).
+9. `test_submit_returns_new_access_token_with_tier_2` — JWT in response decoda con `tier=2, kind=access, sub=user_id`.
+10. `test_canonicalization_deterministic` — `canonicalize` due volte stesso input → byte-identical. Verificato lex-sort delle keys (`a:1,b:2,c:[3,1,2],...`).
+11. `test_webauthn_replay_protection` — sign_count rejection simulata via monkeypatch raise → 422. State unchanged.
+12. `test_audit_log_records_mandate_signed` — spy su `audit_service.log_mandate_signed` → chiamato 1 volta con `(user_id, agent_id, mandate_id)` post-commit.
+
+### Decisioni prese non esplicite nel brief / approfondimenti
+- **DQ-17** (one mandate per agent in V0) — enforcement in `create_draft` AND `submit_signed_mandate`. 2.5 (revocation) riapre la pipeline.
+- **DQ-18** (V0 fixed vocab) — actions/forbidden/step_up/categories tutti hard-coded server-side. Riduce surface area errori dal client.
+- **DQ-19** (UUID plain) — niente prefissi `mnd_` nel DB. Display layer V1+ può aggiungerli senza migration.
+- **DQ-20** (canonical_payload come Text) — Text per Mandate (compat scaffold), BYTEA per MandateDraft (bytes esatti firmati). Round-trip UTF-8 è bit-identico.
+- **WebAuthn challenge = draft.challenge raw bytes** — i 32 random bytes sono ANCHE inclusi nel payload come hex (`payload.challenge`). Il signing flow attesta "user authenticated CON challenge X"; il binding al payload è garantito server-side dalla relazione 1:1 draft.challenge ↔ draft.canonical_payload.
+- **payload_summary generato server-side**, non client-side. Schermata 6 di MANDATE_UX_FLOW (mobile) renderizza `human_readable` + `key_fields` direttamente. Date in italiano via lookup table `_ITALIAN_MONTHS` (niente locale dependency).
+- **Sequenza submit con SELECT FOR UPDATE**: il fixture refactor di 2.3 (sessione fresca per request HTTP, DQ-12) rende FOR UPDATE compatibile col test. Senza quel refactor, 2.4 avrebbe richiesto rework analogo.
+- **`Mandate.signature` JSONB schema**: `{algorithm: "webauthn", credential_id, raw_id, response: {authenticatorData, clientDataJSON, signature, userHandle}}`. Permette ad un auditor di rifare la verifica leggendo solo dal DB.
+- **`access_token` rinnovato anche post-mandate** — coerente col pattern di 2.3 (post-tier-upgrade refresh). Refresh token NON rinnovato (TTL 30gg, tier-agnostic).
+
+### Test scritti / coverage
+- 35 test totali ora: 4 auth + 7 identity + 2 mandate_verifier + **12 mandates** + 10 tier_gating.
+- `pytest -v` → `35 passed in 6.41s` (~5s container+migration setup, ~1.5s i 35 test).
+- Coverage non misurata; target 100% di `mandate_verifier.py` in 2.6.
+
+### Blocker / dubbi
+- **WebAuthn assertion shape**: `WebAuthnAssertionPayload` accetta verbatim ciò che il client mobile invia. py-webauthn fa il parsing. Se il mobile manda field extra non testati, potrebbero rompere alla `verify_authentication_response`. Da validare con la prima integration mobile reale.
+- **`signature` blob storage size**: ogni mandate ha ~5KB di blob WebAuthn (auth_data + client_data + signature in b64). 100 utenti = 500KB, niente. 100K utenti = 500MB, ancora gestibile. V1 valutare compression se cresce.
+- **Replay protection real**: il test 11 simula via monkeypatch. Per testare la replay vera servirebbe un fake authenticator (CBOR) — fuori scope V0 (libreria `webauthn` non ne ha helper). py-webauthn library affidabile su questo punto.
+- **Concorrenza tra create_draft + cleanup** (futuro): un cron job che pulisce draft scaduti potrebbe race con un submit di un draft "ai limiti del TTL". Non blocker V0 (cleanup non implementato; al primo bisogno usare `WHERE expires_at < NOW() AND consumed = FALSE`). Se serve transazionalità, `WHERE id NOT IN (SELECT id FROM mandate_drafts WHERE consumed = TRUE FOR UPDATE)` lock-aware.
+- **Italian months hardcoded**: `_ITALIAN_MONTHS` tuple in `mandate_service.py`. Quando V1 espanderà a EU, servirà una mappa per locale. `babel` library è la mossa standard ma overkill per V0 IT-only.
+- **`InvalidExpiryWindow` non testato esplicitamente**: il test 2 copre solo `LimitsExceedPlatformCap`. Caso `expires_in_days=200` o `=0` non ha test dedicato — coperto solo da Pydantic schema validation (`Field(ge=1, le=90)` su `expires_in_days` in `DraftRequest`). Pydantic ritorna 422 prima che arrivi al service. OK per V0.
+
+### Prossima task
+2.5 Mandate revocation & step-up. **Attendo brief esteso del founder.**
+
+> **Promemoria del founder per 2.5**: "richiederà 2.5: endpoint POST /api/mandates/{id}/revoke con stessa logica WebAuthn signing; concept di pending step-up actions (table, push notification, /api/step-up/{action_id}/sign endpoint); endpoint /api/auth/refresh per rinnovare access token. Niente di tutto questo va costruito in 2.4."
