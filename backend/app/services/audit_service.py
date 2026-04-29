@@ -76,6 +76,8 @@ class NegotiationActions:
     REJECT_OFFER: Final[str] = "reject_offer"
     CAP: Final[str] = "cap_negotiation"
     COMPLETE: Final[str] = "complete_negotiation"
+    EXPIRE: Final[str] = "expire_negotiation"
+    CANCEL: Final[str] = "cancel_negotiation"
 
 
 class DealActions:

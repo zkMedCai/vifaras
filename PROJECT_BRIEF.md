@@ -279,9 +279,9 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - API endpoint: `GET /api/intents/{id}/matches`
 - **Vector index HNSW cosine** creato in migration separata pre-4.3 (vedi DQ-3)
 
-### 🔲 FASE 5 — Negoziazione
+### 🔄 FASE 5 — Negoziazione (in corso)
 
-#### 🔲 5.1 Negotiation service
+#### ✅ 5.1 Negotiation service
 - `services/negotiation_service.py`
 - `start_or_continue(match_id, agent_id, price_cents, message)` (richiede **tier ≥ 1**)
 - `add_counter_offer()` (richiede **tier ≥ 1**)

@@ -893,3 +893,68 @@ Il marketplace è vivo. Tier 0+ utenti possono creare intent, ricevere match aut
 
 ### Prossima task
 **5.1 Negotiation service**. `start_or_continue`, `add_counter_offer`, `accept_offer`, `reject_offer`. Hard cap 6 round (EC6). Tier ≥ 1 per start/counter, tier ≥ 2 per accept (step-up sopra threshold). Match status transition discovered → negotiating → agreed/rejected. Attendo via libera + brief denso analogo.
+
+
+---
+
+## [5.1] negotiation service primitives + state machine (2026-04-29)
+
+### Cosa fatto
+- **`services/negotiation_service.py`** completo:
+  - 4 primitive async: `start_or_continue` (tier ≥ 1), `accept_offer` (tier ≥ 2), `reject_offer` (tier ≥ 1), `get_negotiation_state` (tier ≥ 1, party-only).
+  - `list_negotiations_for_user` per il list endpoint.
+  - `cancel_negotiations_for_intent` cascade hook (chiamato da intent_service.cancel_intent).
+  - Pessimistic locking via `select(...).with_for_update()` su Match + Negotiation. Combinato con `UniqueConstraint(match_id)`, le start concorrenti serializzano sul Match lock.
+  - JSONB `state` con `turns[]`, `is_final_round`, `final_status`, `agreed_price_cents`. Reassignment esplicito su mutation per il tracking SQLAlchemy.
+  - Hard cap `MAX_ROUNDS=6` (V0). `is_final_round=True` quando rounds_used == max-1 — flag letto dal futuro orchestrator (FASE 6) per adattare il prompt "best and final".
+  - Match transition: `discovered → negotiating` su prima offerta, `→ agreed` su accept, `→ rejected` su reject.
+  - Truncation silenziosa del message a 500 char (no validation). Decisione UX-friendly per mobile clients.
+- **Errori tipizzati**: `MatchNotFoundForNegotiation` (404), `InvalidMatchState` (409), `AgentNotOwned` (403), `AgentNotInUsableState` (409), `AgentNotPartyToMatch` (403), `NegotiationNotFound` (404), `NegotiationNotActive` (409), `NegotiationNotForUser` (403), `MaxRoundsReached` (409), `NoOfferToAccept` (409), `CannotActOnOwnOffer` (409), `InvalidPrice` (422).
+- **Agent state policy**:
+  - `start_or_continue` / `reject` accettano agent in `('active', 'pending_mandate')` — tier 1 con agent pending può iniziare/rifiutare.
+  - `accept_offer` richiede agent `'active'` — accept porta verso deal closure (5.3) che richiede mandate firmato.
+- **`api/negotiations.py`** — 5 endpoint REST: POST start, POST accept, POST reject, GET id, GET list.
+- **`audit_service.NegotiationActions`** — aggiunte costanti `EXPIRE` e `CANCEL` (oltre alle 7 pre-emptive di 4.2). Audit emesso su ogni primitiva via `log_intent_event` (nome storico, helper generic per qualsiasi marketplace event).
+- **`intent_service.cancel_intent`** refactor: cascade alle negoziazioni delegata a `negotiation_service.cancel_negotiations_for_intent`. Rimosso direct `update(Negotiation)` + import inutile di `update`. Cleaner per 5.x.
+- **`main.py`** — router `negotiations` registrato.
+
+### Decisioni prese non esplicite nel brief
+- **Action codes verb-noun preservati**, NON past-tense. Il brief 5.1 proponeva `OFFER_SENT`/`COUNTER_OFFER_SENT`/`OFFER_ACCEPTED`/etc. — sarebbe stata regressione vs convenzione 4.2 approvata. Mantenuto verb-noun matching mandate_verifier + platform_limits + tool_layer naming. Una sola query `WHERE action='accept_offer'` cattura sia user-initiated che future agent-initiated occurrences.
+- **`AgentNotOwned` (403) vs `AgentNotPartyToMatch` (403)** — due errori distinti. Owned = agent.user_id != caller (auth boundary, info hiding non importa). Party = caller possiede uno degli intent del match (authorization per match-specific action). Entrambi 403 ma codici distinti per UI clarity.
+- **`get_negotiation_state` ritorna 403 (non 404) per non-party**. Razionale: il caller ha già il negotiation_id (legittimamente o meno). 403 dice "esiste, non tuo"; 404 implicherebbe "non esiste" misleadingly. Coerente con pattern di get_match_for_user in 4.3.
+- **`accept_offer` richiede agent.status=='active' (no pending)**, mentre start/reject accettano pending. Razionale: accept porta verso 5.3 deal creation che richiede mandate attivo. Tier=2 da JWT è condizione necessaria ma non sufficiente — agent.status è authoritative (DQ-26: post-revoke tier=2 ma agent='revoked'; non si deve poter accettare).
+- **Truncation message vs validation**: brief diceva truncate, l'ho seguito. Validation friendlier per V0 mobile (input field può sovra-mandare, server normalizza). Validation più strict si può aggiungere in V0.5 se vediamo abuse.
+- **`AcceptResult.next_step="create_deal_in_5_3"` come placeholder string** — handoff esplicito per 5.3. Quando 5.3 implementerà Deal creation, sostituirà con `{"path": "/api/deals", ...}` o equivalente. Per ora il caller della response sa che il deal è da creare nel prossimo step.
+- **Concurrency test (#20) non true-concurrent** — pytest async + `join_transaction_mode='create_savepoint'` rende il vero concurrent test problematico (le 2 sessioni condividono la stessa connection wrapper, no real DB-level concurrency). Test verifica l'invariante via Match lock: la seconda call vede Negotiation esistente e appende. La race su INSERT (fallback su UniqueConstraint) è coperta logicamente dal codice + UniqueConstraint declarato; vero stress test di concurrency è infrastruttura V0.5.
+- **`negotiation_service.cancel_negotiations_for_intent` non emette audit per-row**. Cascade è event aggregato catturato dal parent `cancel_intent` audit (params.intent_id + result.negotiations_cancelled count). Per-negotiation audit su cancel cascade è feature di V0.5 quando audit volume sarà calibrato.
+- **`audit_service.log_intent_event` riusato per negoziazioni** invece di nuovo `log_negotiation_event`. La function è già generic (action+params+result+optional agent_id/mandate_id); il nome `log_intent_event` è 4.1 historical baggage. Renaming diff sarebbe rumoroso (5+ callers); decisione: preservare il nome, documentare nel docstring. 7.x cleanup task per il rename.
+- **`AcceptRequest` / `RejectRequest` body con solo `agent_id`** — minimal. Reject opzionalmente `reason`. Niente price re-confirmation (l'API accetta semanticamente l'ultimo turn, no override). Test 11/16 coprono "can't accept own offer".
+
+### Test scritti / coverage
+- **28 nuovi test** in `tests/test_negotiation.py`:
+  - 8 start/continue (creates new, appends, inactive match, non-party agent, already agreed, rounds increment, is_final_round flag, max_rounds exceeded)
+  - 5 accept (marks agreed, requires tier 2 via API, rejects own offer, no offers yet, response carries next_step)
+  - 3 reject (marks rejected, requires tier 1 via API, rejects own offer)
+  - 3 state/list (party reads history, non-party 403, list only own)
+  - 3 concurrency/cascade (concurrent start invariant, intent cancel cascade, agent_not_owned)
+  - 2 validation (negative price, message truncation)
+  - 4 API surface (POST happy path, start tier-gated, list endpoint, get endpoint)
+- **Suite totale**: `pytest` → **194 passed in ~10s** (94 + 25 + 16 + 31 + 28). Nessuna regressione.
+- Test factory `_seed_setup` produce un negotiation context complete (seller tier-2 + buyer tier-1/2 + 2 intents + 1 match) in 1 chiamata. Riusato in tutti i 28 test.
+- `_seed_tier_1_user_with_agent` helper inline (factories.py non l'aveva). Da promuovere a factories.py se 5.x lo riusa.
+
+### Blocker / dubbi
+- **Concurrency test (#20)** verifica invariante Match-lock + UniqueConstraint ma non vera DB-level concurrency. È noto + accettato.
+- **`audit_service.log_intent_event` naming** ora è ufficialmente fuorviante (cattura intent, match, negotiation events). Rename a `log_marketplace_event` rinviato a 7.x cleanup — ora 5+ callers, ridurrebbe diff cleanliness.
+- **Step-up signature su accept** non implementato in V0. Brief dice rinviato a 5.3 (Deal service). In 5.3 quando Deal viene creato, step-up signature di entrambe le parti sarà richiesto.
+- **Match status `expired` non gestito in start_or_continue**. Solo `discovered` e `negotiating` consentiti. Match expired da intent expiry rifiuta start. Test 3 copre `cancelled`; expired ha lo stesso path.
+- **Negotiation expiry V0**: nessun auto-expire di negoziazioni inattive >72h. Decisione brief: V0.5+. Match scheduler in 4.3 non tocca negotiations.
+- **Helper `_seed_tier_1_user_with_agent` non in factories.py** — duplicato logically con default_user_kwargs(tier=1) + Agent insert. Da promuovere a factories.setup_tier_1_user_async se 5.x/6.x lo riusano.
+
+### Cosa significa "5.1 completa"
+Il primo livello di interazione strutturata tra agenti esiste. Da 5.1 in avanti, due utenti tier 1+ possono scambiarsi offerte/contro-offerte su un match, con cap 6 round, lock pessimistico, cascade lifecycle automatica. Tier 2+ può accettare → match.status='agreed', handoff a 5.3 per Deal creation.
+
+194 test verdi. Pronto per **5.2 Mini-asta** (concurrent matches sullo stesso intent: quando una controparte accetta, le altre vengono cancellate; optimistic locking + intent.status race).
+
+### Prossima task
+**5.2 Mini-asta logic**. Optimistic locking via `SELECT ... FOR UPDATE` su Intent quando un accept arriva. Cancellazione delle altre negotiations attive sullo stesso intent. EC5 race condition handling. Attendo via libera + brief denso analogo.

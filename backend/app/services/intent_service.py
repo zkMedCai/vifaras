@@ -48,12 +48,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Literal
 
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import categories, platform_limits as pl
 from app.models.schema import Intent, Mandate, Match, Negotiation, User
-from app.services import audit_service, embedding_service, match_service
+from app.services import (
+    audit_service,
+    embedding_service,
+    match_service,
+    negotiation_service,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -797,21 +802,12 @@ async def cancel_intent(
     intent.status = "cancelled"
     intent.closed_at = now
 
-    # Cascade: active negotiations on matches involving this intent → cancelled.
-    neg_result = await db.execute(
-        update(Negotiation)
-        .where(
-            Negotiation.match_id.in_(
-                select(Match.id).where(
-                    (Match.buy_intent_id == intent_id)
-                    | (Match.sell_intent_id == intent_id)
-                )
-            )
-        )
-        .where(Negotiation.status == "active")
-        .values(status="cancelled", closed_at=now)
+    # Cascade: active negotiations on matches involving this intent →
+    # cancelled. Delegated to negotiation_service (5.1) so all negotiation
+    # lifecycle queries live in one place.
+    neg_count = await negotiation_service.cancel_negotiations_for_intent(
+        db, intent_id=intent_id
     )
-    neg_count = neg_result.rowcount or 0
 
     # Cascade: existing matches involving this intent → expired. Delegated
     # to match_service so the cascade query lives next to the rest of the
