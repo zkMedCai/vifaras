@@ -465,6 +465,46 @@ class DealMessage(Base):
 # AUDIT LAYER
 # ============================================================================
 
+class Notification(Base):
+    """Per-user UX-layer notification (brief task 6.1).
+
+    Emitted post-commit by 4.x/5.x services as fire-and-forget. Failure
+    to persist a row must never roll back the underlying business action.
+    See `notification_service.create_notification`.
+    """
+    __tablename__ = "notifications"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+
+    type = Column(String(50), nullable=False)
+    category = Column(String(20), nullable=False)
+
+    title = Column(Text, nullable=False)
+    body = Column(Text, nullable=False)
+    payload = Column(JSONB, nullable=False, default=dict)
+
+    read_at = Column(DateTime, nullable=True)
+    acted_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_notifications_user_unread",
+            "user_id",
+            "created_at",
+            postgresql_where=(read_at.is_(None)),
+        ),
+        Index(
+            "ix_notifications_user_recent",
+            "user_id",
+            "created_at",
+        ),
+    )
+
+
 class AuditLog(Base):
     """
     Log immutabile di ogni azione agente.

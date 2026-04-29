@@ -57,7 +57,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.schema import Agent, Intent, Match, Negotiation
-from app.services import audit_service
+from app.services import audit_service, notification_service
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +367,9 @@ async def start_or_continue(
         )
 
     # 3. Caller's user must own one side of the match.
-    await _verify_user_party_to_match(db, user_id=user_id, match=match)
+    buy_intent, sell_intent = await _verify_user_party_to_match(
+        db, user_id=user_id, match=match
+    )
 
     # 4. Lock existing negotiation if any; otherwise create fresh.
     nego = await db.scalar(
@@ -449,6 +451,35 @@ async def start_or_continue(
 
     await db.commit()
     await db.refresh(nego)
+
+    # 6.1 — fire-and-forget UX notification to the counterparty.
+    counterparty_user_id = (
+        sell_intent.user_id if user_id == buy_intent.user_id else buy_intent.user_id
+    )
+    notif_type = (
+        notification_service.NotificationType.OFFER_RECEIVED
+        if turn_type == "offer"
+        else notification_service.NotificationType.COUNTER_OFFER_RECEIVED
+    )
+    price_eur = price_cents / 100
+    await notification_service.create_notification(
+        db,
+        user_id=counterparty_user_id,
+        notification_type=notif_type,
+        title=(
+            "Hai ricevuto un'offerta"
+            if turn_type == "offer"
+            else "Nuova contro-offerta"
+        ),
+        body=f"Prezzo: €{price_eur:.2f} (round {nego.rounds_used})",
+        payload={
+            "negotiation_id": nego.id,
+            "match_id": match_id,
+            "turn_number": nego.rounds_used,
+            "price_cents": price_cents,
+            "is_final_round": bool((nego.state or {}).get("is_final_round")),
+        },
+    )
 
     return TurnResult(
         negotiation_id=nego.id,
@@ -611,6 +642,22 @@ async def accept_offer(
     )
 
     await db.commit()
+
+    # 6.1 — fire-and-forget UX notification for both parties: a deal is
+    # now pending and they each need to sign with their passkey.
+    for recipient in (buy_intent_obj.user_id, sell_intent_obj.user_id):
+        await notification_service.create_notification(
+            db,
+            user_id=recipient,
+            notification_type=notification_service.NotificationType.DEAL_AWAITING_YOUR_SIGNATURE,
+            title="Firma il deal con passkey",
+            body=f"Hai 24h per firmare. Prezzo concordato: €{agreed_price/100:.2f}",
+            payload={
+                "deal_id": deal.id,
+                "negotiation_id": nego.id,
+                "agreed_price_cents": agreed_price,
+            },
+        )
 
     return AcceptResult(
         negotiation_id=nego.id,

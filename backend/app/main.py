@@ -15,6 +15,7 @@ from app.api import (
     mandates as mandate_routes,
     matches as match_routes,
     negotiations as negotiation_routes,
+    notifications as notification_routes,
     step_up as step_up_routes,
 )
 from app.core.config import settings
@@ -45,6 +46,7 @@ app.include_router(intent_routes.router)
 app.include_router(match_routes.router)
 app.include_router(negotiation_routes.router)
 app.include_router(deal_routes.router)
+app.include_router(notification_routes.router)
 app.include_router(_test_endpoints.router)
 app.include_router(_dev_endpoints.router)
 

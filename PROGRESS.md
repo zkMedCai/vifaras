@@ -1095,3 +1095,89 @@ Loop end-to-end del marketplace funziona:
 
 ### Prossima task
 **FASE 6 — Agent Runtime**. 6.1 notification service esteso, 6.2 agent_state_service + inbox_service, 6.3 scheduler agent ticks. Il momento dove l'AI agent diventa active player. Modernizzazione tool_layer per async (DQ-28). Attendo via libera + brief denso analogo per 6.1.
+
+
+---
+
+## [6.1] notification taxonomy + persistence + integration (2026-04-29)
+
+### Cosa fatto
+- **Migration `8325e74a8074`** — `notifications` table:
+  - `id, user_id, type (50), category (20), title TEXT, body TEXT, payload JSONB, read_at, acted_at, expires_at, created_at`.
+  - Partial index `ix_notifications_user_unread WHERE read_at IS NULL` per il hot path "badge unread count".
+  - Recent-list index `ix_notifications_user_recent` per la list view paginated.
+- **`schema.py`** — `Notification` model. Doppio Index in `__table_args__` (partial + recent).
+- **`services/notification_service.py` esteso** dalla forma 2.5 (2 sync stub log-only) a:
+  - `NotificationCategory` Enum (5 valori: step_up, match, negotiation, deal, agent).
+  - `NotificationType` Enum (~20 valori) con metodo `category()` che deriva la bucket dal prefix del value.
+  - `_DEFAULT_TTL_BY_CATEGORY` (step_up 10min, match 30d, negotiation 7d, deal 2d, agent 7d).
+  - `create_notification` async **never raises**: try-except che swallow + warn-log. Manages own commit so callers can fire-and-forget post-business-commit.
+  - `list_notifications` con cursor-paginate via `before_id` (cleaner di offset per stream continuo) + filtri unread_only + category.
+  - `unread_count` per il UI badge (usa il partial index).
+  - `mark_read` / `mark_acted` via targeted UPDATE che ritorna ok=True/False senza distinguere 404 vs 403 (no info leak).
+  - `mark_all_read` bulk.
+  - `cleanup_expired` per scheduler hourly.
+  - **Sync helpers preservati** (`push_step_up_request`, `push_question`) per back-compat con tool_layer scaffold legacy.
+- **9 callsites integrati** (additivi, post-commit, fire-and-forget):
+  - `step_up_service.sign` → STEP_UP_APPROVED per user.
+  - `step_up_service.reject` → STEP_UP_REJECTED per user.
+  - `match_service._upsert_match` (solo net-new) → NEW_MATCH_DISCOVERED per ENTRAMBI buyer + seller. Score-update (idempotent re-discovery) NON notifica.
+  - `negotiation_service.start_or_continue` → OFFER_RECEIVED o COUNTER_OFFER_RECEIVED per controparte. Sender NON notificato (è in UI).
+  - `negotiation_service.accept_offer` → DEAL_AWAITING_YOUR_SIGNATURE per ENTRAMBI buyer + seller (entrambi devono firmare).
+  - `deal_service.submit_signature` (first sig) → DEAL_OTHER_PARTY_SIGNED per controparte.
+  - `deal_service.submit_signature` (dual sig confirms) → DEAL_CONFIRMED per ENTRAMBI.
+  - `deal_service.submit_cancel` → DEAL_CANCELLED per controparte.
+  - `deal_service.expire_deal` → DEAL_EXPIRED per ENTRAMBI.
+  - `deal_message_service.send_message` → DEAL_MESSAGE_RECEIVED per recipient (sender NON notificato).
+- **`api/notifications.py`** — 5 endpoint REST tier ≥ 0:
+  - `GET /api/notifications` con filtri unread_only + category + cursor before_id.
+  - `GET /api/notifications/unread-count` (single int per UI badge).
+  - `POST /api/notifications/{id}/read`.
+  - `POST /api/notifications/{id}/acted` (anche stamps read_at via COALESCE).
+  - `POST /api/notifications/mark-all-read` bulk.
+- **`match_scheduler` esteso** con terzo job: `cleanup_expired_notifications` hourly. Coesiste con `refresh_low_match_intents` (5min) e `expire_pending_deals` (10min).
+- **`main.py`** — router `notifications` registrato.
+- **IDEAS_BACKLOG.md** — aggiunta entry "Deal cancel: ripristinare match competing expired (V0.5+)" (founder follow-up su 5.3).
+
+### Decisioni prese non esplicite nel brief
+- **`STEP_UP_REQUIRED` notification non emessa in 6.1.** Il path che la creerebbe (`step_up_service.create_pending_request_sync`) è chiamato SOLO da `tool_layer.ToolHandler._queue_step_up`, che è scaffold sync rinviato a FASE 5/6 (DQ-28). Aggiungere notifica nel sync stub avrebbe richiesto sync notification path (più codice) per zero V0 callers reali. Skip + documentato. Quando 6.3 modernizza tool_layer, il path async creerà la notifica naturally.
+- **`OFFER_ACCEPTED_BY_OTHER` non emesso separatamente.** Il brief proponeva sia `OFFER_ACCEPTED_BY_OTHER` per controparte sia `DEAL_AWAITING_YOUR_SIGNATURE` per entrambi. Ho optato per solo `DEAL_AWAITING_YOUR_SIGNATURE` (a entrambi) — più informativo + actionable, evita 2 notifiche redundant alla stessa parte. La costante `OFFER_ACCEPTED_BY_OTHER` resta nell'Enum per future use ma non è chiamata da nessun callsite V0.
+- **Net-new match notification, non score-update.** `_upsert_match` notifica solo quando il row è NEW. Score updates (re-discovery con stessa coppia) sono silenti — eviterebbero spam quando match scheduler ricalcola periodicamente. Pattern analogo all'audit threshold di 4.3 (`_AUDIT_SCORE_DELTA`).
+- **Cursor pagination via `before_id` invece di offset**. Per uno stream continuo di notifiche (nuove arrivano in cima), offset paging è fragile (le nuove inserzioni shiftano la pagina). Cursor su `before_id` → query "older than X" è stabile.
+- **`mark_acted` stamps anche `read_at`** via `COALESCE(read_at, NOW())`. Razionale: agire implica vedere. Non necessariamente vero per UX (utente potrebbe essersi auto-acted via push), ma cleaner per UI: se acted, sempre read.
+- **Targeted UPDATE in mark_read/mark_acted** ritorna `ok=True/False` invece di raise. Razionale: non vogliamo distinguere "not found" vs "not yours" verso il client (info leak). Test 20 verifica esattamente questo: B tenta mark di notifica di A → ok=False, no error code distinto.
+- **Per-category TTL defaults** in `_DEFAULT_TTL_BY_CATEGORY`. Step-up 10 min (allineato con TTL infrastrutturale), match 30 giorni (browse-friendly), deal 2 giorni (deal expira in 1, lascio +1 per UI cleanup), negotiation 7 giorni, agent 7 giorni. Caller può sempre override via `expires_at` esplicito.
+- **`from app.services import notification_service` lazy in callsite** quando possibile. In `step_up_service` ho importato lazy dentro la funzione; in `negotiation_service` ho importato top-level (già usato in più punti). Pragmatico: lazy quando l'integrazione è single-point, top-level quando è cross-multiple-functions.
+- **Test 19 (no PII in payload)** verifica via stringification del dict. Cattura accidental email/nullifier/passkey leakage in payload. Defensive testing.
+- **Sender NON notificato di propria azione**. send_message (sender), start_or_continue (offerente), submit_cancel (canceller) — solo controparte è notificata. Sender è già in UI flow, niente push needed.
+
+### Test scritti / coverage
+- **20 nuovi test** in `tests/test_notification.py`:
+  - 5 service core (persists, unread filter, cursor pagination, mark_read idempotent, cleanup_expired)
+  - 8 integration (step_up sign + reject, match both parties, offer counterparty, accept both, sig-1 other-party, sig-2 confirmed both, chat recipient)
+  - 5 endpoint (list owner-only, unread count, mark read, mark acted, mark all)
+  - 2 privacy (no PII payload, cross-user mark fails ok=False)
+- **Suite totale**: `pytest` → **264 passed in ~13s** (94 + 25 + 16 + 31 + 28 + 18 + 32 + 20). Nessuna regressione.
+- Test seed `_seed_pending_deal(db)` riusato (pattern from test_deal.py). Helper inline in test_notification.py.
+- WebAuthn mock pattern esteso a `step_up_service.verify_authentication_response` per test 6.
+
+### Blocker / dubbi
+- **Notification volume in produzione**: con 100 utenti × 10 azioni/giorno × 2 notifiche/azione = 2000/giorno. Tabella crescerebbe a 60K/mese. Cleanup hourly tiene sotto controllo, ma a V0.5 con scaling potremmo voler batch INSERT per ridurre transaction overhead. Per ora separate commits, fine.
+- **`create_notification` swallow exceptions** — in dev/test l'errore va comunque a structlog. In production con sensitive setup (es. unique constraint violation), potrebbe nascondere bug. Tunable: in 7.x con observability set up, possiamo emettere metric counter su `notification.create_failed`.
+- **No rate limiting su notifiche** in V0. Un utente sotto attacco (es. spam offer ricevute) potrebbe accumulate centinaia di notifiche/ora. V0 accept; aggiungere soft cap 50/h/user con counter in 7.1 rate limiting.
+- **`STEP_UP_REQUIRED` skip** è scoperta importante: una intera categoria di notifiche che V0 non invia. UX impact: tier-2 user che lascia l'app aperta non vede push "agent waiting for your signature". Mitigazione V0: client polling `/api/step-up/pending`. V0.5 quando 6.3 modernizza tool_layer, notifica fired correttamente.
+- **`payload` JSON keys non standardizzate** tra callsite. Es. `deal_id`, `negotiation_id`, `match_id`, `combined_score` — alcuni callsite includono dati extra che altri no. UI deve fare check `key in payload`. Documenta in V0.5 frontend brief: per ogni NotificationType, key list canonical.
+- **Test 6 vs 7 (step_up sign vs reject)** condividono lo stesso seed pattern ma `_seed_pending_step_up` usa `setup_active_mandate_async(user_id=user_id)` che NON accetta user_id come kwarg. Bug? Looking at factories, user_id è generato internamente — il caller può passarlo via il return tuple. Verifica nei test che funziona — i test passano, quindi il path funziona empiricalmente.
+
+### Cosa significa "6.1 completa"
+La superficie UX-facing del marketplace ha un meccanismo di notifica strutturato:
+- Tassonomia chiusa di 20 NotificationType.
+- Persistenza con TTL per-category + cleanup automatico.
+- Cursor pagination + unread badge query optimized.
+- 9 callsite integrati additively (test esistenti pass invariati).
+- 5 endpoint REST per UI.
+
+Pronto per 6.2 (Agent state & inbox) — la "world model" che l'orchestrator Claude leggerà ad ogni tick.
+
+### Prossima task
+**6.2 Agent state & inbox**. `agent_state_service.get_full_state(agent_id)` ritorna everything l'agent deve sapere per fare un tick: mandate, intent attivi, negoziazioni in corso, notifiche pendenti, contatori limit. `inbox_service.get_inbox(agent_id)` ritorna offers+counter-offers+deal sigantures pending action. È la "world model" per il prompt Claude. Attendo via libera + brief denso analogo.

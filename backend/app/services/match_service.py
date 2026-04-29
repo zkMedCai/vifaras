@@ -188,6 +188,8 @@ def _resolve_buy_sell(
 class _ScoredCandidate:
     buy_intent_id: str
     sell_intent_id: str
+    buy_user_id: str
+    sell_user_id: str
     similarity: float
     price_proximity: float
     combined: float
@@ -272,6 +274,8 @@ async def find_matches_for_intent(
             _ScoredCandidate(
                 buy_intent_id=buy_intent.id,
                 sell_intent_id=sell_intent.id,
+                buy_user_id=buy_intent.user_id,
+                sell_user_id=sell_intent.user_id,
                 similarity=similarity,
                 price_proximity=price_proximity,
                 combined=combined,
@@ -347,6 +351,26 @@ async def _upsert_match(
             },
             success=True,
         )
+        # 6.1 — fire-and-forget UX notification to BOTH parties on net-new
+        # match. We deliberately don't notify on score-only updates: a
+        # match that already exists is already in the user's list, the
+        # ranking shift is internal.
+        from app.services import notification_service
+
+        for recipient in (sc.buy_user_id, sc.sell_user_id):
+            await notification_service.create_notification(
+                db,
+                user_id=recipient,
+                notification_type=notification_service.NotificationType.NEW_MATCH_DISCOVERED,
+                title="Nuovo match trovato",
+                body="Abbiamo trovato un intent compatibile.",
+                payload={
+                    "match_id": new_match.id,
+                    "buy_intent_id": sc.buy_intent_id,
+                    "sell_intent_id": sc.sell_intent_id,
+                    "combined_score": round(sc.combined, 4),
+                },
+            )
         return new_match.id
 
     old_combined = float(existing.combined_score or 0.0)

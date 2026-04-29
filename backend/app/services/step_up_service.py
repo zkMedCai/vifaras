@@ -342,6 +342,21 @@ async def sign(
         await db.rollback()
         raise
 
+    # 6.1 — fire-and-forget UX notification (post-commit, never raises).
+    from app.services import notification_service
+
+    await notification_service.create_notification(
+        db,
+        user_id=user_id,
+        notification_type=notification_service.NotificationType.STEP_UP_APPROVED,
+        title="Firma confermata",
+        body=f"Hai approvato l'azione: {request.action}",
+        payload={
+            "step_up_id": request.id,
+            "action": request.action,
+        },
+    )
+
     return SignedStepUp(
         step_up_id=request.id,
         status="approved",
@@ -363,6 +378,22 @@ async def reject(
     except Exception:
         await db.rollback()
         raise
+
+    # 6.1 — fire-and-forget UX notification.
+    from app.services import notification_service
+
+    await notification_service.create_notification(
+        db,
+        user_id=user_id,
+        notification_type=notification_service.NotificationType.STEP_UP_REJECTED,
+        title="Firma rifiutata",
+        body=f"Hai rifiutato l'azione: {request.action}",
+        payload={
+            "step_up_id": request.id,
+            "action": request.action,
+        },
+    )
+
     return RejectedStepUp(
         step_up_id=request.id,
         status="rejected",

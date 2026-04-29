@@ -299,9 +299,9 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - Step-up signatures buyer + seller
 - Chat E2E pseudonimizzata
 
-### 🔲 FASE 6 — Agent runtime
+### 🔄 FASE 6 — Agent runtime (in corso)
 
-#### 🔲 6.1 Notification service esteso
+#### ✅ 6.1 Notification service esteso
 - V0: console log + `/api/dev/notifications`
 - V1+: APNs / FCM reale
 

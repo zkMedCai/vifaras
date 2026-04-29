@@ -576,6 +576,40 @@ async def submit_signature(
 
     await db.commit()
 
+    # 6.1 — fire-and-forget UX notifications. Two cases:
+    #   - first signature: notify counterparty "the other party signed"
+    #   - both signed (deal_confirmed=True): notify BOTH parties
+    from app.services import notification_service
+
+    other_user_id = (
+        deal.seller_user_id if role == "buyer" else deal.buyer_user_id
+    )
+    if deal_confirmed:
+        for recipient in (deal.buyer_user_id, deal.seller_user_id):
+            await notification_service.create_notification(
+                db,
+                user_id=recipient,
+                notification_type=notification_service.NotificationType.DEAL_CONFIRMED,
+                title="Deal confermato",
+                body=(
+                    f"Entrambe le parti hanno firmato. "
+                    f"Apri la chat per coordinare la consegna."
+                ),
+                payload={
+                    "deal_id": deal.id,
+                    "agreed_price_cents": deal.agreed_price_cents,
+                },
+            )
+    else:
+        await notification_service.create_notification(
+            db,
+            user_id=other_user_id,
+            notification_type=notification_service.NotificationType.DEAL_OTHER_PARTY_SIGNED,
+            title="L'altra parte ha firmato",
+            body="Manca solo la tua firma per completare il deal.",
+            payload={"deal_id": deal.id, "role_signed": role},
+        )
+
     return SignSubmitResult(
         deal_id=deal.id,
         role=role,
@@ -637,6 +671,26 @@ async def submit_cancel(
     )
 
     await db.commit()
+
+    # 6.1 — fire-and-forget UX notification to the OTHER party. The
+    # canceller already knows what they did; the counterparty needs to be
+    # told "the other side pulled out".
+    from app.services import notification_service
+
+    other_user_id = (
+        deal.seller_user_id if user_id == deal.buyer_user_id else deal.buyer_user_id
+    )
+    await notification_service.create_notification(
+        db,
+        user_id=other_user_id,
+        notification_type=notification_service.NotificationType.DEAL_CANCELLED,
+        title="Deal annullato",
+        body="L'altra parte ha annullato il deal. I tuoi intent sono di nuovo attivi.",
+        payload={
+            "deal_id": deal.id,
+            "cancellation_reason": CANCELLATION_REASON_USER,
+        },
+    )
 
     return CancelResult(
         deal_id=deal.id,
@@ -735,6 +789,25 @@ async def expire_deal(
     )
 
     await db.commit()
+
+    # 6.1 — notify both parties that the deal expired without dual sign.
+    from app.services import notification_service
+
+    for recipient in (deal.buyer_user_id, deal.seller_user_id):
+        await notification_service.create_notification(
+            db,
+            user_id=recipient,
+            notification_type=notification_service.NotificationType.DEAL_EXPIRED,
+            title="Deal scaduto",
+            body=(
+                "Le 24h per firmare sono scadute. I tuoi intent sono di "
+                "nuovo attivi."
+            ),
+            payload={
+                "deal_id": deal.id,
+                "cancellation_reason": CANCELLATION_REASON_EXPIRED,
+            },
+        )
 
     return ExpireResult(
         deal_id=deal.id,

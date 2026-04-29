@@ -136,6 +136,24 @@ async def send_message(
 
     await db.commit()
     await db.refresh(msg)
+
+    # 6.1 — fire-and-forget UX notification to the recipient (the OTHER
+    # party in the deal). Server doesn't decrypt the content; the
+    # notification body is generic.
+    from app.services import notification_service
+
+    recipient_user_id = (
+        deal.seller_user_id if user_id == deal.buyer_user_id else deal.buyer_user_id
+    )
+    await notification_service.create_notification(
+        db,
+        user_id=recipient_user_id,
+        notification_type=notification_service.NotificationType.DEAL_MESSAGE_RECEIVED,
+        title="Nuovo messaggio",
+        body="Hai ricevuto un messaggio nella chat del deal.",
+        payload={"deal_id": deal.id, "message_id": msg.id},
+    )
+
     return msg
 
 

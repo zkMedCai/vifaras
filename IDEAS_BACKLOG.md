@@ -88,6 +88,12 @@
 - Trigger: prima del deploy su >1 worker.
 - Riferimento: DQ-33
 
+### Deal cancel: ripristinare match competing expired (V0.5+)
+- Quando un deal viene cancellato/expired, il chosen match torna `discovered`. I match competing che 5.2 mini-auction aveva expired NON vengono ripristinati — match scheduler li rediscoverà al next tick (5 min latency).
+- Trigger di promozione: se utenti report "ho perso match dopo cancel deal", aggiungere logica in `_rollback_deal_state` che identifica i match competing tramite query audit log (`MatchActions.EXPIRE` con `params.reason='other_match_accepted'` linked al deal) e li ripristina a `discovered`.
+- Costo: tracking + query audit + selective restore. Forse 30-50 LOC.
+- Beneficio: zero latenza UX, no "match flicker".
+
 ### Match list privacy: nascondere anche reservation_price (V1+)
 - V0: compromesso "show reservation, hide ideal" (DQ-31).
 - Trigger di revisione: se in V1 vediamo gaming pattern (seller "vedo cap buyer = sparo prezzo alto"), nascondere anche reservation. Mostrare solo `combined_score` + `counterparty.title/category`.

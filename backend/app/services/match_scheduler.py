@@ -31,6 +31,33 @@ from app.services import match_service
 _scheduler: AsyncIOScheduler | None = None
 
 
+async def cleanup_expired_notifications() -> dict[str, int]:
+    """Hourly tick: prune notifications past their `expires_at`.
+
+    Notifications carry per-category default TTLs (10 min for step-up,
+    24h for deals, 30d for matches, 7d for negotiations). This sweep
+    keeps the table from growing unbounded.
+    """
+    from app.core.db import AsyncSessionLocal
+    from app.services import notification_service
+
+    async with AsyncSessionLocal() as db:
+        try:
+            deleted = await notification_service.cleanup_expired(db)
+        except Exception as exc:
+            log.warning(
+                "match_scheduler.notification_cleanup_failed",
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+            return {"deleted": 0, "errored": 1}
+
+    log.info(
+        "match_scheduler.notification_cleanup_tick_complete", deleted=deleted
+    )
+    return {"deleted": deleted, "errored": 0}
+
+
 async def expire_pending_deals() -> dict[str, int]:
     """One tick: expire pending Deals past their `expires_at` (24h V0 default).
 
@@ -180,6 +207,15 @@ def start_scheduler() -> AsyncIOScheduler | None:
         "interval",
         minutes=10,
         id="deal_expire_pending",
+        replace_existing=True,
+    )
+    # 6.1: hourly notification cleanup. Lower frequency than the others —
+    # pruning a few rows per hour is plenty for V0 traffic.
+    sched.add_job(
+        cleanup_expired_notifications,
+        "interval",
+        hours=1,
+        id="notification_cleanup_expired",
         replace_existing=True,
     )
     sched.start()
