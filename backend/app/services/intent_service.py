@@ -798,6 +798,15 @@ async def cancel_intent(
             already_cancelled=True,
         )
 
+    # 5.2: matched intents are held by the deal flow (5.3 will revert to
+    # `active` if the deal is cancelled before confirmation). Cancelling
+    # unilaterally would leak a half-formed deal.
+    if intent.status == "matched":
+        raise negotiation_service.IntentAlreadyMatched(
+            f"intent {intent_id!r} is in status 'matched' and held by "
+            f"the deal flow; cancel via the deal endpoint instead"
+        )
+
     now = _utcnow()
     intent.status = "cancelled"
     intent.closed_at = now

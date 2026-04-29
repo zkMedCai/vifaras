@@ -119,6 +119,16 @@
 - Paga 2 ore di debug all'integrazione mobile
 - Da fare prima di FASE 11
 
+### Rename audit_service.log_intent_event → log_marketplace_event
+- Function già generic: action+params+result+optional agent_id/mandate_id. Il nome è 4.1 historical baggage; ora cattura intent + match + negotiation events e in 5.3+ catturerà deal events.
+- Quando: 7.x cleanup, dopo che 5.2/5.3/6.x avranno popolato i callers (≥10 sites). Prima di V0 launch.
+- Diff piccolo (string rename); minimal risk.
+
+### True concurrency stress test su negotiation + match service
+- V0 ha test "lock-check invariant" che verifica logica ma non vera DB-level concurrency (pytest async + savepoint rendono impossibile real contention).
+- Quando: V0.5 pre-launch, con setup pgbench / Locust dedicato.
+- Verifica: race accept simultanei, deadlock cross-transaction, throughput sotto N concurrent users.
+
 ### Atomic rollback test post-flush
 - DQ-16: copertura solo via code review attualmente
 - Simulare fallimento durante db.commit() richiede infrastructure di test invasiva

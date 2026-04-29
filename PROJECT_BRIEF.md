@@ -289,7 +289,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - `reject_offer()` (richiede **tier ≥ 1**)
 - Logica best-and-final automatica al 5° round
 
-#### 🔲 5.2 Mini-asta logic
+#### ✅ 5.2 Mini-asta logic
 - N>1 match → offerte parallele
 - EC5 race condition: optimistic locking via `SELECT ... FOR UPDATE`
 

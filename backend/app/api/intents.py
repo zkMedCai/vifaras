@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.security import CurrentUser, require_tier
-from app.services import intent_service
+from app.services import intent_service, negotiation_service
 
 router = APIRouter(prefix="/api/intents", tags=["intents"])
 
@@ -100,7 +100,9 @@ class CancelIntentResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _to_http(exc: intent_service.IntentError) -> HTTPException:
+def _to_http(
+    exc: intent_service.IntentError | negotiation_service.NegotiationError,
+) -> HTTPException:
     detail: dict[str, Any] = {"code": exc.code, "message": str(exc)}
     if isinstance(exc, intent_service.TooManyActiveIntents):
         detail["next_step"] = {
@@ -246,7 +248,12 @@ async def cancel_intent_endpoint(
         result = await intent_service.cancel_intent(
             db, user_id=user.user_id, intent_id=intent_id
         )
-    except intent_service.IntentError as exc:
+    except (
+        intent_service.IntentError,
+        negotiation_service.NegotiationError,
+    ) as exc:
+        # cancel_intent can raise IntentAlreadyMatched (NegotiationError)
+        # when a competing accept already promoted the intent to `matched`.
         raise _to_http(exc) from exc
     return CancelIntentResponse(
         intent_id=result.intent.id,

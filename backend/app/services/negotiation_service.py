@@ -73,6 +73,26 @@ DEFAULT_LIST_LIMIT: Final[int] = 20
 MAX_LIST_LIMIT: Final[int] = 50
 
 
+class CancelReason:
+    """Reasons a Negotiation transitions to `cancelled`.
+
+    Stored in `Negotiation.state["cancellation_reason"]` so post-mortem
+    queries can distinguish "user pulled the plug" from "lost the auction".
+    Adding a new reason is a code change — string-typed reasons in callers
+    would drift.
+
+    V0 actively uses `OTHER_MATCH_ACCEPTED` (5.2 mini-auction cascade).
+    The other constants are pre-defined for 5.3+ consumers (deal flow,
+    intent expiry sweep, mandate revocation cascade) so 5.x doesn't
+    introduce ad-hoc strings.
+    """
+
+    OTHER_MATCH_ACCEPTED: Final[str] = "other_match_accepted"
+    INTENT_CANCELLED_BY_USER: Final[str] = "intent_cancelled_by_user"
+    INTENT_EXPIRED: Final[str] = "intent_expired"
+    AGENT_REVOKED: Final[str] = "agent_revoked"
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -149,6 +169,19 @@ class CannotActOnOwnOffer(NegotiationError):
 class InvalidPrice(NegotiationError):
     code = "invalid_price"
     http_status = 422
+
+
+class IntentAlreadyMatched(NegotiationError):
+    """Another negotiation already accepted on one of this match's intents.
+
+    Raised by `accept_offer` when the optimistic intent.status='active'
+    check fails inside the row lock. The competing negotiation has
+    already transitioned the intent to `matched` and our accept lost
+    the race. Caller should treat this as final — re-trying won't help.
+    """
+
+    code = "intent_already_matched"
+    http_status = 409
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +471,17 @@ async def accept_offer(
     agent_id: str,
     negotiation_id: str,
 ) -> AcceptResult:
-    """Accept the counterparty's last turn. Tier ≥ 2 (deal hand-off in 5.3)."""
+    """Accept the counterparty's last turn. Tier ≥ 2 (deal hand-off in 5.3).
+
+    Mini-auction safety (5.2): in addition to the negotiation/match lock,
+    accept also locks BOTH intents involved in sorted-ID order
+    (deadlock-prevention). It then verifies both intents are still
+    `active` — if a competing accept on the other side got there first,
+    one of the intents is already `matched` and we raise
+    `IntentAlreadyMatched` cleanly. On success, both intents transition
+    to `matched`, competing negotiations on either intent are cancelled
+    with reason `OTHER_MATCH_ACCEPTED`, and competing matches are expired.
+    """
     # 1. Auth — agent active (not pending; accept implies imminent deal).
     await _verify_agent_ownership(
         db, agent_id=agent_id, user_id=user_id, accept_pending=False
@@ -463,9 +506,28 @@ async def accept_offer(
     match = await _load_match_locked(db, nego.match_id)
     await _verify_user_party_to_match(db, user_id=user_id, match=match)
 
+    # 4. Mini-auction lock: lock both intents in sorted-ID order. If a
+    #    competing accept already promoted either intent to `matched`,
+    #    raise IntentAlreadyMatched and don't mutate anything.
+    sorted_intent_ids = sorted([match.buy_intent_id, match.sell_intent_id])
+    locked_intents = list(
+        await db.scalars(
+            select(Intent)
+            .where(Intent.id.in_(sorted_intent_ids))
+            .order_by(Intent.id)
+            .with_for_update()
+        )
+    )
+    for intent in locked_intents:
+        if intent.status != "active":
+            raise IntentAlreadyMatched(
+                f"intent {intent.id!r} is in status {intent.status!r}, "
+                f"not 'active' — another negotiation got there first"
+            )
+
     agreed_price = int(last_turn["price_cents"])
 
-    # 4. Append accept turn.
+    # 5. Append accept turn + transition negotiation/match.
     accept_turn = {
         "turn_number": (nego.rounds_used or 0) + 1,
         "agent_id": agent_id,
@@ -482,9 +544,29 @@ async def accept_offer(
     nego.closed_at = _utcnow()
     match.status = "agreed"
 
+    # 6. Mini-auction: promote both intents to `matched` (held by the
+    #    upcoming Deal in 5.3; reverts to `active` if the deal cancels).
+    for intent in locked_intents:
+        intent.status = "matched"
+
+    # 7. Cascade: cancel other active negotiations on either intent, and
+    #    expire other discovered/negotiating matches on either intent.
+    cancelled_count = await _cancel_competing_negotiations(
+        db,
+        intent_ids=sorted_intent_ids,
+        except_negotiation_id=nego.id,
+        owning_user_id=user_id,
+    )
+    expired_count = await _expire_competing_matches(
+        db,
+        intent_ids=sorted_intent_ids,
+        except_match_id=match.id,
+        owning_user_id=user_id,
+    )
+
     await db.flush()
 
-    # 5. Audit.
+    # 8. Audit.
     await audit_service.log_intent_event(
         db,
         user_id=user_id,
@@ -495,7 +577,11 @@ async def accept_offer(
             "agent_id": agent_id,
             "agreed_price_cents": agreed_price,
         },
-        result={"status": "agreed"},
+        result={
+            "status": "agreed",
+            "competing_negotiations_cancelled": cancelled_count,
+            "competing_matches_expired": expired_count,
+        },
         success=True,
         agent_id=agent_id,
     )
@@ -508,6 +594,117 @@ async def accept_offer(
         agreed_price_cents=agreed_price,
         next_step="create_deal_in_5_3",
     )
+
+
+# ---------------------------------------------------------------------------
+# Mini-auction cascade helpers (5.2)
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_competing_negotiations(
+    db: AsyncSession,
+    *,
+    intent_ids: list[str],
+    except_negotiation_id: str,
+    owning_user_id: str,
+) -> int:
+    """Cancel active negotiations on matches that touch any of `intent_ids`,
+    except `except_negotiation_id`. Returns rowcount.
+
+    Per-row mutation (not bulk UPDATE) so we can stamp
+    `state["cancellation_reason"] = OTHER_MATCH_ACCEPTED` and emit a
+    per-negotiation audit row. Volumes are tiny in V0 (≤ N matches per
+    intent, ≤ 1 active negotiation per match) — round-trip count is fine.
+    """
+    # Find matches involving any of the intents.
+    match_id_rows = await db.scalars(
+        select(Match.id).where(
+            or_(
+                Match.buy_intent_id.in_(intent_ids),
+                Match.sell_intent_id.in_(intent_ids),
+            )
+        )
+    )
+    match_ids = list(match_id_rows)
+    if not match_ids:
+        return 0
+
+    competing = list(
+        await db.scalars(
+            select(Negotiation)
+            .where(Negotiation.match_id.in_(match_ids))
+            .where(Negotiation.id != except_negotiation_id)
+            .where(Negotiation.status == "active")
+            .with_for_update()
+        )
+    )
+
+    for nego in competing:
+        nego.status = "cancelled"
+        nego.closed_at = _utcnow()
+        _set_state_keys(
+            nego,
+            final_status="cancelled",
+            cancellation_reason=CancelReason.OTHER_MATCH_ACCEPTED,
+        )
+        await audit_service.log_intent_event(
+            db,
+            user_id=owning_user_id,
+            action=audit_service.NegotiationActions.CANCEL,
+            params={
+                "negotiation_id": nego.id,
+                "match_id": nego.match_id,
+                "reason": CancelReason.OTHER_MATCH_ACCEPTED,
+            },
+            result={"status": "cancelled"},
+            success=True,
+        )
+
+    return len(competing)
+
+
+async def _expire_competing_matches(
+    db: AsyncSession,
+    *,
+    intent_ids: list[str],
+    except_match_id: str,
+    owning_user_id: str,
+) -> int:
+    """Expire matches on `intent_ids` other than `except_match_id`.
+
+    Only transitions out of pre-terminal states (`discovered`,
+    `negotiating`) so terminal history is preserved.
+    """
+    competing = list(
+        await db.scalars(
+            select(Match)
+            .where(
+                or_(
+                    Match.buy_intent_id.in_(intent_ids),
+                    Match.sell_intent_id.in_(intent_ids),
+                )
+            )
+            .where(Match.id != except_match_id)
+            .where(Match.status.in_(("discovered", "negotiating")))
+            .with_for_update()
+        )
+    )
+
+    for m in competing:
+        m.status = "expired"
+        await audit_service.log_intent_event(
+            db,
+            user_id=owning_user_id,
+            action=audit_service.MatchActions.EXPIRE,
+            params={
+                "match_id": m.id,
+                "reason": CancelReason.OTHER_MATCH_ACCEPTED,
+            },
+            result={"status": "expired"},
+            success=True,
+        )
+
+    return len(competing)
 
 
 # ---------------------------------------------------------------------------

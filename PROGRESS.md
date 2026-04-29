@@ -958,3 +958,57 @@ Il primo livello di interazione strutturata tra agenti esiste. Da 5.1 in avanti,
 
 ### Prossima task
 **5.2 Mini-asta logic**. Optimistic locking via `SELECT ... FOR UPDATE` su Intent quando un accept arriva. Cancellazione delle altre negotiations attive sullo stesso intent. EC5 race condition handling. Attendo via libera + brief denso analogo.
+
+
+---
+
+## [5.2] mini-auction concurrency + intent matched lifecycle (2026-04-29)
+
+### Cosa fatto
+- **`negotiation_service.accept_offer` esteso con mini-auction safety**:
+  - Lock entrambi gli intent `FOR UPDATE` in **sorted-ID order** (deadlock-prevention cross-transaction).
+  - Verifica entrambi `status='active'`; se uno è `'matched'` → `IntentAlreadyMatched` (409). La race è risolta atomicamente sotto lock.
+  - Promote entrambi gli intent a `'matched'` (held by deal flow di 5.3).
+  - Cascade `_cancel_competing_negotiations`: cancella negoziazioni `active` su match che toccano uno dei due intent (esclusa la corrente). Per-row mutation con `state["cancellation_reason"] = OTHER_MATCH_ACCEPTED` + audit.
+  - Cascade `_expire_competing_matches`: marca `expired` i match `discovered`/`negotiating` su quegli intent (escluso il corrente). Audit con reason.
+- **`CancelReason` constants** in negotiation_service: `OTHER_MATCH_ACCEPTED`, `INTENT_CANCELLED_BY_USER`, `INTENT_EXPIRED`, `AGENT_REVOKED`. V0 usa solo il primo; gli altri sono pre-emptive per 5.3+ (deal cancel, intent expire sweep, mandate revocation).
+- **`IntentAlreadyMatched` (409)** error in negotiation_service. Cross-service usage: anche `intent_service.cancel_intent` lo solleva quando l'utente prova a cancellare un intent già `matched`.
+- **`intent_service.cancel_intent`** rifiuta intent `'matched'` con `IntentAlreadyMatched`. `cancelled` resta idempotent. Documenta: "matched intent è held by deal flow; cancel via deal endpoint instead" (5.3).
+- **`api/intents.py`** error mapping esteso a `(IntentError, NegotiationError)` tuple per il DELETE handler.
+- **`audit_service`** invariato: i constants `NegotiationActions.CANCEL` / `MatchActions.EXPIRE` già esistevano. Il cascade emette audit con `params={"reason": "other_match_accepted"}`.
+- **`IDEAS_BACKLOG.md`** aggiornato con due note founder: (1) Rename `log_intent_event → log_marketplace_event` in 7.x. (2) True concurrency stress test pgbench/Locust per V0.5 pre-launch.
+
+### Decisioni prese non esplicite nel brief
+- **`IntentAlreadyMatched` definito in `negotiation_service` + cross-imported da `intent_service.cancel_intent`**. Razionale: la transition `active → matched` è scritta atomicamente da `accept_offer`; la classe vive accanto al codice che fa la promotion. `intent_service` la importa quando refusa il cancel. `api/intents.py` cattura entrambe `(IntentError, NegotiationError)` per mapping HTTP. Alternativa scartata: definirla in entrambi services con multiple inheritance — over-engineering.
+- **Per-row mutation invece di bulk `UPDATE`** in `_cancel_competing_negotiations` e `_expire_competing_matches`. Costa N round-trip per N matches/negotiations (max ~5 in V0 per intent), ma permette: (a) stamp del `cancellation_reason` nello state JSONB, (b) audit per-row con context. Bulk update farebbe perdere entrambi.
+- **Audit cascade emesso col `user_id` dell'accepting party** (l'utente che ha vinto la mini-auction). Razionale: l'audit "cancel_negotiation reason=other_match_accepted" ha responsibility chiaro — è quello che ha causato la cascade. Per `expire_match`, idem.
+- **Test 11 (sequential second accept) accetta tuple `(NegotiationNotActive, IntentAlreadyMatched)`** come outcomes validi. Razionale: l'ordine in cui la cascade tocca le rows competing dipende da query plan; la seconda accept potrebbe vedere la sua negotiation già `cancelled` (NegotiationNotActive) PRIMA di arrivare al check intent. Entrambi sono semanticamente corretti — la cascade ha già reso impossibile l'accept. Documentato inline.
+- **Sorted-ID lock** invece di lock di un solo intent. Brief proponeva entrambi sotto FOR UPDATE. Sorting prevents deadlock cross-transaction se due accept di intent diversi (ma overlapping su one shared intent) racing. Test 13 verifica funziona indipendentemente dall'ordine lessicografico di buy_intent.id vs sell_intent.id.
+- **`expired` match status non più transitable** dopo accept (filter `status.in_(("discovered","negotiating"))` in expire). Test 8 verifica che match già `rejected` resta `rejected`. Coerente con match_service.expire_matches_for_intent (4.3) che ha lo stesso filtro.
+- **Test helper `_seed_multi_match` inline in test_mini_auction.py** invece di promuovere a `factories.py`. È il 3° caso di duplicazione (test_match.py + test_negotiation.py + test_mini_auction.py); il founder aveva detto "promotion quando 3+ moduli lo riusano". Tuttavia il helper in ogni file è leggermente diverso (multi-buyer setup qui, single pair lì). Promotion a factories richiederebbe parametrizzazione + risk di rompere test esistenti. Preferito: keep inline per 5.x, fare cleanup unico in 7.x quando lo shape sarà chiaro. Documentato in IDEAS_BACKLOG (test factories consolidation V0.5+).
+- **`update_intent` su intent matched fallisce con `IntentNotEditable` (409)**, non con `IntentAlreadyMatched`. Razionale: update_intent gating su `status != "active"` era già presente da 4.1 — rifiuta ANY non-active state (cancelled, matched, expired, ecc.). Test 18 verifica il comportamento. La distinzione `IntentNotEditable` vs `IntentAlreadyMatched` è semantica (former: generic "non-active", latter: specific "matched, blocking your action"); per update il primo è sufficiente.
+
+### Test scritti / coverage
+- **18 nuovi test** in `tests/test_mini_auction.py`:
+  - 4 single-match regression (both intents matched, vanilla case, unrelated unaffected, lifecycle progression)
+  - 6 cascade (cancels competing negotiations, expires competing matches, ignores already-cancelled, ignores terminal-status, only relevant intents, cancellation_reason persisted)
+  - 4 race conditions (sequential second accept, disjoint pairs, lock-order invariant, audit with reason)
+  - 4 intent state (cannot cancel matched, find_matches skips matched, atomic transition, update rejected on matched)
+- **Suite totale**: `pytest` → **212 passed in ~10s** (94 + 25 + 16 + 31 + 28 + 18). Nessuna regressione.
+- Test factory `_seed_multi_match(num_buyers=N)` produce 1 seller + N buyers + N matches in 1 chiamata. Riusato in 14 test.
+- Test 14 verifica audit row in DB con SQL direct query (`SELECT FROM audit_log WHERE action='expire_match' AND params->>'match_id'=...`). Pattern utile per future audit-coverage tests.
+
+### Blocker / dubbi
+- **Test 11 outcome non-deterministic** tra `NegotiationNotActive` e `IntentAlreadyMatched` (entrambi accettati). Vero stress test rivelerebbe che ratio ottenibili in produzione. Non un blocker — entrambi semanticamente corretti.
+- **Locking granularity Intent vs Mandate**: ho lockato Intent per V0. Per V1+ multi-agent (DQ-26), un user con N agent attivi potrebbe avere N intent, e una mandate revocation cascade dovrebbe lockare tutto. V0 single-agent: Intent lock è sufficiente. Da rivedere in V1 quando multi-agent attivo.
+- **Cascade audit volume**: con 1 accept, ~N audit rows per-row su negotiations + matches expired. Se in V1 ogni intent ha 20 match attivi, accept genera ~40 audit rows. Tunable threshold (analogo a `_AUDIT_SCORE_DELTA` di 4.3) potrebbe ridurre. Per ora: V0 traffic ridotto, full audit OK.
+- **`api/intents.py` _to_http accetta union** `IntentError | NegotiationError`. Il pattern funziona ma non è scalabile: in 5.3 aggiungeremo DealError, ecc. Refactoring futuro: introdurre un `MarketplaceError` base class che tutti i service errors estendono. 7.x cleanup task.
+- **Test 18 espone bug latente di 4.1?** No — `IntentNotEditable` su matched è il comportamento corretto. Ma il messaggio "intent is in status 'matched', not editable" è ambiguo per il client (suggerisce "puoi editarlo dopo"). UX clarity: in V0.5 quando aggiungeremo Italian copy, distinguere "matched" da "expired" nei messaggi error.
+
+### Cosa significa "5.2 completa"
+Mini-auction sicura: il marketplace gestisce N negoziazioni concorrenti sullo stesso intent senza creare deal duplicati. Una sola può chiudere, le altre vengono cancelled atomicamente. Intent in stato `matched` è bloccato (no update, no cancel) finché 5.3 Deal flow non lo rilascia.
+
+212 test verdi. Pronto per **5.3 Deal service** — il punto di chiusura del loop: idempotency key, step-up signature da entrambe le parti, chat E2E pseudonimizzata.
+
+### Prossima task
+**5.3 Deal service**. `create_pending_deal` con idempotency_key consumando il next_step di accept_offer. Step-up signatures buyer + seller (passkey-firmate). Match status: `agreed → completed`. Intent status: `matched → closed`. Rollback path: se step-up fallisce, ripristina intent `active`. Attendo via libera + brief denso analogo.
