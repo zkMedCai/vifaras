@@ -825,3 +825,71 @@ Embedding service è production-ready: retry su OpenAI transient, cache LRU+TTL 
 
 ### Prossima task
 **4.3 Match service** — il primo punto dove il marketplace prende vita. Userà `description_embedding` per cosine similarity tra intent BUY/SELL della stessa categoria con price overlap. Vector index HNSW va creato come migration separata pre-4.3 (vedi IDEAS_BACKLOG § Performance + DQ-3). Attendo via libera + brief denso analogo a 4.1/4.2.
+
+
+---
+
+## [4.3] match service + hnsw index + scoring (2026-04-29)
+
+### Cosa fatto
+- **Migration `e42f1c9ed0a1`** — HNSW index su `intents.description_embedding` (`vector_cosine_ops`, m=16, ef_construction=64). Match score breakdown: aggiunte `price_proximity_score`, `combined_score`. Indici composti filtered su `(buy_intent_id, combined_score DESC) WHERE status='discovered'` + simmetrico sell-side per il hot path "top-N discovered matches per intent".
+- **`services/match_service.py`** completo:
+  - Pure functions: `compute_price_proximity` (zone-center model, [0,1] clamped), `combine_scores` (0.7 sim + 0.3 price, weights as `Final[float]` constants).
+  - `find_matches_for_intent`: 3-layer filter (categoria + side + freshness via SQL → HNSW cosine_distance ranking + oversampling 3x → application-side price-overlap filter + scoring → top-N upsert + audit).
+  - `_upsert_match` policy: net-new audit `create_match`, score drift ≥ 0.05 audit `update_match_score`, sub-threshold drift silente (idempotent re-discovery).
+  - Read API: `list_matches_for_intent` (owner-only, 404 if non-owner), `get_match_for_user` (owner OR 403).
+  - Lifecycle: `mark_match_negotiating` (discovered→negotiating, idempotent, raise on terminal state), `expire_matches_for_intent` (cascade da intent cancel).
+- **`services/match_scheduler.py`** — `AsyncIOScheduler` periodico (default 5 min) che ri-scansiona intent con < 3 match. Bound al lifespan FastAPI. Gated da `settings.enable_match_scheduler` (default True; tests non triggerano lifespan via httpx ASGITransport).
+- **`api/matches.py`** — 2 endpoint:
+  - `GET /api/intents/{id}/matches` (tier ≥ 0, owner-only): list view privacy-aware. Counterparty espone `reservation_price_eur` ma NON `ideal_price_eur` (DQ-31).
+  - `GET /api/matches/{id}` (tier ≥ 2): detail view full prices per agent negotiation.
+- **`intent_service`** hooks:
+  - `create_intent` triggera `find_matches_for_intent` post-commit (best-effort, MatchError swallowed).
+  - `update_intent` regenera embedding se title/desc cambia (DQ-32 — fix bug latente di 4.1) + re-triggera matcher se embedding o prezzo cambiano.
+  - `cancel_intent` delegata a `match_service.expire_matches_for_intent` (deduplicazione).
+- **`audit_service.MatchActions`** — aggiunto `SCORE_UPDATED = "update_match_score"` (oltre a CREATE/EXPIRE già pre-emptive in 4.2).
+- **`config.py`** — knobs scheduler: `enable_match_scheduler`, `match_scheduler_interval_minutes` (5), `match_scheduler_batch_size` (50), `match_scheduler_min_matches` (3).
+- **`main.py`** — router `matches` registrato. Lifespan start/stop scheduler.
+- **`IDEAS_BACKLOG.md`** — entry "Match scheduler → Redis-backed (V0.5+)" + "Match list privacy: nascondere anche reservation_price (V1+)".
+- **`DESIGN_QUESTIONS.md`** — DQ-31 (privacy compromise), DQ-32 (embedding regen su update), DQ-33 (scheduler in-process apscheduler).
+
+### Decisioni prese non esplicite nel brief
+- **Privacy compromise: reservation visibile, ideal nascosto** (DQ-31). L'utente ha bisogno di vedere "a che prezzo è il match" per capire — Opzione X estrema renderebbe il list view incomprensibile. Reservation è già implicitly leaked dal price overlap (deciding to match implies cap >= floor); ideal è la vera info strategica privata. Compromesso non puro ma difendibile.
+- **Embedding regeneration su title/description update** (DQ-32). 4.1 update_intent permetteva modifiche a title/desc senza regenerare l'embedding — bug latente che si manifesta con 4.3 attivo (matcher rankerebbe contro testo stale). Fix: regen sync inline, stesso failure contract di create_intent.
+- **Score audit threshold 0.05** — `_AUDIT_SCORE_DELTA` evita audit flood su idempotent re-discovery (stesso embedding, stessi prezzi, score deterministico → no audit). Soglia bassa abbastanza da catturare drift significativo, alta abbastanza da silenziare il noise. Hardcoded constant; tunable se 7.x mostra che è troppo loquace.
+- **Owner-only su list view → 404 non 403** quando non-owner. Non leak di esistenza intent altrui. La detail view (tier 2) usa 403 — lì il caller ha già provato ownership di un intent, e 404 sarebbe misleading.
+- **Match cascade su intent cancel via match_service.expire_matches_for_intent** (refactor del cancel_intent diretto UPDATE). DRY + audit consistency: la cascade lifecycle vive next to match logic.
+- **Detail view fa get + 2x get separati invece di una join eager-load** — più round-trip ma più leggibile. Performance trascurabile a V0 traffic; ottimizzabile in 7.x se metric mostrano problema.
+- **Default match limit 20**, max 50. Brief proponeva 20 default. UI probabilmente paginerà a 5-10 — limit alto serve all'agent negotiation in 5.x che ha bisogno di vedere il pool completo per multi-match auctioning (5.2).
+- **Oversampling 3x** del HNSW pre-filter: prendiamo top-(limit*3) candidati semantici prima del price filter. Empirically clear il filter per la varianza di V0 spreads. Constant `_OVERSAMPLING_MULTIPLIER`; tunable se vediamo top-N starvation.
+- **Test mock vs real pgvector**: tutti i test discovery usano fake embedding deterministic, ma il cosine distance operator gira su pgvector reale (testcontainer). Test 28 esplicita la verifica che cosine ranking funziona end-to-end.
+- **`find_matches_for_intent` empty-list su intent missing/inactive** — non raise. Permette "fire-and-forget" call da intent_service hooks. Solo `side='trade'` raise (programmatic error).
+- **InvalidMatchTransition (409)** distinto da MatchError generico per `mark_match_negotiating` su terminal state. 5.x error path quando programmatic bug invierà transition errata.
+
+### Test scritti / coverage
+- **31 nuovi test** in `tests/test_match.py`:
+  - 6 score functions (pure math, no DB)
+  - 8 discovery (overlap/no-overlap, self-exclusion, inactive/expired, opposite-side/same-category, trade rejection)
+  - 5 persistence (unique constraint, upsert, idempotent, status, score breakdown)
+  - 4 lifecycle (cancel cascade, mark_negotiating, invalid transition, scheduler tick)
+  - 4 API (owner list, non-owner 404, min_score filter, detail tier-gating)
+  - 3 integration (real pgvector cosine ranking, create-intent hook, update-intent re-trigger)
+  - 1 privacy (DQ-31 verification)
+- **Suite totale**: `pytest` → **166 passed in ~9s** (94 + 25 + 16 + 31). Nessuna regressione.
+- Test 23 (scheduler tick) usa monkeypatch su `AsyncSessionLocal` per bind allo stesso connection del test, così le rows seedate sono visibili al tick.
+
+### Blocker / dubbi
+- **Schema `Intent.agent_id` ancora dichiarato `nullable=False` nel docstring di alcuni service** — la migration 4.1 (8df1d6891fd9) lo ha rilassato a nullable, e il match service correttamente non assume agent_id. Nessun bug, solo nota.
+- **HNSW index recall**: pgvector default `ef_search=40`. Con 100K+ vectors, recall potrebbe scendere. Trigger di tuning: V1 quando dataset grande. Già in IDEAS_BACKLOG.
+- **`_upsert_match` non usa `INSERT ... ON CONFLICT`** — split SELECT + INSERT/UPDATE per audit clarity (distinguish create vs score-update). Volumes ≤20 per call, niente preoccupazioni perf.
+- **Match scheduler sotto carico**: 50 intent per tick × ogni 5 min = 600/h. A 10K active intents starved, bastano 17h per coprire tutto. Accettabile per V0; trigger di re-design se backlog grows.
+- **Test 23 monkeypatching `AsyncSessionLocal`** è invasivo. Funziona per il test ma se in 4.4+ qualcuno aggiungesse logic che dipende dal sessionmaker globale, potrebbe rompersi silenziosamente. Mitigation: documented inline + only used in this single integration test.
+- **No test esplicito che HNSW index è actually used** (EXPLAIN check). Test 28 verifica end-to-end correctness, ma non plan optimization. EXPLAIN-based test è 7.x level rigour, sopra 4.3 scope.
+
+### Cosa significa "FASE 4 completa"
+Il marketplace è vivo. Tier 0+ utenti possono creare intent, ricevere match automatici (sync alla creazione + scheduled refresh), modificare/cancellare intent con cascade pulita. Embedding deterministic per test, OpenAI in prod con retry. Vector search HNSW. 166 test verdi.
+
+**Pronto per FASE 5 (Negoziazione)** — prima fase dove agenti AI iniziano a negoziare automaticamente. 5.1 Negotiation service, 5.2 mini-asta, 5.3 Deal service.
+
+### Prossima task
+**5.1 Negotiation service**. `start_or_continue`, `add_counter_offer`, `accept_offer`, `reject_offer`. Hard cap 6 round (EC6). Tier ≥ 1 per start/counter, tier ≥ 2 per accept (step-up sopra threshold). Match status transition discovered → negotiating → agreed/rejected. Attendo via libera + brief denso analogo.

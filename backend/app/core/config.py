@@ -57,6 +57,20 @@ class Settings(BaseSettings):
     # Dev-only endpoints (e.g. /api/_dev/embedding-stats). Off in prod.
     enable_dev_endpoints: bool = False
 
+    # Match scheduler (4.3): in-process apscheduler refreshing low-match
+    # intents periodically. On by default for production; the FastAPI
+    # lifespan starts/stops it, so unit tests that don't trigger lifespan
+    # never see it. Set to False to disable in environments that don't
+    # want the background tick (e.g. CLI scripts, batch tools).
+    enable_match_scheduler: bool = True
+    match_scheduler_interval_minutes: int = 5
+    # Per-tick batch ceiling. Bounded so a single tick never spends more
+    # than ~50× embedding cost; the rest waits for the next interval.
+    match_scheduler_batch_size: int = 50
+    # Threshold below which an intent is considered "match-starved" and
+    # eligible for re-scan. 3 matches per intent is the V0 default.
+    match_scheduler_min_matches: int = 3
+
     self_verifier_url: str = "https://api.self.xyz/v1/verify"
     self_verifier_scope: str = "marketplace-it-v0"
     self_verifier_timeout_seconds: float = 10.0

@@ -479,3 +479,60 @@ Out-of-scope per il brief 4.1 che dice "stub minimale embedding service estendib
 Test `test_tier_0_max_5_active_intents`, `test_tier_1_max_10_active_intents`, `test_tier_2_uses_mandate_limits`.
 
 **Quando rivedere.** Se vediamo abuse pattern in V0 (utenti tier=0 che riempiono di garbage), abbassare a 3. Se vediamo lamentele di "non posso provare il prodotto" perché 5 è poco, alzare a 7. A/B testabile post-launch.
+
+
+## DQ-31 — Privacy match list: reservation visibile, ideal nascosto (DECIDED)
+
+**Contesto (4.3).** Il brief originale §3 cementava "Trasparenza zero sui prezzi" (Opzione X): l'agente vede solo i match, non i prezzi altrui. Implementare l'opzione X estrema sull'API match list significa esporre solo `match_score` + `counterparty.title/category` — niente prezzi. Ma l'utente nella UI non capirebbe nulla: "match al 0.85, ma a quale prezzo?". UX fallisce.
+
+**Tensione.** Privacy strategica vs UX leggibilità.
+
+**Decisione (2026-04-29).** Compromesso V0:
+- `GET /api/intents/{id}/matches` (list view, tier ≥ 0): mostra `counterparty.reservation_price_eur` (cap del buyer / floor del seller). NON mostra `ideal_price_eur`.
+- `GET /api/matches/{id}` (detail view, tier ≥ 2 = agent): mostra entrambi i prezzi su entrambi gli intent. L'agente ne ha bisogno per negoziare.
+
+**Razionale.**
+- `reservation_price_eur` è già **implicitamente esposto** dal price overlap: se c'è un match, l'altro lato sa che il proprio cap/floor è compatibile col tuo. Esporre il valore esatto aggiunge poca info.
+- `ideal_price_eur` è la **vera informazione strategica privata**: rivela al controparte dove l'utente preferisce davvero atterrare. Tenerlo nascosto preserva il punto centrale dell'Opzione X.
+- Compromesso non puro ma difendibile: privacy strategica preservata sull'asse che conta, UX leggibile.
+
+**Attack surface noto.** Un utente tier 2 (con mandate) può vedere `ideal_price_eur` di una controparte qualsiasi via `GET /api/matches/{id}` se è proprietario di uno dei due intent del match. Questo è by-design: l'agente NEGOZIA per quell'utente, deve sapere il prezzo target. Non è leak — è funzione.
+
+**Quando rivedere.** Se in V1 vediamo gaming pattern (seller che si comportano come "vedo cap del buyer = sparo prezzo alto"), nascondere anche reservation. Per ora, mostrare reservation e nascondere ideal è il compromesso che ottimizza UX vs privacy. Aggiunto a `IDEAS_BACKLOG.md` § Sicurezza/Auth come trigger di revisione.
+
+**Test.** `test_list_matches_does_not_expose_ideal_price` verifica che la response del list view non contenga la chiave `ideal_price_eur`. `test_get_match_detail_requires_tier_2` verifica che il detail view richieda tier 2 (e quindi exposa entrambi i prezzi).
+
+
+## DQ-32 — Embedding regeneration su title/description update (DECIDED)
+
+**Contesto (4.3).** 4.1 implementava `update_intent` permettendo modifiche a `title` e `description` ma NON regenerava `description_embedding`. Risultato: l'embedding diventa stale, il matcher in 4.3 ranka l'intent contro testo obsoleto. Bug latente che si manifesta solo con 4.3 attivo.
+
+**Decisione (2026-04-29).** `update_intent` regenera l'embedding se `title` o `description` cambiano. Inline + sync (stesso failure mode di `create_intent`: `EmbeddingServiceUnavailable` → 503).
+
+**Implementazione.**
+- Flag locale `embedding_relevant_changed` triggerato se `input.title is not None or input.description is not None`.
+- Se trigger: chiamata a `embedding_service.generate_embedding(build_embedding_text(...))` con nuovo title+description.
+- In caso di failure, l'intero PATCH fallisce (no commit di update parziale + embedding stale).
+- Match re-discovery viene chiamato post-commit se `embedding_relevant_changed or price_change`.
+
+**Costo.** Una chiamata OpenAI extra per ogni PATCH che cambia title/desc (~$0.000004, ~150ms). Trascurabile per V0 traffic.
+
+**Alternativa scartata.** Lazy regeneration (only at next match query). Complicato (dove sta lo "stale flag"?), e match scheduler non saprebbe quale intent rigenerare prima. Sync-inline è la scelta semplice e corretta.
+
+**Test.** `test_update_intent_re_triggers_match_calc_on_price_fix` verifica re-trigger del matcher (price change). Re-trigger su title change è copertura implicita via il branch `embedding_relevant_changed or price_change` nello stesso codice path.
+
+
+## DQ-33 — Match scheduler in-process apscheduler (DECIDED, V0 SOFT)
+
+**Contesto (4.3).** Il refresh periodico dei match-starved intents (intent con < 3 match) richiede un job ricorrente. Stack scelto in PROJECT_BRIEF §1: `apscheduler` in-process con asyncio, opt-out di Celery/Redis per V0.
+
+**Decisione (2026-04-29).** `services/match_scheduler.py` con `AsyncIOScheduler` start/stop bound al lifespan FastAPI. Default `enable_match_scheduler=True` in production; tests non triggerano lifespan via httpx ASGITransport (default `lifespan="auto"` non lo attiva), quindi nessun scheduler nei test http_client per costruzione.
+
+**Implicazioni quando passeremo a multi-worker (V1+).**
+- Multi-worker = N processi, N scheduler che ticka in parallelo → race conditions on UPSERT match. Mitigato dall'unique constraint, ma audit log diventa rumoroso.
+- Cleanest fix: leader-election lock (Redis SETNX TTL) + spostare a Celery beat o arq.
+- Trigger di promozione: prima che V0.5 deployi su 2+ worker.
+
+**Test.** `test_refresh_low_match_intents_targets_correct_intents` chiama direttamente la funzione `refresh_low_match_intents` (bypassa scheduler), verifica che intent under-matched vengano processati. Lo scheduler in sé è solo glue logic, non test specificamente.
+
+**Aggiunto a IDEAS_BACKLOG.md** sotto § Performance/Optimization come trigger di migration a Redis-backed scheduler.

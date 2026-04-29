@@ -12,20 +12,24 @@ from app.api import (
     identity as identity_routes,
     intents as intent_routes,
     mandates as mandate_routes,
+    matches as match_routes,
     step_up as step_up_routes,
 )
 from app.core.config import settings
 from app.core.db import engine
 from app.core.logging import configure_logging, log
+from app.services import match_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     log.info("app.startup", env=settings.app_env, name=settings.app_name)
+    match_scheduler.start_scheduler()
     try:
         yield
     finally:
+        match_scheduler.shutdown_scheduler()
         await engine.dispose()
         log.info("app.shutdown")
 
@@ -36,6 +40,7 @@ app.include_router(identity_routes.router)
 app.include_router(mandate_routes.router)
 app.include_router(step_up_routes.router)
 app.include_router(intent_routes.router)
+app.include_router(match_routes.router)
 app.include_router(_test_endpoints.router)
 app.include_router(_dev_endpoints.router)
 

@@ -247,7 +247,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 
 > Nota: la vecchia Fase 3 ("Mandate management") è stata fusa nella Fase 2 dato che mandate è parte integrante del flow di tier upgrade.
 
-### 🔄 FASE 4 — Marketplace core (in corso)
+### ✅ FASE 4 — Marketplace core (completa)
 
 #### ✅ 4.1 Intent service
 - `services/intent_service.py`
@@ -267,7 +267,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - Retry con backoff su rate limit
 - **Test deterministic**: hash-based fake embedding (vedi `seed_dev.py` pattern)
 
-#### 🔲 4.3 Match service
+#### ✅ 4.3 Match service
 - `services/match_service.py`
 - `find_matches(intent_id)`:
   1. Query intent della parte opposta in stessa categoria, attivi

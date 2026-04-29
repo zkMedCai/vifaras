@@ -81,6 +81,19 @@
 - A 100 utenti V0 cheap, a 100K serve denormalizzazione
 - Da fare in 7.x quando metriche traffico reali
 
+### Match scheduler → Redis-backed (V0.5+)
+- V0: in-process apscheduler `AsyncIOScheduler` per il refresh dei match-starved intents.
+- V0.5+: quando deployi su 2+ worker, N processi ticka in parallelo → race su UPSERT match (mitigato da unique constraint ma audit log diventa rumoroso).
+- Migration target: Redis SETNX TTL leader-election lock + Celery beat o arq.
+- Trigger: prima del deploy su >1 worker.
+- Riferimento: DQ-33
+
+### Match list privacy: nascondere anche reservation_price (V1+)
+- V0: compromesso "show reservation, hide ideal" (DQ-31).
+- Trigger di revisione: se in V1 vediamo gaming pattern (seller "vedo cap buyer = sparo prezzo alto"), nascondere anche reservation. Mostrare solo `combined_score` + `counterparty.title/category`.
+- Costo UX: utente non capisce a che prezzo è il match. Da bilanciare con metriche reali post-launch.
+- Riferimento: DQ-31
+
 ### Compression mandate signature blob
 - ~5KB per mandate, insignificante a 100 utenti
 - A 100K-1M mandate diventa 0.5-5GB

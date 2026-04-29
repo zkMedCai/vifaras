@@ -53,7 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import categories, platform_limits as pl
 from app.models.schema import Intent, Mandate, Match, Negotiation, User
-from app.services import audit_service, embedding_service
+from app.services import audit_service, embedding_service, match_service
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +526,17 @@ async def create_intent(
 
     await db.commit()
     await db.refresh(intent)
+
+    # Trigger match discovery for the freshly-created intent. Failures
+    # here are non-fatal: the intent is already durable, the matcher
+    # will retry it on the next scheduler tick (4.3 match_scheduler).
+    try:
+        await match_service.find_matches_for_intent(
+            db, intent_id=intent.id, limit=match_service.DEFAULT_MATCH_LIMIT
+        )
+    except match_service.MatchError:
+        pass
+
     return intent
 
 
@@ -661,16 +672,19 @@ async def update_intent(
 
     # 5. Apply scalar field updates.
     changed: dict[str, Any] = {}
+    embedding_relevant_changed = False
 
     if input.title is not None:
         _validate_title(input.title)
         intent.title = input.title.strip()
         changed["title"] = intent.title
+        embedding_relevant_changed = True
 
     if input.description is not None:
         _validate_description(input.description)
         intent.description = input.description
         changed["description"] = "<changed>"
+        embedding_relevant_changed = True
 
     if input.soft_preferences is not None:
         intent.soft_preferences = input.soft_preferences
@@ -705,6 +719,20 @@ async def update_intent(
             ideal_eur=_cents_to_eur(intent.ideal_price_cents),
         )
 
+    # Regenerate embedding if title or description changed. The matcher
+    # would otherwise rank the intent against stale text — semantically
+    # incoherent. Inline + sync, same failure contract as create_intent.
+    if embedding_relevant_changed:
+        text_to_embed = embedding_service.build_embedding_text(
+            title=intent.title, description=intent.description
+        )
+        try:
+            intent.description_embedding = (
+                await embedding_service.generate_embedding(text_to_embed)
+            )
+        except embedding_service.EmbeddingServiceUnavailable as exc:
+            raise EmbeddingUnavailable(str(exc)) from exc
+
     await db.flush()
 
     await audit_service.log_intent_event(
@@ -718,6 +746,16 @@ async def update_intent(
 
     await db.commit()
     await db.refresh(intent)
+
+    # Re-rank matches if anything that affects the score changed.
+    if embedding_relevant_changed or price_change:
+        try:
+            await match_service.find_matches_for_intent(
+                db, intent_id=intent.id, limit=match_service.DEFAULT_MATCH_LIMIT
+            )
+        except match_service.MatchError:
+            pass
+
     return intent
 
 
@@ -775,17 +813,12 @@ async def cancel_intent(
     )
     neg_count = neg_result.rowcount or 0
 
-    # Cascade: existing matches involving this intent → expired.
-    match_result = await db.execute(
-        update(Match)
-        .where(
-            (Match.buy_intent_id == intent_id)
-            | (Match.sell_intent_id == intent_id)
-        )
-        .where(Match.status.in_(("discovered", "negotiating")))
-        .values(status="expired")
+    # Cascade: existing matches involving this intent → expired. Delegated
+    # to match_service so the cascade query lives next to the rest of the
+    # match lifecycle code.
+    match_count = await match_service.expire_matches_for_intent(
+        db, intent_id=intent_id
     )
-    match_count = match_result.rowcount or 0
 
     await db.flush()
 

@@ -312,12 +312,19 @@ class Match(Base):
     buy_intent_id = Column(UUID(as_uuid=False), ForeignKey("intents.id"), nullable=False)
     sell_intent_id = Column(UUID(as_uuid=False), ForeignKey("intents.id"), nullable=False)
     
-    similarity_score = Column(Numeric(5, 4))  # 0.0000-1.0000
+    similarity_score = Column(Numeric(5, 4))  # cosine similarity, 0.0000-1.0000
     price_overlap = Column(Boolean, default=False)
-    
+
+    # 4.3: score breakdown. similarity_score above is semantic only; the
+    # matcher ranks on `combined_score = 0.7*similarity + 0.3*price_proximity`.
+    # Both nullable so legacy rows pre-4.3 don't break (none in V0 yet, but
+    # cheap insurance). New rows always populate them.
+    price_proximity_score = Column(Numeric(5, 4))
+    combined_score = Column(Numeric(5, 4))
+
     status = Column(String(20), default="discovered")  # discovered|negotiating|agreed|rejected|expired
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+
     __table_args__ = (
         UniqueConstraint("buy_intent_id", "sell_intent_id", name="uq_match"),
     )

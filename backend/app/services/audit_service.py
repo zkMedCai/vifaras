@@ -62,6 +62,7 @@ class MatchActions:
     """Action codes for Match lifecycle (FASE 4.3)."""
 
     CREATE: Final[str] = "create_match"
+    SCORE_UPDATED: Final[str] = "update_match_score"
     EXPIRE: Final[str] = "expire_match"
 
 
