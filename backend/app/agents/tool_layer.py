@@ -252,10 +252,16 @@ class ToolHandler:
     # ------------------------------------------------------------------------
     
     def _create_intent(self, params: dict) -> dict:
-        intent = intent_service.create_intent(
-            self.db, agent_id=self.agent_id, **params
+        # 4.1 brief: tool_layer scaffold is sync and uses `Session.query()`;
+        # `intent_service.create_intent` is async and takes `user_id +
+        # CreateIntentInput`. Wiring the two together cleanly requires
+        # modernizing tool_layer to async (FASE 5/6 — orchestrator + agent
+        # runtime). For 4.1, intents are exclusively created via the FastAPI
+        # endpoints in `api/intents.py`. See DESIGN_QUESTIONS DQ-28.
+        raise NotImplementedError(
+            "tool_layer._create_intent is deferred to FASE 5/6 "
+            "(see DQ-28). Use POST /api/intents directly in V0."
         )
-        return {"intent_id": intent.id, "status": intent.status}
     
     def _search_matches(self, params: dict) -> dict:
         matches = match_service.find_matches(

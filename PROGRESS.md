@@ -702,3 +702,63 @@ N/A — chore documentale. `pytest -v` post-chore: **94 passed** invariato.
 ### Prossima task
 **4.1 Intent service** — pronto a partire. Founder ha promesso brief esteso pre-4.1; attendo via libera.
 
+
+---
+
+## [4.1] Intent service + crud endpoints (2026-04-29)
+
+### Cosa fatto
+- **Migration `8df1d6891fd9`** — `intents.agent_id`, `audit_log.agent_id`, `audit_log.mandate_id` → nullable. `intents.side` widened String(4) → String(5) per future-compat con `'trade'` (§2.9).
+- **`core/categories.py`** — 22 categorie V0 chiuse + helpers `is_allowed`/`is_forbidden`. `HARD_FORBIDDEN_CATEGORIES` resta in `platform_limits.py` (decisione platform), categorie V0 sono vocabulary.
+- **`services/embedding_service.py`** — async `generate_embedding(text)`. Backend env-switched: `EMBEDDING_BACKEND=openai` (default, AsyncOpenAI inline) o `=fake` (deterministic SHA-256-seeded vector L2-normalized). LRU cache 1000 entries. Failure mode: `EmbeddingServiceUnavailable` → 503 `Retry-After: 30` lato API.
+- **`services/intent_service.py`** — CRUD completo async:
+  - `create_intent` (tier≥0): valida side/title/description/category/prices/duration/location/currency. Cap intent attivi per tier (0:5, 1:10, 2:mandate). Embedding inline. Audit row.
+  - `list_user_intents` con filtri status/side + paginazione clamped [1,100].
+  - `get_intent_for_user` (404 sia per non-found sia per non-owned, no info leak).
+  - `update_intent` con field-level gating: title/desc/soft_pref → tier≥0; price → tier≥2 + active-negotiation guard (409); category/side mai modificabili (422).
+  - `cancel_intent` con cascade su Negotiation→cancelled e Match→expired. Idempotent.
+- **`api/intents.py`** — 4 endpoint REST: POST/GET/PATCH/DELETE su `/api/intents{,/{id}}`. Pydantic v2 request/response. `IntentError → HTTPException` mapping (pattern da mandates.py). `TooManyActiveIntents` aggiunge `next_step.action='upgrade_tier'` al payload 402.
+- **`audit_service.py`** — nuovo `log_intent_event(db, *, user_id, action, params, ...)` per AuditLog table con `agent_id`/`mandate_id` nullable. Doctrine docstring aggiornata (DQ-14 evolved): table = marketplace actions, structlog = identity-lifecycle.
+- **`tool_layer._create_intent`** → `NotImplementedError` con riferimento a DQ-28. Sync-async mismatch tra scaffold legacy e nuovo service rinviato a FASE 5/6.
+- **`main.py`** — router `/api/intents` registrato.
+
+### Decisioni prese non esplicite nel brief
+- **DQ-28** — tool_layer._create_intent rinviato a FASE 5/6. V0 intent CRUD è solo via API.
+- **DQ-29** — step-up biometrico su PATCH price update rinviato a V0.5. V0 gate solo per `tier=2` (la passkey è già stata firmata recentemente con il mandate). Aggiunto a IDEAS_BACKLOG.
+- **DQ-30** — caps tier-based asimmetrici: tier 0 → 5, tier 1 → 10, tier 2 → mandate. Tier 0 deliberatamente più stretto del default mandate (10) per anti-abuse di utenti non verificati.
+- **`intents.side` widening migration** — schema String(4) → String(5) anche se 'trade' è rifiutato a service-level. Mantenere il column troppo stretto per il valore sarebbe un foot-gun futuro, widening costa zero.
+- **Audit doctrine evolved** — DQ-14 originale diceva "AuditLog table = agent under mandate, structlog = identity-lifecycle". Post-4.1: "AuditLog table = marketplace actions (qualsiasi entry/cambio su Intent/Negotiation/Deal anche tier 0), structlog = identity-lifecycle (tier upgrade, mandate signed)". `agent_id`/`mandate_id` nullable rendono possibile la prima parte. Aggiornato docstring di audit_service.py.
+- **Cache embedding LRU in-memory** — 1000 entries. V0 single-process, sufficient. V1 → Redis. Già in IDEAS_BACKLOG § Performance.
+- **Embedding text format** — `f"{title}\n{description}"` (semplice). Brief consigliava di sperimentare con `f"{category}: {title}\n..."`. Ho lasciato il format semplice per ora — la categoria è già un filtro pre-similarity nel match service (4.3), prependerla nell'embedding sarebbe ridondante e potenzialmente noise. Posso cambiarlo se 4.3 mostra match cross-category subottimali.
+- **`update_intent` ricalcola `expires_at` da NOW** quando `duration_days` cambia (semantica "renew"), invece di sommare a `created_at`. Più intuitivo per l'utente che vuole "estendere di altri 14 giorni".
+- **`IntentInActiveNegotiation` (409)** — guard sul price update richiede join `Match.id == Negotiation.match_id` filtrato sull'intent. Non userà `with_for_update()` sulla tabella Negotiation (ridondante: il lock sull'Intent row + l'idempotency_key futuro su Deal coprono la race).
+
+### Test scritti / coverage
+- **25 nuovi test** in `tests/test_intents.py`:
+  - 8 create (BUY/SELL happy path, embedding, trade rejection, price-relationship × 2, category × 2)
+  - 3 tier limits (0:5, 1:10, 2:mandate)
+  - 3 list (filter, paginate, ownership isolation)
+  - 5 update (title OK at tier 0, price 402 at tier 0, price OK at tier 2, 409 in active negotiation, category 422)
+  - 3 cancel (mark cancelled, cascade neg+match, idempotent)
+  - 3 embedding integration (calls service, 503 on failure, cache hit)
+- **Suite totale**: `pytest` → **119 passed in ~7s** (94 pre-4.1 + 25 nuovi). Nessuna regressione.
+- Autouse fixture `_force_fake_embedding` setta `EMBEDDING_BACKEND=fake` per ogni test del modulo, cache pulita pre/post.
+
+### Blocker / dubbi
+- **Pydantic deprecation** — `self.model_fields` in `UpdateIntentInput._at_least_one_field` (instance access deprecato V2.11). Cambiato a `type(self).model_fields`. Nessun warning post-fix.
+- **AsyncSession identity-map staleness** — il test `cancels_active_negotiations` inizialmente leggeva `Negotiation`/`Match` mutati dalla session API via `select()`, ma `expire_on_commit=False` lasciava lo snapshot pre-cancel nell'identity map. Risolto con `await async_db_session.refresh(obj)` (non `expire_all()` — quello fa lazy-load fuori greenlet → MissingGreenlet).
+- **`agent_id` nullable cascade** — `mandate_revocation_service` cascade query `Intent.agent_id == agent_id` continua a funzionare correttamente con NULL (Postgres: NULL ≠ qualsiasi valore non-NULL → skip). Tier-0 intents sono per design immuni a revocation cascade. Verificato che non ci siano altre cascade rotte (deal cascade è 5.x quindi out-of-scope).
+- **OpenAI sync-inline costo** — text-embedding-3-small ~$0.000004/intent, ~150ms latency. A V0 traffic (10K intent/giorno target) trascurabile. Se passiamo 100K/giorno consideriamo batch inline (ma è 4.2 estensione).
+- **`_create_intent_directly` test helper** — bypassa l'API per il setup dei test tier-limit/list. Comodo ma rischia di drift dallo schema reale. Mitigazione: usato solo per scenari dove la creazione API è già coperta da altri test (1, 2, 3); il setup helper produce intent identici al path API + embedding deterministico.
+
+### Cosa significa "4.1 completa"
+Marketplace ha il suo primo concrete deliverable. Tier=0 user può:
+1. POST /api/intents → embedding generato, intent persisto, status=active
+2. GET /api/intents → lista propri intent
+3. PATCH /api/intents/{id} → modifiche non-sensibili (title, desc)
+4. DELETE /api/intents/{id} → cancel + cascade
+
+Tier=2 (con mandate) anche modifica prezzi. Trade è schema-ready. 119 test verdi. Pronto per 4.2 (embedding service estension) e 4.3 (match service).
+
+### Prossima task
+**4.2 Embedding service**. Estende lo stub minimale di 4.1: retry con backoff su rate limit, batch processing (V1+ come bulk import), cache LRU formale. Brief minimale già nel BRIEF §6. Attendo via libera (e eventualmente brief denso analogo a 4.1 se vuoi).

@@ -1,32 +1,38 @@
-"""Audit service — structured-log audit events (brief task 2.3).
+"""Audit service — structured-log + AuditLog table emitters (brief tasks 2.3, 4.1).
 
-Two distinct audit channels coexist in this codebase:
+Two complementary audit channels coexist in this codebase:
 
-1. **`AuditLog` table** (schema.py): per-agent-action records with
-   `(user_id, agent_id, mandate_id, action, params, result, success)`.
-   `mandate_id` is `NOT NULL`, so this table is reserved for actions taken
-   *by an agent under an active mandate* — i.e. anything that happens
-   from FASE 5 onwards. Wired into `tool_layer` / negotiation in 5.x.
+1. **`AuditLog` table** (schema.py): per-marketplace-action records with
+   `(user_id, agent_id?, mandate_id?, action, params, result, success)`.
+   Post-4.1, `agent_id` and `mandate_id` are nullable — the table now
+   covers both agent-under-mandate actions (5.x onward) AND user-initiated
+   marketplace actions before a mandate exists (intent CRUD at tier 0/1).
+   Wired into `tool_layer` for agent actions, and `intent_service` for
+   user-initiated CRUD. Always written via `log_intent_event` /
+   `log_action` in this module so the call shape stays uniform.
 
 2. **structlog audit events** (this module): identity / lifecycle events
-   that don't have a mandate yet (tier upgrades, login, mandate-revoke
-   in the future). Emitted as JSON to stdout under the `audit.*` event
-   namespace so they can be pulled by log aggregators alongside the
-   per-action audit table.
+   that don't fit the per-action shape (tier upgrades, mandate signed).
+   Emitted as JSON to stdout under the `audit.*` event namespace so they
+   can be pulled by log aggregators alongside the per-action audit table.
 
-V0 strategy for tier upgrade: use the structured-log channel. Tier
-upgrade happens *before* the user has a mandate (mandates are tier-2),
-so the `AuditLog` table can't represent it without a sentinel
-`mandate_id` — we'd be lying about the schema's invariants.
+Routing rule of thumb:
+  - "User clicked / agent invoked tool / something happened to an Intent
+    or Negotiation or Deal" → `AuditLog` table.
+  - "User's identity tier or mandate state transitioned" → structlog.
 
-All functions in this module are designed to **never raise**: audit
-emission must not abort the upgrade itself. If structlog fails, we
-swallow + warn — the upgrade is already durable, the audit is
-secondary.
+All functions are designed to **never raise**: audit emission must not
+abort the upstream operation. If the table write or structlog fails, we
+swallow + warn — the operation is already durable, the audit is secondary.
 """
 from __future__ import annotations
 
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.logging import log
+from app.models.schema import AuditLog
 
 
 async def log_tier_upgrade(
@@ -77,11 +83,9 @@ async def log_mandate_signed(
 ) -> None:
     """Audit a mandate signing event (tier 1 → 2 transition). Never raises.
 
-    Like `log_tier_upgrade`, this uses the structlog channel rather than
-    the `AuditLog` table — the table requires `mandate_id NOT NULL` which
-    is satisfied here, but for consistency we keep all *identity-lifecycle*
-    audit on structlog and reserve the table for *agent actions* under a
-    live mandate (5.x+).
+    Like `log_tier_upgrade`, this uses the structlog channel: identity-
+    lifecycle events stay on structlog even though the `AuditLog` table
+    could now hold them with the relaxed FKs.
     """
     try:
         log.info(
@@ -94,6 +98,56 @@ async def log_mandate_signed(
         try:
             log.warning(
                 "audit.mandate_signed.emit_failed",
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+        except Exception:
+            pass
+
+
+async def log_intent_event(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    action: str,
+    params: dict[str, Any],
+    result: dict[str, Any] | None = None,
+    success: bool = True,
+    error_code: str | None = None,
+    agent_id: str | None = None,
+    mandate_id: str | None = None,
+) -> None:
+    """Insert an `AuditLog` row for a user-initiated intent CRUD action.
+
+    `action` is a verb-noun snake_case string aligned with the existing
+    schema convention (`create_intent`, `update_intent`, `cancel_intent`).
+
+    Most callers will pass `agent_id=None, mandate_id=None` because intent
+    CRUD is exposed at tier 0 where no agent exists yet. Both are nullable
+    post-4.1 migration.
+
+    Never raises. The row is added + flushed but NOT committed — the
+    caller controls transaction boundaries. If the flush fails (rare),
+    we log + swallow rather than break the upstream service operation.
+    """
+    try:
+        row = AuditLog(
+            user_id=user_id,
+            agent_id=agent_id,
+            mandate_id=mandate_id,
+            action=action,
+            params=params,
+            result=result,
+            success=success,
+            error_code=error_code,
+        )
+        db.add(row)
+        await db.flush()
+    except Exception as exc:
+        try:
+            log.warning(
+                "audit.intent_event.write_failed",
+                action=action,
                 error=type(exc).__name__,
                 message=str(exc),
             )

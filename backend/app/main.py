@@ -9,6 +9,7 @@ from app.api import (
     _test_endpoints,
     auth as auth_routes,
     identity as identity_routes,
+    intents as intent_routes,
     mandates as mandate_routes,
     step_up as step_up_routes,
 )
@@ -33,6 +34,7 @@ app.include_router(auth_routes.router)
 app.include_router(identity_routes.router)
 app.include_router(mandate_routes.router)
 app.include_router(step_up_routes.router)
+app.include_router(intent_routes.router)
 app.include_router(_test_endpoints.router)
 
 

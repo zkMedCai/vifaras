@@ -265,9 +265,16 @@ class Intent(Base):
     
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
-    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
-    
-    side = Column(String(4), nullable=False)  # 'buy' | 'sell'
+    # agent_id is nullable: tier-0 users have no agent yet but can create intents.
+    # Cascade revoke (mandate_revocation_service) filters by agent_id; NULLs are
+    # correctly skipped, so tier-0 intents are immune to revocation cascades.
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=True)
+
+    # side is a 3-value enum at the spec level (PROJECT_BRIEF §2.9): 'buy' |
+    # 'sell' | 'trade'. V0 service-layer rejects 'trade' before any DB write,
+    # so only 'buy'/'sell' actually land — column width tolerates 'trade' for
+    # forward-compat (FASE 8).
+    side = Column(String(5), nullable=False)
     
     # Descrizione dell'oggetto
     title = Column(String(200), nullable=False)
@@ -399,8 +406,13 @@ class AuditLog(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     
     user_id = Column(UUID(as_uuid=False), nullable=False)  # no FK per immutabilità
-    agent_id = Column(UUID(as_uuid=False), nullable=False)
-    mandate_id = Column(UUID(as_uuid=False), nullable=False)
+    # agent_id / mandate_id nullable: marketplace actions at tier 0 (intent CRUD
+    # before mandate exists) write audit rows with NULL agent + NULL mandate.
+    # Identity-lifecycle events (tier upgrade, mandate signed) still go via
+    # structlog (audit_service.py) — those don't fit a per-action audit row even
+    # with relaxed FKs. See migration 8df1d6891fd9.
+    agent_id = Column(UUID(as_uuid=False), nullable=True)
+    mandate_id = Column(UUID(as_uuid=False), nullable=True)
     
     action = Column(String(50), nullable=False)  # create_intent, send_offer, accept, ...
     params = Column(JSONB)

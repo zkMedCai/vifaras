@@ -247,9 +247,9 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 
 > Nota: la vecchia Fase 3 ("Mandate management") è stata fusa nella Fase 2 dato che mandate è parte integrante del flow di tier upgrade.
 
-### 🔄 FASE 4 — Marketplace core (prossima)
+### 🔄 FASE 4 — Marketplace core (in corso)
 
-#### 🔲 4.1 Intent service
+#### ✅ 4.1 Intent service
 - `services/intent_service.py`
 - `create_intent()` (richiede **tier ≥ 0**) genera embedding via OpenAI **sincrono in-line**
 - `update_intent()` modifica reservation/ideal price (richiede step-up se sale, quindi tier ≥ 2)

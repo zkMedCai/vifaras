@@ -420,3 +420,62 @@ Coerente con DQ-14 (split AuditLog table per agent actions con mandate, structlo
 - `test_log_failed_without_mandate_does_not_crash` — chiamata su agent senza mandate non solleva, structlog event captured (monkey-patch).
 
 Scaffold cambiato di ~10 righe (best-effort query + branch). Motivato (bug fix, raise di scaffold), come DQ-21.
+
+
+## DQ-28 — tool_layer._create_intent rinviato a FASE 5/6 (DECIDED, V0 SOFT)
+
+**Contesto (4.1).** Il brief 4.1 dice "estensione tool_layer.py per create_intent tool che ora delega a intent_service invece di stub". Ma:
+- `tool_layer.py` è **scaffold legacy sync** (DQ-1): usa `Session.query()` style.
+- `intent_service.create_intent` è **async**, prende `user_id` + `CreateIntentInput` (no `agent_id`).
+
+Wirare i due richiede modernizzare tool_layer ad async, oppure aggiungere un sync-wrapper duplicato in intent_service. Il primo è lavoro di FASE 5/6 (orchestrator + agent runtime); il secondo introduce code duplication subito buttata via.
+
+**Decisione (2026-04-29).** Per V0 4.1, **`intent_service.create_intent` è esposto solo dagli endpoint FastAPI** (`POST /api/intents`). `tool_layer._create_intent` solleva `NotImplementedError` con riferimento a questa DQ.
+
+L'agente Claude in V0 non scrive intent autonomamente — gli intent vengono creati dall'utente via UI. Quando in FASE 5/6 implementeremo orchestrator runtime, modernizzeremo tool_layer ad async e wireremo correttamente `_create_intent` allora.
+
+**Implicazioni per il brief.** Lo step-up rule `{"action": "create_intent", "above_eur": 150}` in `V0_DEFAULT_STEP_UP_REQUIRED_FOR` resta nel mandate ma non firea in V0 (l'agent non chiama mai create_intent). Diventerà operativo in FASE 5/6.
+
+**Test.** Nessuno specifico per V0 — il path NotImplementedError non viene esercitato dai test della suite (i test di intent passano via API). Coverage dell'integrazione FASE 5/6.
+
+
+## DQ-29 — Step-up biometrico su PATCH price update rinviato (V0 SOFT, V0.5 HARDENING)
+
+**Contesto (4.1).** Il brief 4.1 specifica per la modifica di `reservation_price_eur`: "richiede tier=2 + step-up se sopra threshold del mandate". Razionale: cambiare il floor/cap mid-negoziazione è un'azione finanziariamente rilevante che merita conferma biometrica.
+
+**Tensione tecnica.** L'infrastruttura step-up esistente (`step_up_service`) lavora su **azioni dell'agente bloccate dal verifier**: l'agente tenta `accept_offer`, il verifier solleva `StepUpRequired`, viene creato uno `StepUpRequest` row, l'utente firma via push. Per **azioni utente-iniziate** (PATCH /api/intents/{id}) non c'è oggi un meccanismo equivalente di challenge-binding canonicalizzato.
+
+Implementarlo in V0 significherebbe:
+- Endpoint `POST /api/intents/{id}/price-update/draft` → `IntentPriceUpdateDraft` row + challenge.
+- Endpoint `POST /api/intents/{id}/price-update/submit` → verifica WebAuthn + applica.
+- Tabella + migration nuova.
+- ~150 LOC + test dedicati.
+
+Out-of-scope per il brief 4.1 che dice "stub minimale embedding service estendibile in 4.2".
+
+**Decisione (2026-04-29).** V0 **gate solo per tier**: `reservation_price_eur` / `ideal_price_eur` update richiede `tier ≥ 2`. Tier 2 implica già passkey registrata + mandate firmato, quindi c'è una conferma biometrica recente "in cassaforte". Non richiediamo una conferma fresh per ogni price update.
+
+**Quando promuovere.** V0.5 (FASE 10/11 frontend), quando saremo in fase di hardening UX e introdurremo il pattern draft+submit canonico per azioni utente-iniziate sensibili (e.g. revocation flow è già così, possiamo riutilizzarlo). Trigger: prima di alpha pubblica. Aggiunto a `IDEAS_BACKLOG.md` § Sicurezza/Auth.
+
+**Test.** `test_update_reservation_price_tier_2_succeeds` verifica solo il gating per tier (no step-up). Quando V0.5 lo introdurrà, aggiungere test challenge+verify.
+
+
+## DQ-30 — Tier-based active intent cap diverso da mandate.max_active_intents (DECIDED)
+
+**Contesto (4.1).** Il brief 4.1 specifica:
+- tier=0: max 5 intent attivi
+- tier=1: max 10 intent attivi
+- tier=2: limite letto da `mandate.limits.max_active_intents`
+
+`platform_limits.DEFAULT_MAX_ACTIVE_INTENTS = 10` e `MAX_ACTIVE_INTENTS = 20` (hard cap). Tier 0 è 5, NON 10. Volutamente più restrittivo dei tier verificati.
+
+**Razionale.** Tier 0 sono utenti anonimi (solo email + passkey). Permettere a un utente non verificato di spammare 10-20 intent attivi è un vettore di abuso (matching cost, spam visibility). 5 è la soglia "decent demo experience" senza permettere abuso.
+
+**Implementazione.** Costanti separate in `intent_service.py`:
+- `TIER_0_MAX_ACTIVE_INTENTS = 5`
+- `TIER_1_MAX_ACTIVE_INTENTS = 10`
+- Tier 2 → letto da `mandate.limits.max_active_intents` (default 10, hard cap 20 in `platform_limits`)
+
+Test `test_tier_0_max_5_active_intents`, `test_tier_1_max_10_active_intents`, `test_tier_2_uses_mandate_limits`.
+
+**Quando rivedere.** Se vediamo abuse pattern in V0 (utenti tier=0 che riempiono di garbage), abbassare a 3. Se vediamo lamentele di "non posso provare il prodotto" perché 5 è poco, alzare a 7. A/B testabile post-launch.
