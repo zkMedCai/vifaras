@@ -59,6 +59,12 @@
 - Niente migration pesante
 - Riferimento: DQ-13
 
+### STEP_UP_REQUIRED notification — wire al modernization (FASE 6.3)
+- 6.1 ha la notification path preparata in `step_up_service.create_pending_request_sync` ma il callsite (`tool_layer.ToolHandler._queue_step_up`) è scaffold sync, dead-code in V0.
+- Quando 6.3 modernizzerà `tool_layer` ad async (DQ-28), il path async di `create_pending_request` emetterà la notifica STEP_UP_REQUIRED automaticamente.
+- Niente da fare ora — solo memoria che il loop si chiude in 6.3.
+- Riferimento: DQ-28 + brief 6.1 §"STEP_UP_REQUIRED non emesso in V0".
+
 ### Step-up biometrico su PATCH price update (V0.5)
 - V0 (4.1): tier=2 da solo è sufficient gate per modifiche a `reservation_price_eur` / `ideal_price_eur`. Razionale: passkey già firmata recentemente con il mandate (max 30gg), `intent.status != active` blocca update durante negoziazione, niente settlement = niente impatto monetario diretto.
 - Attack surface noto: device sbloccato + JWT valido = attacker può modificare floor/cap senza biometria fresh.

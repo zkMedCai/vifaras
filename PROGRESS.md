@@ -1181,3 +1181,81 @@ Pronto per 6.2 (Agent state & inbox) — la "world model" che l'orchestrator Cla
 
 ### Prossima task
 **6.2 Agent state & inbox**. `agent_state_service.get_full_state(agent_id)` ritorna everything l'agent deve sapere per fare un tick: mandate, intent attivi, negoziazioni in corso, notifiche pendenti, contatori limit. `inbox_service.get_inbox(agent_id)` ritorna offers+counter-offers+deal sigantures pending action. È la "world model" per il prompt Claude. Attendo via libera + brief denso analogo.
+
+
+---
+
+## [6.2] agent state full reload + inbox view (2026-04-29)
+
+### Cosa fatto
+- **Migration `a718c85956d0`** — Agent table: `+last_tick_at TIMESTAMPTZ` (cursor "what's new since last tick"), `+last_tick_summary JSONB` (debug blob set by orchestrator post-tick in 6.3).
+- **`schema.py`** — Agent.last_tick_at + last_tick_summary nullable.
+- **`core/datetime_helpers.py`** — `days_until`, `minutes_until`, `is_near_cap`. Pure functions, naive UTC, injectable `now` per testabilità.
+- **`models/views.py` (nuovo)** — Pydantic v2 view models JSON-serializable separati dallo schema SQLAlchemy. Privacy invariants enforced qui (DQ-31): `OtherIntentView` espone `reservation_price_eur` ma NON `ideal_price_eur`. Verbose field names + computed helpers (`days_until_expiry`, `awaiting_my_response`, `is_near_mandate_cap`) tengono il prompt Claude conciso. `description` truncate a 300 char per prompt budget. Models: `MandateView`, `LimitsRemaining`, `IntentView`, `OtherIntentView`, `MatchView`, `OfferView`, `NegotiationView`, `DealView`, `StepUpView`, `AgentInbox`, `AgentFullState`.
+- **`services/inbox_service.py` (nuovo)** — `get_inbox_for_agent(db, *, agent_id, user_id, since)`. 6 query categorie:
+  - `new_offers_received` + `counter_offers_received`: turn parsing app-side da `Negotiation.state["turns"]` JSONB (bounded by `since`, filtered by agent_id != self).
+  - `deals_awaiting_my_signature`: status-only filter (no since cursor — agent re-considers ogni tick).
+  - `other_party_signed_recently`: pending deals dove l'altro lato ha firmato post-since AND io non ho ancora.
+  - `approved_step_ups` / `rejected_step_ups`: resolved post-since.
+  - `since=None` → `_EPOCH_SENTINEL` (everything new on first tick).
+- **`services/agent_state_service.py` (nuovo)** — `get_full_state(db, *, agent_id)` orchestratore. Compone:
+  - Identità (agent_id, user_id, status, nullifier_pseudonym truncated 12-char).
+  - Mandate active + limits remaining (con auto-reset surfacing su daily counters stale).
+  - Active intents view con match_count_active + has_active_negotiation flag.
+  - Discovered/negotiating matches view ordinati per combined_score DESC.
+  - Active negotiations con last_offer + awaiting_my_response heuristic.
+  - Pending deals con `i_have_signed`, `other_has_signed`, `minutes_until_expiry`.
+  - Pending step-ups (resolved → inbox).
+  - `inbox` via `inbox_service`.
+  - `next_action_required` heuristic.
+  - Performance: ~5-8 queries DB, tutti su indici esistenti. No N+1 (bulk-load per intent/match).
+- **`api/_dev_endpoints.py` esteso** — `GET /api/_dev/agents/{id}/state`. Gated da `enable_dev_endpoints` (404 se off) + ownership check (403 se l'agent non è del caller). Ritorna `state.model_dump(mode="json")`.
+- **IDEAS_BACKLOG** — entry "STEP_UP_REQUIRED notification — wire al modernization (FASE 6.3)".
+
+### Decisioni prese non esplicite nel brief
+- **`get_full_state` NON aggiorna `last_tick_at`.** Rimane responsabilità del orchestrator post-tick (6.3). Razionale: se la tick fallisce mid-flight, il cursor non si muove → la prossima tick re-vede l'inbox. Idempotency-friendly.
+- **Limits remaining surface post-reset values quando daily counter è stale.** Il mandate_verifier fa lazy reset on next call; la view fa stesso ragionamento per il prompt: se `last_reset_date < today`, ritorna `daily_remaining = full_cap`. Evita prompt fuorvianti tipo "0 remaining" quando in realtà è stato già resettato logicamente.
+- **`description` truncate a 300 char in tutti i view models** (`IntentView`, `OtherIntentView`). Prompt budget defensive: 300 char ≈ 75 token, sufficient per gist semantico, evita prompt bloat su intent verbose. Truncated con `…` indicator.
+- **`OtherIntentView` schema-enforced privacy** invece di runtime filter. Pydantic model NON ha campo `ideal_price_eur` → impossibile leakage by construction. DQ-31 baked into the type.
+- **Match view sort by `combined_score DESC`**. Prompt prioritization: il modello vede prima i match più rilevanti. UX implicit: la prima offerta che l'agent farà è probabilmente quella su match[0].
+- **`awaiting_my_response` heuristic** = last_turn.agent_id != my_agent AND last_turn.type in ("offer", "counter_offer"). Non considera `accept`/`reject` perché quelli sono terminali (la negoziazione transition a `agreed`/`rejected`, non rimane `active`).
+- **`next_action_required` heuristic** = (any awaiting_response) OR (any deal_unsigned) OR (inbox events). Used dall'orchestrator per skip cheap su agent con niente da fare.
+- **Nullifier pseudonym 12-char prefix** (truncato). Audit-correlatable, no PII risk. None per tier-0 user (nullifier_hash è null).
+- **Inbox turn parsing app-side** invece di JSONB query Postgres. Volume: ≤ handful di negotiations active per agent × ≤ 6 turns/negotiation = <50 items/parse. JSONB filtering per timestamp è hairy (`(state->'turns'->X->>'timestamp')::timestamptz > since` + index su JSONB element non utile). App-side parse è più chiaro.
+- **`_parse_iso_z` defensive** — turn timestamps sono scritti dal nostro `negotiation_service._utc_iso_z`. Se per qualche motivo il format diverge (V1 schema migration, manual fix), parse failure ritorna `_EPOCH_SENTINEL` (turn surfaces conservatively as "new"). Belt + suspenders.
+- **Dev endpoint richiede tier=0+** ma fa ownership check. Razionale: anche tier-0 può debuggare i propri (futuri) agent. La protezione vera è `enable_dev_endpoints` flag (404 in prod) + agent ownership (403 cross-user). Non leakage even with flag accidentally enabled.
+
+### Test scritti / coverage
+- **22 nuovi test** in `tests/test_agent_state.py`:
+  - 4 identity & mandate (active mandate, pending_mandate, revoked, identity fields)
+  - 3 limits remaining (zero-spend, decremented, stale-daily-reset)
+  - 2 intents (match count, owner filter)
+  - 3 matches privacy + ranking (no ideal_price, score breakdown, ownership filter)
+  - 3 negotiations (awaiting_my_response, round + final flag, only-mine)
+  - 4 inbox (offers since cursor, exclude before, deal pending, approved step-ups)
+  - 3 edge cases (pending_mandate minimal, revoked minimal, nonexistent → AgentNotFound)
+- **Suite totale**: `pytest` → **286 passed in ~13s** (94 + 25 + 16 + 31 + 28 + 18 + 32 + 20 + 22). Nessuna regressione.
+- Test 7 (stale daily counter reset) verifica che il view surface POST-RESET values quando `last_reset_date.date() < today`. Guardia contro prompt accuracy.
+- Test 10 (privacy) ispeziona `model_dump()` per verifica strutturale che `ideal_price_eur` non sia mai presente in `OtherIntentView`. Coverage by construction: il campo non esiste nel model.
+
+### Blocker / dubbi
+- **`get_full_state` query count**: 7-8 round-trip per call. A 100 agent ticking ogni 60s = ~13/sec total. Acceptable V0. V1+ valutare consolidation in single query con CTEs o denormalization per `match_count_active` su Intent (se hot path).
+- **No snapshot consistency** tra le query. Race window: tra prima e ultima query, qualcosa cambia. V0 acceptable (l'agent rilegge al next tick). V1+ può usare `REPEATABLE READ` o single big query.
+- **Inbox JSONB parsing app-side**: efficient per scale V0 ma se in V1 una negotiation accumula molte turns (es. agent fa 20 round) → parse cost cresce. Mitigazione naturale: hard cap 6 round già impone bound.
+- **`_has_pending_work` heuristic non considera `pending_step_ups`**. Rationale: step-up pending sono signal "agent waiting for user input"; il run_tick non può fare nulla finché user non firma. Includerli triggererebbe tick inutili. Se in 6.3 vediamo agent "stuck", aggiungere come signal.
+- **Dev endpoint test non scritto**. Brief 6.2 list 22 test ma niente per dev endpoint. Aggiunto solo logica + smoke implicita via altre integration. 7.x può aggiungere test specifico.
+- **Test 21 (revoked agent)** non asserts strictly su `next_action_required`. Razionale: pending_deals può ancora esistere su agent revocato (deal pre-revoke), quindi heuristic potrebbe ritornare True. Non un bug — l'orchestrator in 6.3 vedrà `mandate=None` e refuserà di agire. La heuristic è "do I have pending work?" non "can I do work?".
+- **`limits_remaining.deals_remaining_today` cap reading**: legge `mandate.limits["max_deals_per_day"]` con default 0. Se il mandate fields è `None` o mancante → 0 deals available. Defensive.
+
+### Cosa significa "6.2 completa"
+L'orchestrator (6.3) ora ha tutti i dati per fare un tick:
+- Single function `get_full_state(agent_id)` → AgentFullState JSON-friendly.
+- Privacy DQ-31 enforced by view model construction.
+- Inbox delta cursor-based via `last_tick_at`.
+- Computed helpers per minimal prompt logic.
+- Dev endpoint per debugging local.
+
+286 test verdi. Pronto per **6.3 (Scheduler agent ticks)** — il finale di FASE 6 dove l'AI prende il sopravvento. Modernizzazione tool_layer ad async (DQ-28 saldata), orchestrator.py async, scheduler apscheduler trova agent con `next_action_required=True` e chiama `orchestrator.run_tick()`. Quando 6.3 chiude, il marketplace è truly agent-mediated.
+
+### Prossima task
+**6.3 Scheduler agent ticks**. Modernizza tool_layer (DQ-28). orchestrator.py async con Claude API + tool use. Scheduler ogni 60s su agent con `next_action_required`. Closes FASE 6. Attendo via libera + brief denso analogo.

@@ -87,7 +87,14 @@ class Agent(Base):
     
     status = Column(String(20), default="active")  # active|paused|revoked
     created_at = Column(DateTime, default=datetime.utcnow)
-    
+
+    # 6.2: orchestrator tick tracking. `last_tick_at` is the cursor for
+    # "what's new since last visit" inbox queries. `last_tick_summary` is
+    # a small JSONB debug blob (decided action, reason) — V0 founder-led
+    # inspection lever before full observability lands in 7.x.
+    last_tick_at = Column(DateTime, nullable=True)
+    last_tick_summary = Column(JSONB, nullable=True)
+
     user = relationship("User", back_populates="agents")
     mandates = relationship("Mandate", back_populates="agent")
 

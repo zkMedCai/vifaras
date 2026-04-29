@@ -305,7 +305,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - V0: console log + `/api/dev/notifications`
 - V1+: APNs / FCM reale
 
-#### 🔲 6.2 Agent state & inbox services
+#### ✅ 6.2 Agent state & inbox services
 - `services/agent_state_service.py.get_full_state(agent_id)`
 - `services/inbox_service.py`
 
