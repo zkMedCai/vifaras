@@ -277,8 +277,8 @@ async def test_revoke_cancels_active_negotiations_and_pending_deals(
         seller_user_id=cp_user_id,
         buy_intent_id=buy_intent.id,
         sell_intent_id=sell_intent.id,
-        final_price_cents=160_000,
-        status="pending_buyer",
+        agreed_price_cents=160_000,
+        status="pending_signatures",
         idempotency_key=str(uuid.uuid4()),
     )
     confirmed_deal = Deal(
@@ -288,7 +288,7 @@ async def test_revoke_cancels_active_negotiations_and_pending_deals(
         seller_user_id=cp_user_id,
         buy_intent_id=buy_intent.id,
         sell_intent_id=sell_intent.id,
-        final_price_cents=170_000,
+        agreed_price_cents=170_000,
         status="confirmed",
         idempotency_key=str(uuid.uuid4()),
     )
@@ -413,7 +413,7 @@ async def test_revoke_does_not_affect_confirmed_deals(
         seller_user_id=cp_user_id,
         buy_intent_id=buy_intent.id,
         sell_intent_id=sell_intent.id,
-        final_price_cents=42_000,
+        agreed_price_cents=42_000,
         status="confirmed",
         idempotency_key=str(uuid.uuid4()),
     )

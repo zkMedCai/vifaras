@@ -4,7 +4,7 @@ Schema database del marketplace.
 Principio guida: ZERO PII memorizzata.
 Identità = nullifier opaco da Self Protocol.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from sqlalchemy import (
     Column, String, Integer, Numeric, DateTime, Boolean,
@@ -357,45 +357,108 @@ class Negotiation(Base):
 class Deal(Base):
     """
     Un deal confermato. Richiede step-up signature da entrambe le parti.
+
+    State machine (post-5.3):
+      pending_signatures → confirmed (both signed)
+      pending_signatures → cancelled (explicit cancel by either party)
+      pending_signatures → expired   (24h timeout without dual sign)
+      confirmed          → completed (V1.5+ Trustee Service)
+      confirmed          → disputed  (V1.5+ Trustee Service)
     """
     __tablename__ = "deals"
-    
+
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     negotiation_id = Column(UUID(as_uuid=False), ForeignKey("negotiations.id"), nullable=False)
-    
+
     buyer_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
     seller_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
     buy_intent_id = Column(UUID(as_uuid=False), ForeignKey("intents.id"), nullable=False)
     sell_intent_id = Column(UUID(as_uuid=False), ForeignKey("intents.id"), nullable=False)
-    
-    final_price_cents = Column(BigInteger, nullable=False)
-    
+
+    # Renamed from `final_price_cents` in 5.3: "agreed" reflects the
+    # negotiated value at accept; "final" is reserved for V1.5+ Trustee
+    # post-settlement state.
+    agreed_price_cents = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False, default="EUR")
+
     # Step-up signatures (passkey-firmate dagli umani)
     buyer_signature = Column(JSONB, nullable=True)
     buyer_signed_at = Column(DateTime, nullable=True)
     seller_signature = Column(JSONB, nullable=True)
     seller_signed_at = Column(DateTime, nullable=True)
-    
-    status = Column(String(20), default="pending_buyer")
-    # pending_buyer -> pending_seller -> confirmed -> completed -> disputed/cancelled
-    
+
+    status = Column(String(20), default="pending_signatures")
+    # pending_signatures | confirmed | cancelled | expired | completed | disputed
+
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Python-side default mirrors the migration's server_default (NOW()+24h).
+    # deal_service overrides this on insert; the default here is a safety net
+    # for legacy callers (test_revocation seed rows) and ORM consistency.
+    expires_at = Column(
+        DateTime,
+        nullable=False,
+        default=lambda: datetime.utcnow() + timedelta(hours=24),
+    )
     confirmed_at = Column(DateTime, nullable=True)
-    
+    cancelled_at = Column(DateTime, nullable=True)
+    cancellation_reason = Column(String(50), nullable=True)
+
     # EC5: idempotency key per evitare double-deal su stessa negoziazione
     idempotency_key = Column(Text, unique=True, nullable=False)
 
 
+class DealSignatureDraft(Base):
+    """Pending WebAuthn-bound signature draft for a Deal action (5.3).
+
+    Same pattern as MandateDraft / MandateRevocationDraft (2.4 / 2.5):
+    short-TTL row carrying the canonical bytes the user's passkey will
+    sign + the WebAuthn challenge. `consumed=True` is the replay guard.
+
+    Discriminated by `kind`:
+      - 'sign'   → buyer or seller signing the deal to confirm.
+      - 'cancel' → buyer or seller signing a deal cancellation.
+
+    `role` identifies which side of the deal is signing.
+    """
+    __tablename__ = "deal_signature_drafts"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    deal_id = Column(UUID(as_uuid=False), ForeignKey("deals.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+
+    role = Column(String(10), nullable=False)  # 'buyer' | 'seller'
+    kind = Column(String(10), nullable=False)  # 'sign'  | 'cancel'
+
+    canonical_payload = Column(LargeBinary, nullable=False)
+    challenge = Column(LargeBinary, nullable=False)
+
+    expires_at = Column(DateTime, nullable=False)
+    consumed = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_deal_drafts_deal_user", "deal_id", "user_id", "expires_at"
+        ),
+    )
+
+
 class DealMessage(Base):
-    """Chat tra umani post-deal per coordinare consegna/pagamento. Pseudonimi."""
+    """Chat tra umani post-deal per coordinare consegna/pagamento. Pseudonimi.
+
+    V0 backend is transport-only: `encrypted_content` and `nonce` are
+    opaque binary blobs the server never decrypts. Real key exchange +
+    encryption is FASE 11 (mobile client).
+    """
     __tablename__ = "deal_messages"
-    
+
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     deal_id = Column(UUID(as_uuid=False), ForeignKey("deals.id"), nullable=False)
     sender_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
-    
-    encrypted_content = Column(Text, nullable=False)  # E2E cifrato
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+    encrypted_content = Column(LargeBinary, nullable=False)
+    nonce = Column(LargeBinary, nullable=False)
+    sent_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 # ============================================================================

@@ -8,7 +8,8 @@ payload says `action: revoke_mandate` and the submit handler:
   3. Cancels active negotiations for that agent
      (status='active' → 'cancelled_due_to_revocation')
   4. Cancels pending deals for that user/agent
-     (status='pending_buyer'|'pending_seller' → 'cancelled_due_to_revocation')
+     (status='pending_signatures' (post-5.3) | 'pending_buyer' | 'pending_seller'
+      → 'cancelled_revoked')
   5. Pauses active intents (status='active' → 'paused')
   6. Invalidates pending mandate_drafts (consumed=True)
   7. Invalidates pending step_up_requests (status='expired')
@@ -465,12 +466,19 @@ async def _cascade_cancellations(
 
     # 2. Pending deals where this user is buyer or seller AND status is
     #    pending → cancelled. Confirmed/completed deals are NOT touched.
+    #    5.3 unified `pending_buyer`/`pending_seller` into `pending_signatures`;
+    #    legacy strings kept in the IN-list for safety until any pre-5.3
+    #    rows have aged out (no live data exists, but cheap insurance).
     deal_rows = await db.scalars(
         select(Deal)
         .where(
             (Deal.buyer_user_id == user_id) | (Deal.seller_user_id == user_id)
         )
-        .where(Deal.status.in_(("pending_buyer", "pending_seller")))
+        .where(
+            Deal.status.in_(
+                ("pending_signatures", "pending_buyer", "pending_seller")
+            )
+        )
     )
     deal_count = 0
     for deal in deal_rows:

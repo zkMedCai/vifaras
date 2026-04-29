@@ -1012,3 +1012,86 @@ Mini-auction sicura: il marketplace gestisce N negoziazioni concorrenti sullo st
 
 ### Prossima task
 **5.3 Deal service**. `create_pending_deal` con idempotency_key consumando il next_step di accept_offer. Step-up signatures buyer + seller (passkey-firmate). Match status: `agreed → completed`. Intent status: `matched → closed`. Rollback path: se step-up fallisce, ripristina intent `active`. Attendo via libera + brief denso analogo.
+
+
+---
+
+## [5.3] deal service + dual signing + e2e chat transport (2026-04-29)
+
+### Cosa fatto
+- **Migration `83695fb4e8a6`** — schema reconciliation:
+  - Deal: `final_price_cents` → `agreed_price_cents` (rename); `+currency`, `+expires_at` (server_default NOW+24h), `+cancelled_at`, `+cancellation_reason`; status default `pending_buyer` → `pending_signatures`.
+  - DealMessage: `encrypted_content` Text → BYTEA (drop+re-add, no live rows); `+nonce BYTEA`; `created_at` → `sent_at`.
+  - **Nuova table `deal_signature_drafts`**: shape mandate_drafts-like + discriminator `kind` (`sign` | `cancel`) + `role` (`buyer` | `seller`). Index su (deal_id, user_id, expires_at).
+- **`schema.py`** updated to match. Python-side default `expires_at = NOW + 24h` per ORM-inserted Deal rows. New `DealSignatureDraft` model.
+- **`audit_service.DealActions`** esteso con `SIGN`, `EXPIRE`, `SEND_MESSAGE` (oltre alle 7 esistenti pre-emptive).
+- **`services/deal_service.py`** completo:
+  - `create_pending_deal` idempotente via natural key `deal_v1_{negotiation_id}_{agreed_price_cents}`. NO commit (caller in `accept_offer` owns transaction boundary).
+  - `request_sign_draft` / `request_cancel_draft` shared via `_create_signature_draft(kind=...)`. Genera challenge + canonical JCS payload, persiste draft con TTL 5min.
+  - `submit_signature`: WebAuthn verify → mark party signed → if both signed, transition `pending_signatures → confirmed`. Per-role audit + separate CONFIRM audit when both lands.
+  - `submit_cancel`: WebAuthn verify → cancel + `_rollback_deal_state` (intents matched→active, chosen match agreed→discovered).
+  - `expire_deal`: scheduler-driven, idempotent, same rollback as cancel with `cancellation_reason='deal_expired'`.
+  - 11 typed errors (`DealError` hierarchy) + `DealMessageError` extension.
+- **`services/deal_message_service.py`** — chat E2E transport-only:
+  - `send_message` / `list_messages`. Server treats `encrypted_content` + `nonce` as opaque bytes (real crypto FASE 11 mobile).
+  - V0 caps: 100 messages/deal, 4KB/message. Status check: only `confirmed` deals open chat.
+- **`negotiation_service.accept_offer` esteso**:
+  - Step 8 nuovo: dopo cascade, chiama `deal_service.create_pending_deal` nello stesso transaction. Atomic accept-and-deal.
+  - `AcceptResult` ora carry `deal_id` + `deal_expires_at`. `next_step` cambiato da `"create_deal_in_5_3"` (placeholder) a `"sign_deal_with_passkey"`.
+  - Audit `accept_offer` arricchito con `result.deal_id`.
+- **`api/deals.py`** — 8 endpoint REST tutti `tier ≥ 2`: GET list/detail, POST sign draft/submit, POST cancel draft/submit, POST/GET messages. Base64 encoding per blob binari nei messages.
+- **`match_scheduler`** esteso: nuovo job `expire_pending_deals` (interval 10min) che chiama `deal_service.expire_deal` per ogni Deal `pending_signatures` past `expires_at`. Coesiste con `refresh_low_match_intents` esistente.
+- **`mandate_revocation_service`** updated: cascade su deals pending include sia `pending_signatures` (post-5.3) che legacy `pending_buyer`/`pending_seller` per safety. Test esistenti aggiornati (column rename `final_price_cents→agreed_price_cents`).
+- **`main.py`** — router `deals` registrato.
+- **Test esistenti aggiornati**: `test_revocation.py` (column rename + status string), `test_negotiation.py` (next_step assertion).
+
+### Decisioni prese non esplicite nel brief
+- **Schema state default `'pending_signatures'` (singolo stato)** invece di `pending_buyer → pending_seller` ordering. Razionale: i due signature sono semanticamente simmetrici; non c'è "buyer signs first" ordering. Single-state semplifica il codice e i test. Status string capped at 20 chars (schema constraint). Cancel/expire logic also simpler: un solo `pending_signatures` da catturare invece di due valori OR'd.
+- **Idempotency key naturale** `deal_v1_{negotiation_id}_{agreed_price_cents}` invece di UUID random. Una negotiation può accettare al massimo una volta (transitional rule); price è il valore agreed. Stessa coppia → stessa Deal row → idempotency by construction. UUID random richiederebbe extra state per detectare duplicates.
+- **`expires_at` Python-side default in schema.py** (`lambda: datetime.utcnow() + timedelta(hours=24)`) oltre al server_default in migration. Razionale: ORM-instantiated Deal rows (test seed via Deal(...)) bypass server_default; senza Python default, INSERT fallisce su nullable=False. Server_default rimane per raw SQL inserts. Belt + suspenders.
+- **`_rollback_deal_state` re-loka FOR UPDATE** sugli Intent + Match in cancel/expire path. Già lockati da accept_offer in 5.2 ma il txn è committed; rollback è una nuova txn. Defensive lock is cheap insurance.
+- **Cancel rollback ripristina solo il chosen match** a `discovered`. I match competing (expired by mini-auction in 5.2) NON vengono ripristinati. Razionale: match scheduler (4.3) li rediscoverà automaticamente quando intent torna `active` con < 3 match. Evita complicazioni di tracking "which matches were affected by the mini-auction".
+- **Single `_create_signature_draft` shared per sign + cancel** con `kind` parameter, invece di 2 funzioni dedicate. DRY: validazione status + WebAuthn challenge + payload structure sono identiche; differisce solo `action` field nel canonical payload (`deal_sign` vs `deal_cancel`).
+- **Chat transport-only per V0**: encrypted_content / nonce sono opaque blobs. Server NON valida il formato crypto. Documentato che real key exchange è FASE 11.
+- **`MAX_MESSAGES_PER_DEAL=100`, `MAX_MESSAGE_BYTES=4096`** hard-coded constants in `deal_message_service`. Da settings se mai V0.5 vuole tunable, ma V0 non vediamo motivo. Caps sono anti-spam + anti-storage-bloat baseline.
+- **`cancellation_reason='user_cancelled'` vs `'deal_expired'`** — due valori canonical V0. V1+ può estendere (`buyer_cancelled`, `seller_cancelled`, `dispute_initiated`, ...). Stringe magic ma constants in deal_service module.
+- **Audit cascade su `expire_pending_deals` scheduler** emette EXPIRE per-deal. Volume basso (< deals_pending_per_tick), accettabile.
+- **`create_pending_deal` non auto-create chat thread**. Chat è gated da `status == 'confirmed'`; thread emerge implicitly al confirm. Niente DealChat row separata — sarebbe overhead per V0.
+- **Tutti gli endpoint deals require_tier(2)**. Anche GET list. Razionale: a tier 0/1 non hai mai un deal (accept richiede mandate active = tier 2). Tier check è ridondante ma defensive.
+- **`api/deals.py` error mapping cattura solo `DealError`** (non `IntentError` / `NegotiationError` come `cancel_intent`). Razionale: deal endpoints non chiamano intent_service / negotiation_service direttamente; solo deal_service.
+
+### Test scritti / coverage
+- **32 nuovi test** in `tests/test_deal.py`:
+  - 5 creation (correct fields, idempotent, links, expires_at 24h, status pending)
+  - 5 sign draft (buyer ok, seller ok, non-party 403, already-signed 409, non-pending 409)
+  - 8 sign submit (valid signature, first doesn't confirm, both confirm, invalid sig 422, expired draft 410, consumed 409, replay flag, audit per-role + confirm)
+  - 4 cancel (valid sig, intent rollback, match reset, post-confirm rejected)
+  - 3 expire (scheduler tick, intent rollback, partially-signed)
+  - 4 chat (send to confirmed ok, pending fails, non-party 403, size cap)
+  - 3 concurrency (two-sig serialize, double-cancel rejected, expired-during-sign 410)
+- **Suite totale**: `pytest` → **244 passed in ~12s** (94 + 25 + 16 + 31 + 28 + 18 + 32). Nessuna regressione.
+- WebAuthn mock pattern: `webauthn_ok` fixture patcha `app.services.deal_service.verify_authentication_response` a SimpleNamespace(new_sign_count=1). Failure case via `_patch_webauthn_raise(monkeypatch, msg)`.
+- Test seed `_seed_pending_deal(db)` produce in 1 chiamata: 2 utenti tier-2 + 2 intent + 1 match + 1 negotiation + 1 deal pending. Riusato in 30 test.
+
+### Blocker / dubbi
+- **Test esistenti rotti dalla rename `final_price_cents → agreed_price_cents`**: `test_revocation.py` aveva 3 hardcoded references. Sed-fixed inline. Plus `mandate_revocation_service` cascade query updated per supportare entrambi i status string (legacy + new).
+- **WebAuthn signing semantica diversa da mandate signing**: mandate è "I authorize this agent". Deal è "I confirm this contract". Stesso transport (passkey assertion + challenge), ma il canonical payload distingue (`action: 'deal_sign'` vs `action: 'mandate_signed'`). Replay across contexts è impossibile per construction (challenge bytes uniche per draft).
+- **Scheduler test pattern**: V0 single-process, scheduler driven by FastAPI lifespan. Test 23 (deal expiration) chiama `deal_service.expire_deal` direttamente, bypassa il timer apscheduler. La job-glue logic in `match_scheduler.expire_pending_deals` non è testata direttamente (analogo a 4.3 `test_refresh_low_match_intents`).
+- **Cancel rollback non re-triggera match scheduler**: dopo cancel, intents tornano active e chosen match torna discovered. Il match scheduler li rediscoverà al next tick (ogni 5min). Per V0 latency accettabile; V0.5 può aggiungere trigger immediato `find_matches_for_intent` dentro rollback.
+- **`api/deals.py` POST messages risponde 201**: status_code=201 per creazione, ma list endpoint risponde 200. Inconsistency minor accettata (REST conventions).
+- **`base64` encoding for messages**: client manda b64-encoded encrypted_content + nonce, server decode + persist as bytes. Round-trip via b64 nelle response. V0.5+ potrebbe esporre bytes diretti via multipart/form-data se il throughput lo richiede.
+
+### Cosa significa "5.3 completa" e "FASE 5 chiusa"
+Loop end-to-end del marketplace funziona:
+
+1. Tier 0+ utenti creano intent (4.1) → embedding inline (4.2) → match discovery (4.3)
+2. Tier 1+ negoziazione turn-based (5.1) con cap 6 round
+3. Tier 2 accept atomico → mini-auction cancella concorrenti (5.2)
+4. Tier 2 dual-WebAuthn signing → deal confirmed (5.3)
+5. Chat E2E pseudonimizzata transport-ready (5.3)
+6. Auto-expiration 24h con rollback (5.3)
+
+244 test verdi. Pronto per **FASE 6 (Agent runtime)** — l'orchestrator Claude prende il sopravvento e gli umani diventano "step-up signers" + chat partecipanti invece di operatori manuali.
+
+### Prossima task
+**FASE 6 — Agent Runtime**. 6.1 notification service esteso, 6.2 agent_state_service + inbox_service, 6.3 scheduler agent ticks. Il momento dove l'AI agent diventa active player. Modernizzazione tool_layer per async (DQ-28). Attendo via libera + brief denso analogo per 6.1.

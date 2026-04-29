@@ -205,7 +205,9 @@ class AcceptResult:
     negotiation_id: str
     match_id: str
     agreed_price_cents: int
-    next_step: str  # placeholder for 5.3 deal handoff
+    next_step: str  # 5.3: 'sign_deal_with_passkey'
+    deal_id: str | None = None  # populated post-5.3 hook
+    deal_expires_at: datetime | None = None
 
 
 @dataclass
@@ -564,9 +566,30 @@ async def accept_offer(
         owning_user_id=user_id,
     )
 
+    # 8. 5.3 hand-off: create the pending Deal in the SAME transaction so
+    #    the marketplace state stays atomic — accept-and-deal is one
+    #    indivisible step. Resolve buyer/seller user_ids from the locked
+    #    intents (which are the canonical source).
+    locked_by_id = {i.id: i for i in locked_intents}
+    buy_intent_obj = locked_by_id[match.buy_intent_id]
+    sell_intent_obj = locked_by_id[match.sell_intent_id]
+    # Lazy-import to avoid module-level cycle (deal_service imports types
+    # this module also exports indirectly via mandate_service).
+    from app.services import deal_service
+
+    deal = await deal_service.create_pending_deal(
+        db,
+        negotiation_id=nego.id,
+        buy_intent_id=match.buy_intent_id,
+        sell_intent_id=match.sell_intent_id,
+        buyer_user_id=buy_intent_obj.user_id,
+        seller_user_id=sell_intent_obj.user_id,
+        agreed_price_cents=agreed_price,
+    )
+
     await db.flush()
 
-    # 8. Audit.
+    # 9. Audit.
     await audit_service.log_intent_event(
         db,
         user_id=user_id,
@@ -581,6 +604,7 @@ async def accept_offer(
             "status": "agreed",
             "competing_negotiations_cancelled": cancelled_count,
             "competing_matches_expired": expired_count,
+            "deal_id": deal.id,
         },
         success=True,
         agent_id=agent_id,
@@ -592,7 +616,9 @@ async def accept_offer(
         negotiation_id=nego.id,
         match_id=nego.match_id,
         agreed_price_cents=agreed_price,
-        next_step="create_deal_in_5_3",
+        next_step="sign_deal_with_passkey",
+        deal_id=deal.id,
+        deal_expires_at=deal.expires_at,
     )
 
 

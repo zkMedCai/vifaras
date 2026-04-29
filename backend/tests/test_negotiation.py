@@ -608,7 +608,7 @@ async def test_accept_response_carries_next_step(async_db_session) -> None:
         agent_id=s.buyer_agent_id,
         negotiation_id=result.negotiation_id,
     )
-    assert accept.next_step == "create_deal_in_5_3"
+    assert accept.next_step == "sign_deal_with_passkey"
     assert accept.match_id == s.match_id
 
 

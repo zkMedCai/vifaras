@@ -279,7 +279,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - API endpoint: `GET /api/intents/{id}/matches`
 - **Vector index HNSW cosine** creato in migration separata pre-4.3 (vedi DQ-3)
 
-### 🔄 FASE 5 — Negoziazione (in corso)
+### ✅ FASE 5 — Negoziazione (completa)
 
 #### ✅ 5.1 Negotiation service
 - `services/negotiation_service.py`
@@ -293,7 +293,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - N>1 match → offerte parallele
 - EC5 race condition: optimistic locking via `SELECT ... FOR UPDATE`
 
-#### 🔲 5.3 Deal service
+#### ✅ 5.3 Deal service
 - `services/deal_service.py`
 - `create_pending_deal()` con `idempotency_key`
 - Step-up signatures buyer + seller

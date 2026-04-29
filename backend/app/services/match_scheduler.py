@@ -31,6 +31,63 @@ from app.services import match_service
 _scheduler: AsyncIOScheduler | None = None
 
 
+async def expire_pending_deals() -> dict[str, int]:
+    """One tick: expire pending Deals past their `expires_at` (24h V0 default).
+
+    Each expiration rolls back the linked intents `matched → active` and
+    the chosen match `agreed → discovered` (see deal_service.expire_deal).
+    Returns a small telemetry dict for tests + future stats endpoint.
+    """
+    from app.core.db import AsyncSessionLocal
+    from app.models.schema import Deal
+    from app.services import deal_service
+    from sqlalchemy import select as _select
+
+    expired = 0
+    skipped = 0
+    errored = 0
+
+    async with AsyncSessionLocal() as db:
+        candidate_ids = list(
+            await db.scalars(
+                _select(Deal.id)
+                .where(Deal.status == "pending_signatures")
+                .where(Deal.expires_at < _utcnow_naive())
+                .limit(settings.match_scheduler_batch_size)
+            )
+        )
+
+        for deal_id in candidate_ids:
+            try:
+                result = await deal_service.expire_deal(db, deal_id=deal_id)
+                if result.intents_reverted or result.matches_reverted:
+                    expired += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                errored += 1
+                log.warning(
+                    "match_scheduler.deal_expire_failed",
+                    deal_id=deal_id,
+                    error=type(exc).__name__,
+                    message=str(exc),
+                )
+
+    log.info(
+        "match_scheduler.deal_expire_tick_complete",
+        expired=expired,
+        skipped=skipped,
+        errored=errored,
+    )
+    return {"expired": expired, "skipped": skipped, "errored": errored}
+
+
+def _utcnow_naive():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 async def refresh_low_match_intents() -> dict[str, int]:
     """One tick: re-match intents with `< min_matches` discovered matches.
 
@@ -113,6 +170,16 @@ def start_scheduler() -> AsyncIOScheduler | None:
         "interval",
         minutes=settings.match_scheduler_interval_minutes,
         id="match_refresh_low_intents",
+        replace_existing=True,
+    )
+    # 5.3: piggy-back on the same scheduler for deal expiration. Independent
+    # tick frequency (10 min by default — deals don't auto-expire faster
+    # than that and we don't want to thrash the lock graph).
+    sched.add_job(
+        expire_pending_deals,
+        "interval",
+        minutes=10,
+        id="deal_expire_pending",
         replace_existing=True,
     )
     sched.start()

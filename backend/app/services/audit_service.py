@@ -84,12 +84,15 @@ class DealActions:
     """Action codes for Deal lifecycle (FASE 5)."""
 
     CREATE: Final[str] = "create_deal"
+    SIGN: Final[str] = "sign_deal"
     BUYER_SIGN: Final[str] = "buyer_sign_deal"
     SELLER_SIGN: Final[str] = "seller_sign_deal"
     CONFIRM: Final[str] = "confirm_deal"
     DISPUTE: Final[str] = "dispute_deal"
     COMPLETE: Final[str] = "complete_deal"
     CANCEL: Final[str] = "cancel_deal"
+    EXPIRE: Final[str] = "expire_deal"
+    SEND_MESSAGE: Final[str] = "send_message"
 
 
 async def log_tier_upgrade(
