@@ -662,3 +662,43 @@ Con 2.6 chiusa, la **FASE 2 (Identity & Auth) è completata al 100%**:
 **4.1 Intent service (FASE 4 — Marketplace core)**. Cambio di mood: da identity/security a business logic + matching semantico. **Attendo brief esteso del founder** per partire bene su 4.1.
 
 > **Promemoria del founder pre-FASE 4**: "Fase 4 (Marketplace core) è tutto un altro lavoro: business logic, matching semantico, embedding, scoring algorithms. Più creativo, più 'let's see how it performs', più calibration su feedback reali. Ti scriverò un brief denso per 4.1 (Intent service) quando ci arriviamo, perché è il primo pezzo dove il prodotto inizia davvero a esistere."
+
+---
+
+## [chore] v1.3 stocktaking — pre-FASE 4 housekeeping (2026-04-29)
+
+### Cosa fatto
+- `PROJECT_BRIEF.md` v1.1 → **v1.3**:
+  - §2.7 MCP architectural principle (tool layer come MCP-compatible, V2+ public server)
+  - §2.8 OAuth provider linking V1.5+ (Anthropic primary, ChatGPT/Gemini deferred)
+  - §2.9 BUY/SELL/TRADE come Intent.side enum (V0 schema-ready, TRADE V1+)
+  - Stack web Next.js 14 + mobile React Native companion
+  - FASE 1-2 marcate ✅ complete; rinumerate fasi 8 (TRADE V1), 9 (Trustee V1.5), 10 (Web V0), 11 (Mobile V0.5)
+  - DQ-26 tier-credenziale / agent-operatività formalizzato in §2.5
+  - Spec di prodotto referenziate
+- **Nuovi documenti satellite** (V1+ specs, non implementare in V0):
+  - `IDEAS_BACKLOG.md` v1.0 — backlog accumulato per categoria (provider linking, MCP, sicurezza, performance, testing, multi-agent, TRADE, Trustee, frontend, compliance, GTM)
+  - `MANDATE_UX_FLOW.md` v1.0 — 7 schermate Tier 2 onboarding + stati errore + backend mapping (deliverable FASE 10/11)
+  - `BARTER_DESIGN.md` v1.0 — TRADE bilaterale V1+ (subjective value theory, Pareto matching, multi-dim negotiation, Opzione β, regolatorio IT) (deliverable FASE 8)
+  - `TRADE_WINDOW_FLOW.md` v1.0 — Trustee Service V1.5 (Stripe Connect Express, 4 corrieri IT, dual-tracking, dispute resolution, postal claim handoff) (deliverable FASE 9)
+
+### Decisioni cementate da questo chore
+- **Intent.side = enum a 3 valori** (`buy` | `sell` | `trade`). V0 implementa solo buy/sell. `trade` accetta lo schema ma il service rifiuta operativamente con `NotImplementedError`. Razionale: 30 min in V0 risparmiano settimane in V1.
+- **Tool layer MCP-compatible** anche se nessun MCP server pubblico in V0. Disciplina: tool definitions con JSON schema standard, ToolHandler agnostico al transport.
+- **OAuth provider linking deferred a V1.5**: V0/V1 girano sui nostri crediti Anthropic, free tier 5 negoziazioni/mese. Take rate sui deal 5-8% blended.
+- **Trustee Service obbligatorio (non opt-in) in V1.5**: pattern Cardmarket, default-on. Differenzia da Vinted (opt-in, piena di truffe).
+- **Tutti i deliverable V1+ sono ora documentati** ma fuori scope V0. Nessun debt in agenda per FASE 4-7.
+
+### Cosa NON cambia
+- Stack tecnico backend (Python/FastAPI/Postgres/SQLAlchemy 2.0/Pydantic v2)
+- Decisioni di design §3 (identity, mandate, marketplace, deal, compliance)
+- Test architecture (testcontainers Postgres only)
+- Workflow operativo (una task alla volta, commit `[fase.task]`, PROGRESS, stop)
+- Tutti gli scaffold §5 e i 9 service implementati in FASE 1-2
+
+### Test
+N/A — chore documentale. `pytest -v` post-chore: **94 passed** invariato.
+
+### Prossima task
+**4.1 Intent service** — pronto a partire. Founder ha promesso brief esteso pre-4.1; attendo via libera.
+

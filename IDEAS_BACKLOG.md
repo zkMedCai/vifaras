@@ -1,0 +1,288 @@
+# IDEAS_BACKLOG.md
+
+> Idee, miglioramenti, e debt tecnico identificato ma non bloccante per V0.
+> Non aggiungere al PROJECT_BRIEF se non c'è conferma del founder.
+> Quando V0 sarà completo, rivisitare questa lista per planning V1.
+
+---
+
+## Categoria: Provider linking (V1.5+)
+
+### OAuth "Collega Claude"
+- A V1.5: bottone "Collega Claude" nell'app web/mobile
+- OAuth flow → Anthropic, salviamo access_token cifrato
+- Orchestrator usa quel token invece del nostro account
+- Free tier limitato sui nostri crediti per chi non collega
+- Riferimento dettagli: PROJECT_BRIEF §2.8
+
+### OAuth ChatGPT (V2)
+- Quando OpenAI maturera l'OAuth flow per terzi
+- Stesso pattern di Claude
+
+### API-key fallback Gemini (V2+)
+- Google vieta OAuth third-party per Gemini consumer
+- Possiamo guidare l'utente a generare API key da AI Studio
+- Friction maggiore ma fattibile per power user
+
+---
+
+## Categoria: MCP server pubblico (V2+)
+
+- Esposizione del tool layer come MCP server stand-alone
+- Costo dev: 1-2 settimane (lavoro precedentemente fatto si trasferisce)
+- Audience: power user con Claude Desktop / Cursor / ChatGPT app
+- Storytelling: "primo marketplace consumer A2A-compatible"
+- Riferimento: PROJECT_BRIEF §2.7
+
+---
+
+## Categoria: Sicurezza / Auth
+
+### Refresh token rotation (V1+)
+- Pattern security best practice: nuovo refresh ad ogni use, blocklist su reuse
+- Riferimento: DQ-25
+- Trigger threshold: ~500 utenti registrati
+
+### Email DB-level partial unique index (7.x)
+- Convertire email uniqueness da app-level a DB-level
+- `CREATE UNIQUE INDEX ix_users_email_unique ON users (lower(email))`
+- Risolve race condition teorica
+- Riferimento: DQ-9
+
+### JWT secret rotation strategy (7.4)
+- Rolling key, kid claim, graceful rotation
+- Pre-launch checklist obbligatoria
+
+### KMS reale (V1+)
+- Da file-based ed25519 (V0) a AWS KMS / GCP KMS
+- ed25519 supportato nativamente da AWS KMS dal 2025
+- Niente migration pesante
+- Riferimento: DQ-13
+
+---
+
+## Categoria: Performance / Optimization
+
+### Vector index HNSW pre-4.3
+- Migration separata prima di abilitare 4.3 Match service
+- Operatore: `vector_cosine_ops`
+- Parametri di partenza: `m=16, ef_construction=64`
+- Riferimento: DQ-3
+
+### Denormalize agent_id su Negotiation
+- Cascade revoke fa scan via match→intent→agent
+- A 100 utenti V0 cheap, a 100K serve denormalizzazione
+- Da fare in 7.x quando metriche traffico reali
+
+### Compression mandate signature blob
+- ~5KB per mandate, insignificante a 100 utenti
+- A 100K-1M mandate diventa 0.5-5GB
+- Valutare compression (zstd) in V1+
+
+### Embedding batch async per bulk import (V1+)
+- V0: embedding sincrono in-line
+- V1: se supportiamo bulk import di intent (CSV upload), batch async via background worker
+- Trigger: feature "import inserzioni esistenti da Vinted"
+
+---
+
+## Categoria: Testing & QA
+
+### Integration test orchestrator + step-up resume cycle
+- FASE 6 deliverable
+- End-to-end: orchestrator chiama tool con step-up trigger → step_up_request creato → utente firma → orchestrator riprende azione con signature
+- Coverage gap noto in FASE 2
+
+### WebAuthn assertion shape verification
+- Test con assertion contenente campi extra non documentati (`prf`, `largeBlobKey`, `clientExtensionResults`)
+- Costo: 5 minuti
+- Paga 2 ore di debug all'integrazione mobile
+- Da fare prima di FASE 11
+
+### Atomic rollback test post-flush
+- DQ-16: copertura solo via code review attualmente
+- Simulare fallimento durante db.commit() richiede infrastructure di test invasiva
+- Rivisitare se mai un bug reale lo richiede
+
+---
+
+## Categoria: Multi-agent V1
+
+### Multi-agent re-creation post-revoca
+- DQ-26: tier non degrada, agent va e viene
+- Flow: utente tier=2 con agent revoked → endpoint per creare nuovo agent + nuovo mandate
+- Niente ri-verifica Self richiesta
+- Trigger: prima feature post-V0 launch
+
+### Multi-agent specializzati per categoria
+- "Agente compra GPU max €500"
+- "Agente vende libri"
+- Schema già many-to-one supporta
+- UX nuova: dashboard multi-agent con filter per intent
+
+### Plan Pro €19/mese (V1)
+- Bundle che sblocca multi-agent + features
+- Notifiche Telegram/WhatsApp
+- Analytics dashboard
+- Priority matching
+- Step-up via WhatsApp
+
+---
+
+## Categoria: TRADE / Baratto (V1+)
+
+Vedi `BARTER_DESIGN.md` per dettaglio completo.
+
+### Schema trade-ready V0
+- `Intent.side` enum a 3 valori (buy/sell/trade)
+- V0 implementa solo buy/sell, trade rifiutato con NotImplementedError
+- Schema in posto per V1
+
+### TRADE bilaterale (V1, FASE 8)
+- TRADE↔TRADE, TRADE↔SELL/BUY mixed
+- Wishlist con priority
+- Subjective value theory
+- Pareto matching
+
+### Catene multi-hop di baratto (V2)
+- Graph cycle detection su embedding semantici
+- Storytelling: "il marketplace dove l'AI fa girare gli oggetti senza denaro"
+
+---
+
+## Categoria: Trustee Service (V1.5+)
+
+Vedi `TRADE_WINDOW_FLOW.md` per dettaglio completo.
+
+### Stripe Connect Express integration
+- Fase 9
+- Marketplace facilitator pattern, Stripe custode legale fondi
+- Fee piattaforma 5% del valore deal
+
+### 4 corrieri italiani certificati
+- Poste Italiane, BRT, GLS, InPost
+- Tracking API integration
+
+### Manual dispute resolution V1.5
+- Founder-led, 2-3% dei deal expected
+- Tempo medio target: 5 giorni lavorativi
+
+### AI-assisted dispute (V2)
+- Vision AI per controllo foto
+- Pattern detection cross-nullifier
+- Manual review solo per casi ambigui
+
+---
+
+## Categoria: Notification / Push
+
+### APNs / FCM reali (V1)
+- V0: console log + polling endpoint
+- V1: push notification native iOS+Android
+- Trigger: launch mobile app FASE 11
+
+### WebSocket per dashboard real-time
+- Step-up requests in real-time invece di polling
+- "Match trovato" notifications live
+- Trigger: post-PMF V0
+
+---
+
+## Categoria: Frontend
+
+### Web app Next.js V0 (FASE 10)
+- 8-10 schermate principali
+- Onboarding Tier 0 / 1 / 2
+- Dashboard intent
+- Marketplace browse
+- Negoziazioni in corso
+- Deal history
+
+### Mobile companion (FASE 11)
+- React Native iOS+Android
+- NFC Self integration
+- Step-up biometric
+- Deep link handoff da web
+
+### QR code handoff web → mobile (V0.5)
+- Per Tier 1 NFC: utente browse da web, scansiona QR, completa NFC su mobile
+- Auto-resume sessione web post-verifica
+
+---
+
+## Categoria: Compliance / Legal
+
+### SELF_VERIFIER_URL produzione
+- Confermare URL canonica con Self Labs
+- Setup account Self + scope identifier "marketplace-it-v0"
+- Riferimento: TODO 2.3 placeholder
+
+### Privacy policy + ToS custom (7.4)
+- Non template generici
+- Specifici per marketplace agent-mediato
+- Coperti AI Act, GDPR, eIDAS, Consumer Rights Directive
+
+### Cookie banner / consent management
+- Anche se ZK-by-design riduce PII, serve comunque per email marketing, analytics
+- Considerare Plausible o Fathom (privacy-friendly analytics) invece di GA4
+
+### Costituzione SRL italiana (7.4)
+- Per accesso benefit startup innovative (sgravi fiscali R&D, semplificazioni)
+- Domicilio operativo Italia
+
+---
+
+## Categoria: Marketing / GTM
+
+### Build in public X account
+- Post 3-4 volte/settimana sul tema "sto costruendo X"
+- Crea audience prima del lancio
+- Target: 500-2000 follower al lancio
+
+### Reddit r/Vinted, r/italyinformatica
+- Posts organici (non spam)
+- Pattern: "ho costruito X per risolvere Y, cerco beta tester"
+
+### TikTok / Reels
+- Demo "agente che negozia mentre dormi"
+- Format vincente per nicchia flipper
+
+### Hacker News al lancio
+- Post tecnico "ZK identity + AI agent commerce"
+- Target: front page → 5000 visite + 200 signup
+
+### Press italiana tech
+- Wired, Il Post, Repubblica Tech
+- Pitch: "primo marketplace agent-native EU"
+
+---
+
+## Categoria: Misc / Founder
+
+### Co-founder GTM/marketing
+- Da solo non scala su acquisition
+- Search target: ex-founder marketplace consumer EU, growth marketing track record
+- Trigger: post FASE 4-5, pre-launch alpha
+
+### MSI laptop come dev/staging server
+- Setup: Ubuntu 24.04 server, headless, Tailscale
+- Use case: CI runner self-hosted, Self verifier self-hosted (V1.5)
+- NOT production: produzione su Fly.io / Railway
+
+### Documenta DESIGN_QUESTIONS.md mensilmente
+- Review tutte le DQ deferred, vedere se ancora rilevanti
+- Promote a "decided" o droppare
+- Ogni 4-6 settimane
+
+---
+
+## Note per il founder
+
+Quando rivisiti questa lista (suggerito: ogni inizio fase, e dopo V0 launch):
+
+1. Promuovi item rilevanti a TODO del PROJECT_BRIEF
+2. Drop item ormai irrilevanti (markets cambiano)
+3. Aggiungi nuove idee accumulate
+4. Tieni il file ordinato per categoria
+
+**Non aggiungere niente di tutto questo al PROJECT_BRIEF senza decisione esplicita.** Il backlog è il backlog, il brief è il piano operativo.
