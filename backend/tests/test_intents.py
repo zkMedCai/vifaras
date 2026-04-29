@@ -70,12 +70,14 @@ from tests.factories import (
 def _force_fake_embedding(monkeypatch):
     """Every test in this module uses the deterministic SHA-256 backend.
 
-    Cache is cleared between tests so cache-hit assertions are clean.
+    Resets the EmbeddingService singleton so the backend env var is
+    re-read on the next `get_embedding_service()` call, and ensures cache
+    state doesn't leak between tests.
     """
     monkeypatch.setenv("EMBEDDING_BACKEND", "fake")
-    embedding_service._clear_cache_for_tests()
+    embedding_service._reset_singleton_for_tests()
     yield
-    embedding_service._clear_cache_for_tests()
+    embedding_service._reset_singleton_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -829,18 +831,22 @@ async def test_create_intent_uses_cache_for_identical_text(
     user_id = await _seed_tier_0_or_1_user(async_db_session, tier=0)
     _bearer(http_client, user_id, tier=0)
 
-    embedding_service._clear_cache_for_tests()
     body = _valid_create_body(title="Identical", description="Same text")
 
     r1 = await http_client.post("/api/intents", json=body)
     assert r1.status_code == 201
-    text = embedding_service.build_embedding_text(
-        title=body["title"], description=body["description"]
+    cache = embedding_service.get_embedding_service().cache
+    key = embedding_service._hash_text(
+        embedding_service.build_embedding_text(
+            title=body["title"], description=body["description"]
+        )
     )
-    assert text in embedding_service._cache
-    cache_size_after_first = len(embedding_service._cache)
+    assert key in cache
+    size_after_first = len(cache)
 
     r2 = await http_client.post("/api/intents", json=body)
     assert r2.status_code == 201
-    # Same text → no new cache entry.
-    assert len(embedding_service._cache) == cache_size_after_first
+    # Same text → no new cache entry; hit count grows.
+    assert len(cache) == size_after_first
+    stats = cache.stats()
+    assert stats["hits"] >= 1

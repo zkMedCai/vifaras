@@ -762,3 +762,66 @@ Tier=2 (con mandate) anche modifica prezzi. Trade è schema-ready. 119 test verd
 
 ### Prossima task
 **4.2 Embedding service**. Estende lo stub minimale di 4.1: retry con backoff su rate limit, batch processing (V1+ come bulk import), cache LRU formale. Brief minimale già nel BRIEF §6. Attendo via libera (e eventualmente brief denso analogo a 4.1 se vuoi).
+
+
+---
+
+## [4.2] embedding service hardening: retry, lru cache, batch ready (2026-04-29)
+
+### Cosa fatto
+- **`pyproject.toml`** — aggiunte dep `tenacity>=8.2` + `cachetools>=5.3`. Installate nel venv.
+- **`core/config.py`** — nuovi knobs: `embedding_backend`, `embedding_cache_size` (1000), `embedding_cache_ttl_seconds` (86400 = 24h), `embedding_max_retries` (3), `embedding_retry_min_wait_seconds` (2.0), `embedding_retry_max_wait_seconds` (10.0), `enable_dev_endpoints` (False).
+- **`services/embedding_service.py` rewritten** dalla forma 4.1 (1 funzione + dict cache) a:
+  - `EmbeddingBackend` Enum (`openai` / `fake`).
+  - `EmbeddingCache` wrapper su `cachetools.TTLCache`. LRU eviction a `max_size`, TTL hygiene. `__contains__`, `__len__`, `stats()` con hit/miss/hit_rate/size/max_size/ttl.
+  - `EmbeddingService` class che possiede backend + cache + retry policy + telemetry counter (openai_calls, openai_errors per-type, cost_estimate_usd accumulato).
+  - `generate(text)` cache-first con backend dispatch.
+  - `generate_batch(texts)` con cache partial-hit + 1 sola chiamata OpenAI per i missing (input array, order preserved).
+  - Tenacity `AsyncRetrying`: 3 attempts, exponential backoff 2s/4s/10s capped, retry SOLO su `(APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)`. 4xx (BadRequestError, AuthenticationError) fail immediato. Retry exausto → `EmbeddingServiceUnavailable`.
+  - `estimate_cost(text_length)` — $0.02/1M tokens × ~4 chars/token, per telemetry.
+  - **Singleton lazy** via `get_embedding_service()`. Backend resolved da `os.environ.get("EMBEDDING_BACKEND", settings.embedding_backend)` al primo call. Test seam: `_reset_singleton_for_tests()`.
+  - **Module-level shims preservati** (`generate_embedding`, `generate_embeddings_batch`, `build_embedding_text`, `_clear_cache_for_tests`, `_fake_embedding`, `EmbeddingServiceUnavailable`, `EMBEDDING_DIM`). 4.1 callers non hanno bisogno di churn.
+  - OpenAI client **lazy-construct** dentro `_get_openai_client()`. Tests con backend=fake non importano openai mai.
+- **`audit_service.py`** — vocabolario `IntentActions` / `MatchActions` / `NegotiationActions` / `DealActions` con codici lowercase verb-noun (`create_intent`, `accept_offer`, `create_deal`, ...). Aligned con `platform_limits.V0_DEFAULT_ALLOWED_ACTIONS` e con `mandate_verifier.record_usage` (che usa il tool action name come `AuditLog.action`). Una sola query `WHERE action='accept_offer'` cattura sia path agent-driven (FASE 5+) sia path user-driven (4.1 → 5.x).
+- **`intent_service.py`** — string literals "create_intent"/"update_intent"/"cancel_intent" sostituite con `audit_service.IntentActions.*`.
+- **`api/_dev_endpoints.py`** — `GET /api/_dev/embedding-stats`. Route registrato unconditionally, gated per-request da `settings.enable_dev_endpoints` (404 se off). Permette ai test di flippare il flag a runtime senza rebuild dell'app.
+- **`main.py`** — router `_dev_endpoints` registrato.
+- **`IDEAS_BACKLOG.md`** — entry "Step-up biometrico su PATCH price update (V0.5)" aggiunta sotto Sicurezza/Auth con threshold concreto: ">100 utenti attivi tier=2".
+- **`tests/test_intents.py`** — autouse fixture cambiata da `_clear_cache_for_tests()` a `_reset_singleton_for_tests()` (force re-resolve backend env). Test #25 aggiornato a usare la nuova cache API (`get_embedding_service().cache`, `_hash_text(text)` come key, `cache.stats()`).
+
+### Decisioni prese non esplicite nel brief
+- **Vocabolario action codes — verb-noun, NON event past-tense**. Il brief 4.2 proponeva UPPER_CASE event-style (`MATCH_CREATED`, `NEGOTIATION_STARTED`). Ho seguito la convenzione esistente di 4.1 e dello schema comment (`create_intent`, `send_offer`, ...) — match con `mandate_verifier` (logga il tool name) + con `platform_limits` (allowed_actions list). Una sola convenzione = una sola query per analytics. Decisione documentata nel docstring di audit_service.
+- **Action codes nidificati come classes con `Final[str]` constants** invece di Enum o flat constants. Pattern leggibile (`audit_service.IntentActions.CREATE`), tipizzato (mypy può fare drift detection), nessun import-cycle risk.
+- **Cache truthiness gotcha**: ho aggiunto `__len__` a `EmbeddingCache` (`len(cache)` dovuto). Questo rende empty cache falsy. `_make_service(cache=cache)` test helper inizialmente usava `cache or EmbeddingCache(...)` → empty cache veniva sostituita. Fixato a `cache if cache is not None else ...`. Documentato inline.
+- **OpenAI exception lazy-import**: `_retryable_openai_exceptions()` importa `openai` solo quando il retry decorator deve risolvere i tipi. Test con backend=fake non caricano openai mai. Stessa filosofia del 4.1 lazy `from openai import AsyncOpenAI`.
+- **Singleton telemetry resettable solo via `_reset_singleton_for_tests()`** — non ho aggiunto un reset_stats() pubblico. Il singleton vive per tutto il process; resettare i counter mid-vita confonderebbe le dashboard. Tests che hanno bisogno di stats puliti rebuildano il singleton.
+- **Retry waits in test = 0**: `retry_min_wait=0.0, retry_max_wait=0.0` nel test fixture. `wait_exponential(min=0, max=0)` genera attese 0. Test 9 (3 retry) finisce in <100ms.
+- **TTL test usa `asyncio.sleep(1.05)` con TTL=1**. Ho considerato injecting un timer custom (cachetools lo supporta) ma ho preferito sleep reale per keep test code minimal — 1.05s aggiunge poco al tempo totale della suite (8.5s).
+- **Endpoint dev gated per-request**, non al register-time, così tests possono flippare `settings.enable_dev_endpoints` a runtime via monkeypatch senza ricostruire l'app FastAPI.
+- **+1 test "smoke" oltre i 15 della spec** — `test_dev_embedding_stats_endpoint_gated`. Coverage del routing + del gate. Cheap (uses http_client già esistente), niente disparità tra "endpoint c'è e funziona" e "endpoint solo definito".
+
+### Test scritti / coverage
+- **16 nuovi test** in `tests/test_embedding.py`:
+  - 4 backend (deterministic, uncorrelated, unit-norm, openai mock 1536-dim)
+  - 4 cache (hit-avoids-call, miss-stores, LRU eviction, TTL expiration)
+  - 3 retry (5xx eventually succeeds, 4xx no-retry, retries exhausted)
+  - 3 batch (all inputs, partial cache hit, empty input)
+  - 1 cost (proportional to text length)
+  - 1 smoke (dev stats endpoint 404→200 gating)
+- **Suite totale**: `pytest` → **135 passed in ~9s** (94 pre-4.1 + 25 4.1 + 16 4.2). Nessuna regressione.
+- `_FakeOpenAIClient` test helper con queue di response/exception. Riusato da retry tests, batch tests, basic openai mock test.
+- OpenAI exception construction usa `httpx.Request`+`Response` mock per soddisfare i required args di `InternalServerError(message, response, body)` e `BadRequestError(message, response, body)`.
+
+### Blocker / dubbi
+- **Cost tracking accumulato per-singleton**: i contatori (`openai_calls`, `cost_estimate_usd`) si resettano solo se rebuiltdi il singleton. Per la dashboard di 7.3 (cost monitoring) serve persistere su DB con bucket (per-day, per-hour) — questa è work di 7.3, non 4.2. Per ora il singleton è una telemetry minima per dev-only diagnostic.
+- **`enable_dev_endpoints` default False** — producesse il pattern dove un setup di prod malconfigurato potrebbe accidentalmente esporlo. Mitigazione futura: `if app_env == "production" and enable_dev_endpoints: raise ConfigError` in main.py startup. Non urgente per V0 (deploy ancora locale + dev). Aggiunto a IDEAS_BACKLOG implicit (sotto Compliance/Security).
+- **`generate_batch` ha 1 caller in V0?** Nessuno. È preparazione per V1+ bulk import da CSV. I test la coprono per evitare regression. Decisione di brief.
+- **Cache hit rate atteso V0**: ~5-10% perché ogni intent è semanticamente unico (title + description user-generated). Il valore reale della cache è in test (deterministic) e in update flows che non cambiano title/description. A V1 con bulk import → hit rate ben più alto.
+- **Tenacity `AsyncRetrying` vs decorator-based retry**: ho scelto `AsyncRetrying` runtime API perché il retry config viene da settings (per-instance), non da costanti. Decorator-based richiederebbe wrapping più contorto.
+- **Non ho rimosso il vecchio test `test_create_intent_uses_cache_for_identical_text` poke su `_cache`** — l'ho aggiornato all'API nuova. Il test verifica ora la stessa proprietà ma via `cache.stats()` e `key in cache`. Più leggibile, meno coupled all'internal state.
+
+### Cosa significa "4.2 completa"
+Embedding service è production-ready: retry su OpenAI transient, cache LRU+TTL con telemetry, batch API zero-day per V1 bulk import, cost estimation, dev endpoint per diagnostic, vocabolario audit pre-emptive per FASE 4.3+ pronto. 135 test verdi. **Pronto per 4.3 (Match service)**: la dipendenza chiave (deterministic fake embedding + unit-norm cosine-friendly) è in posto e testata.
+
+### Prossima task
+**4.3 Match service** — il primo punto dove il marketplace prende vita. Userà `description_embedding` per cosine similarity tra intent BUY/SELL della stessa categoria con price overlap. Vector index HNSW va creato come migration separata pre-4.3 (vedi IDEAS_BACKLOG § Performance + DQ-3). Attendo via libera + brief denso analogo a 4.1/4.2.

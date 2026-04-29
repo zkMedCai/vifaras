@@ -512,7 +512,7 @@ async def create_intent(
     await audit_service.log_intent_event(
         db,
         user_id=user_id,
-        action="create_intent",
+        action=audit_service.IntentActions.CREATE,
         params={
             "intent_id": intent_id,
             "side": input.side,
@@ -710,7 +710,7 @@ async def update_intent(
     await audit_service.log_intent_event(
         db,
         user_id=user_id,
-        action="update_intent",
+        action=audit_service.IntentActions.UPDATE,
         params={"intent_id": intent_id, "fields": list(changed.keys())},
         result={"changed": changed},
         success=True,
@@ -792,7 +792,7 @@ async def cancel_intent(
     await audit_service.log_intent_event(
         db,
         user_id=user_id,
-        action="cancel_intent",
+        action=audit_service.IntentActions.CANCEL,
         params={"intent_id": intent_id},
         result={
             "negotiations_cancelled": neg_count,

@@ -1,4 +1,4 @@
-"""Audit service — structured-log + AuditLog table emitters (brief tasks 2.3, 4.1).
+"""Audit service — structured-log + AuditLog table emitters (brief tasks 2.3, 4.1, 4.2).
 
 Two complementary audit channels coexist in this codebase:
 
@@ -27,12 +27,66 @@ swallow + warn — the operation is already durable, the audit is secondary.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import log
 from app.models.schema import AuditLog
+
+
+# ---------------------------------------------------------------------------
+# Action codes vocabulary (4.2 pre-emptive)
+# ---------------------------------------------------------------------------
+#
+# Lowercase verb-noun, present-tense — matches the `AuditLog.action` schema
+# comment example ("create_intent, send_offer, accept, ...") and aligns with
+# the tool-action names in `platform_limits.V0_DEFAULT_ALLOWED_ACTIONS`. So
+# `WHERE action='accept_offer'` returns BOTH user-initiated and agent-
+# initiated occurrences of that action — one query, no UNION.
+#
+# Defined as nested namespaces so call sites read like
+# `audit_service.IntentActions.CREATE`. Adding a new code is a code change;
+# string-typed actions in callers are a drift vector we want to avoid.
+
+class IntentActions:
+    """Action codes for Intent CRUD (FASE 4.1)."""
+
+    CREATE: Final[str] = "create_intent"
+    UPDATE: Final[str] = "update_intent"
+    CANCEL: Final[str] = "cancel_intent"
+    EXPIRE: Final[str] = "expire_intent"  # scheduler-driven (FASE 6)
+
+
+class MatchActions:
+    """Action codes for Match lifecycle (FASE 4.3)."""
+
+    CREATE: Final[str] = "create_match"
+    EXPIRE: Final[str] = "expire_match"
+
+
+class NegotiationActions:
+    """Action codes for Negotiation lifecycle (FASE 5)."""
+
+    START: Final[str] = "start_negotiation"
+    SEND_OFFER: Final[str] = "send_offer"
+    SEND_COUNTER_OFFER: Final[str] = "send_counter_offer"
+    ACCEPT_OFFER: Final[str] = "accept_offer"
+    REJECT_OFFER: Final[str] = "reject_offer"
+    CAP: Final[str] = "cap_negotiation"
+    COMPLETE: Final[str] = "complete_negotiation"
+
+
+class DealActions:
+    """Action codes for Deal lifecycle (FASE 5)."""
+
+    CREATE: Final[str] = "create_deal"
+    BUYER_SIGN: Final[str] = "buyer_sign_deal"
+    SELLER_SIGN: Final[str] = "seller_sign_deal"
+    CONFIRM: Final[str] = "confirm_deal"
+    DISPUTE: Final[str] = "dispute_deal"
+    COMPLETE: Final[str] = "complete_deal"
+    CANCEL: Final[str] = "cancel_deal"
 
 
 async def log_tier_upgrade(

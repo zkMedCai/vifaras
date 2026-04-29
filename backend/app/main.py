@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.api import (
+    _dev_endpoints,
     _test_endpoints,
     auth as auth_routes,
     identity as identity_routes,
@@ -36,6 +37,7 @@ app.include_router(mandate_routes.router)
 app.include_router(step_up_routes.router)
 app.include_router(intent_routes.router)
 app.include_router(_test_endpoints.router)
+app.include_router(_dev_endpoints.router)
 
 
 @app.get("/health")

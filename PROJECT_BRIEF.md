@@ -259,7 +259,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - Utenti tier=0 ricevono notifiche di match potenziali ma NON possono avviare negoziazioni
 - V0 implementa solo `side='buy'` e `side='sell'`. `side='trade'` accetta lo schema ma rifiuta operativamente con `NotImplementedError` (esplicito, documenta che è feature V1+)
 
-#### 🔲 4.2 Embedding service
+#### ✅ 4.2 Embedding service
 - `services/embedding_service.py`
 - Wrapper su OpenAI `text-embedding-3-small` (1536 dim)
 - Cache LRU in-memory per stringhe già viste

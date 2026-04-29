@@ -41,6 +41,22 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"
 
+    # Embedding service knobs (4.2). Backend = "openai" | "fake"; tests
+    # flip to "fake" via env var so the suite stays hermetic. Cache size
+    # 1000 ≈ 6MB RAM at 1536-dim float32. TTL bounds memory leak in
+    # long-running processes — embeddings are stable for the same text,
+    # the TTL is a hygiene measure, not freshness.
+    embedding_backend: str = "openai"
+    embedding_cache_size: int = 1000
+    embedding_cache_ttl_seconds: int = 86_400  # 24h
+    # Per-call retry: 3 attempts with exponential backoff (2s, 4s, 8s).
+    embedding_max_retries: int = 3
+    embedding_retry_min_wait_seconds: float = 2.0
+    embedding_retry_max_wait_seconds: float = 10.0
+
+    # Dev-only endpoints (e.g. /api/_dev/embedding-stats). Off in prod.
+    enable_dev_endpoints: bool = False
+
     self_verifier_url: str = "https://api.self.xyz/v1/verify"
     self_verifier_scope: str = "marketplace-it-v0"
     self_verifier_timeout_seconds: float = 10.0

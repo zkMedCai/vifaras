@@ -59,6 +59,13 @@
 - Niente migration pesante
 - Riferimento: DQ-13
 
+### Step-up biometrico su PATCH price update (V0.5)
+- V0 (4.1): tier=2 da solo è sufficient gate per modifiche a `reservation_price_eur` / `ideal_price_eur`. Razionale: passkey già firmata recentemente con il mandate (max 30gg), `intent.status != active` blocca update durante negoziazione, niente settlement = niente impatto monetario diretto.
+- Attack surface noto: device sbloccato + JWT valido = attacker può modificare floor/cap senza biometria fresh.
+- Mitigazione naturale V0: mandate scade a 30gg, refresh richiede nuovo step-up.
+- **Trigger di promozione**: implementare il pattern draft+submit (analogo a mandate revocation) per il PATCH price update **quando >100 utenti attivi tier=2**.
+- Riferimento: DQ-29
+
 ---
 
 ## Categoria: Performance / Optimization
