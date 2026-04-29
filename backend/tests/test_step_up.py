@@ -21,7 +21,10 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from app.agents.tool_layer import ToolHandler
+# NOTE 6.3.a: the legacy sync `ToolHandler` was deprecated in favour of
+# `AsyncToolHandler` (DQ-28 resolved). The old integration test below
+# exercised the sync path; equivalent coverage now lives in
+# `tests/test_tool_layer.py::test_step_up_required_creates_step_up_request`.
 from app.core.security import create_access_token
 from app.models.schema import StepUpRequest
 from app.services import step_up_service
@@ -61,49 +64,11 @@ def _patch_webauthn_raise(monkeypatch, message: str) -> None:
 # ===========================================================================
 
 
-@pytest.mark.db
-def test_step_up_request_created_when_action_above_threshold(
-    db_session, monkeypatch
-) -> None:
-    """Tool layer integration: send_offer above €50 threshold creates a row.
-
-    Goes through the §5 sync `ToolHandler.execute` → MandateVerifier
-    (raises StepUpRequired) → `_queue_step_up` (creates the row).
-    """
-    user_id, agent_id, mandate_id = setup_active_mandate_sync(
-        db_session,
-        email="step_create@example.com",
-        step_up_rules=[{"action": "send_offer", "above_eur": 50}],
-    )
-
-    # Stub notification_service so we don't try to push without an SDK.
-    monkeypatch.setattr(
-        "app.services.notification_service.push_step_up_request",
-        lambda *args, **kwargs: None,
-    )
-
-    handler = ToolHandler(db_session, agent_id)
-    result = handler.execute(
-        "send_offer",
-        {"match_id": "fake-match-id", "price_cents": 10_000},  # €100 > €50
-    )
-
-    assert result["status"] == "step_up_required"
-    assert result["step_up_id"]
-    request = (
-        db_session.query(StepUpRequest)
-        .filter(StepUpRequest.id == result["step_up_id"])
-        .first()
-    )
-    assert request is not None
-    assert request.user_id == user_id
-    assert request.agent_id == agent_id
-    assert request.mandate_id == mandate_id
-    assert request.action == "send_offer"
-    assert request.action_params["price_cents"] == 10_000
-    assert request.status == "pending"
-    assert request.canonical_payload  # non-empty
-    assert len(request.challenge) == 32
+# 6.3.a: removed the legacy sync ToolHandler integration test. Coverage
+# of the equivalent flow ("MandateVerifier raises StepUpRequired →
+# tool layer persists a StepUpRequest row + fires STEP_UP_REQUIRED
+# notification") now lives in `tests/test_tool_layer.py` against
+# `AsyncToolHandler`. The sync `ToolHandler` is a dead stub.
 
 
 # ===========================================================================

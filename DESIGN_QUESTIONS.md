@@ -536,3 +536,47 @@ Test `test_tier_0_max_5_active_intents`, `test_tier_1_max_10_active_intents`, `t
 **Test.** `test_refresh_low_match_intents_targets_correct_intents` chiama direttamente la funzione `refresh_low_match_intents` (bypassa scheduler), verifica che intent under-matched vengano processati. Lo scheduler in sé è solo glue logic, non test specificamente.
 
 **Aggiunto a IDEAS_BACKLOG.md** sotto § Performance/Optimization come trigger di migration a Redis-backed scheduler.
+
+
+## DQ-28 — tool_layer modernization async (RESOLVED in 6.3.a)
+
+**Stato 2026-04-29 → RESOLVED.**
+
+Originale: il scaffold legacy `tool_layer.py` era sync (`Session.query`), `intent_service`/`match_service`/`negotiation_service`/`deal_service` erano async. Wirare i due richiedeva modernizzazione di tool_layer ad async (DQ-28). Per V0 4.x/5.x era stato rinviato a FASE 5/6, e i metodi `_create_intent` / `_send_offer` / etc. sollevavano `NotImplementedError`.
+
+**Risoluzione (brief task 6.3.a).** Riscritto `tool_layer.py` come `AsyncToolHandler`:
+- Classe async pura, prende `AsyncSession` + `verifier`.
+- 9 tool wired ai service async esistenti (intent/match/negotiation/deal/agent_state/inbox/user_question).
+- `ToolResult` standardized class con statuses `ok | error | step_up_required | limit_exceeded`.
+- Step-up flow: quando il verifier solleva `StepUpRequired`, il handler crea `StepUpRequest` row via `step_up_service.create_pending_request_async` (path nuovo) + emette `STEP_UP_REQUIRED` notification (chiude la nota wire-on-modernization di 6.1).
+- `verifier` parametro inietta dipendenza: production usa `MandateVerifier(sync_session)` con wrapper async via `asyncio.to_thread` (vedi DQ-34); test iniettano `FakeMandateVerifier` (no DB session sync).
+
+**Legacy sync stub `ToolHandler`** preserved for import compat ma solleva `NotImplementedError` se usata. Sarà rimosso nel 7.x cleanup.
+
+**Test 6.3.a**: 26 test in `tests/test_tool_layer.py` (3 dispatch + 9 tool implementations + 4 verifier integration + 3 sync→async bridge + 4 edge cases + 2 step-up resume + 1 schema smoke). Suite totale 311 passed.
+
+
+## DQ-34 — Hybrid sync MandateVerifier + async tool_layer (DECIDED, 7.x cleanup)
+
+**Contesto (6.3.a).** `mandate_verifier.py` è scaffold legacy con 100% coverage testata. La sua logica include 7 check sequence (scope, constraints, limits, step-up, ecc.) — ~140 LOC battle-tested. Per il modernized async `AsyncToolHandler`, abbiamo due opzioni:
+
+1. **Riscrittura completa async + select()** — perde la coverage 100% temporaneamente, codice nuovo, rischio nuovo bug introdotti.
+2. **Wrapper `asyncio.to_thread` sui metodi sync esistenti** — preserva scaffold battle-tested, costa ~10s di µs di context-switch per chiamata.
+
+**Decisione.** Opzione 2. Il `MandateVerifier` resta sync internamente (Session sync). Il `AsyncToolHandler` lo invoca via:
+
+```python
+async def authorize_async(self, agent_id, action, params):
+    return await asyncio.to_thread(self.authorize, agent_id, action, params)
+```
+
+Stessa cosa per `record_usage_async` e `log_failed_async`. Aggiunti come metodi sulla stessa classe in `mandate_verifier.py` (`+15 LOC`).
+
+**Implicazioni operative.**
+- Il verifier deve avere una propria sync `Session` distinta dalla `AsyncSession` del handler. In production: `SyncSessionLocal()` separata. Le scritture audit-log del verifier (`record_usage`) committano sulla connection sync; quelle business del handler committano su quella async. Stesso DB, due transazioni indipendenti — accettabile per V0.
+- I test bypassano lo split iniettando `FakeMandateVerifier`. La coverage 100% del verifier resta negli `tests/test_mandate_verifier.py` (sync `db_session` fixture).
+- 2 test extra (test 17/18 di `test_tool_layer.py`) verificano end-to-end che i wrapper async funzionino con il verifier reale.
+
+**Promotion criteria.** 7.x cleanup task: riscrivere `mandate_verifier.py` async + `select()` quando avremo tempo per maintenare la coverage 100% bench-tested. Trigger: quando arriverà il refactor `MarketplaceError` base class (che già toccherà tutti i service errors), unificarlo lì.
+
+**Costo del workaround.** ~10-50 µs per call (thread context-switch). A 100 agent × ogni 60s × 9 tool calls/tick = 900 calls/min = 15/sec. Trascurabile.

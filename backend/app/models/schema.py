@@ -472,6 +472,38 @@ class DealMessage(Base):
 # AUDIT LAYER
 # ============================================================================
 
+class UserQuestion(Base):
+    """Agent → user open question (brief task 6.3.a `ask_user` tool).
+
+    V0 stub: persisted + notified, but the answering UX (mobile app) lands
+    in FASE 11. The agent surfaces a free-text question with optional
+    structured context; the user answers later, and the agent picks up
+    the answer on the next tick via `read_inbox`.
+    """
+    __tablename__ = "user_questions"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+
+    question = Column(Text, nullable=False)
+    context = Column(JSONB, nullable=False, default=dict)
+
+    status = Column(String(20), nullable=False, default="pending")
+    # pending | answered | expired
+
+    answer = Column(Text, nullable=True)
+    answered_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_user_questions_agent_status", "agent_id", "status"),
+        Index("ix_user_questions_user_status", "user_id", "status"),
+    )
+
+
 class Notification(Base):
     """Per-user UX-layer notification (brief task 6.1).
 

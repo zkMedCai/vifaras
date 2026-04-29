@@ -309,8 +309,10 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - `services/agent_state_service.py.get_full_state(agent_id)`
 - `services/inbox_service.py`
 
-#### 🔲 6.3 Scheduler agent ticks
-- apscheduler in-process
+#### 🔄 6.3 Scheduler agent ticks (in corso, splittato)
+- ✅ 6.3.a tool_layer modernization (AsyncToolHandler, DQ-28 resolved)
+- 🔲 6.3.b orchestrator + Claude SDK integration (next)
+- 🔲 6.3.c apscheduler tick discovery + end-to-end
 - Rate limiting per cost explosion Claude API
 - Integration test orchestrator + step-up resume cycle (vedi IDEAS_BACKLOG)
 

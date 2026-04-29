@@ -59,6 +59,15 @@
 - Niente migration pesante
 - Riferimento: DQ-13
 
+### Privacy docs + LLM data egress (FASE 7.x)
+- 6.3 inserisce `get_full_state(agent_id)` come input al prompt Claude. Primo punto in cui dati cliente fluiscono out-of-platform a un provider LLM (Anthropic).
+- Da fare in 7.x pre-launch:
+  - (a) Inventario campi del state che vanno a Anthropic (mandate, intent, match, negotiations, deals, inbox).
+  - (b) Documentare retention Anthropic per API call payloads (verificare ToS attuali).
+  - (c) Update privacy policy con menzione esplicita LLM provider + processing legal basis.
+  - (d) Valutare field stripping pre-prompt: e.g. nullifier_hash truncation è già fatta (12-char in 6.2), description truncation a 300 char, ma ci sono altri campi che possiamo omettere (es. intent IDs interni → hash).
+- Riferimento: 6.2 + 6.3 brief chiusura FASE 6.
+
 ### STEP_UP_REQUIRED notification — wire al modernization (FASE 6.3)
 - 6.1 ha la notification path preparata in `step_up_service.create_pending_request_sync` ma il callsite (`tool_layer.ToolHandler._queue_step_up`) è scaffold sync, dead-code in V0.
 - Quando 6.3 modernizzerà `tool_layer` ad async (DQ-28), il path async di `create_pending_request` emetterà la notifica STEP_UP_REQUIRED automaticamente.

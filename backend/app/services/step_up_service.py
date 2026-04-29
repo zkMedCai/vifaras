@@ -243,6 +243,81 @@ def create_pending_request_sync(
     return step_up_id
 
 
+async def create_pending_request_async(
+    db: AsyncSession,
+    *,
+    agent_id: str,
+    mandate_id: str,
+    user_id: str,
+    nullifier_hash: str,
+    action: str,
+    action_params: dict[str, Any],
+    reason: str,
+) -> str:
+    """Async sibling of `create_pending_request_sync` (brief task 6.3.a).
+
+    Used by the modernized `AsyncToolHandler` in `tool_layer.py`. Same
+    behavior — random challenge bytes + canonical payload + persisted
+    `StepUpRequest` row — but on an `AsyncSession`. Also fires the
+    `STEP_UP_REQUIRED` notification post-commit (closes the V0 gap noted
+    in 6.1: the sync path was dead-code, the async path is the one that
+    actually runs in 6.3+).
+    """
+    import uuid
+
+    from app.services import notification_service
+
+    step_up_id = str(uuid.uuid4())
+    challenge = secrets.token_bytes(32)
+    issued_at = _utcnow_naive()
+    payload, canonical = _build_canonical_payload(
+        step_up_id=step_up_id,
+        user_id=user_id,
+        nullifier_hash=nullifier_hash,
+        agent_id=agent_id,
+        mandate_id=mandate_id,
+        action=action,
+        action_params=action_params,
+        issued_at=issued_at,
+        challenge_hex=challenge.hex(),
+    )
+    request = StepUpRequest(
+        id=step_up_id,
+        agent_id=agent_id,
+        mandate_id=mandate_id,
+        user_id=user_id,
+        action=action,
+        action_params=action_params,
+        reason=reason,
+        challenge=challenge,
+        canonical_payload=canonical,
+        status="pending",
+        expires_at=issued_at + timedelta(seconds=STEP_UP_TTL_SECONDS),
+        resolved_at=None,
+        signature=None,
+        created_at=issued_at,
+    )
+    db.add(request)
+    await db.commit()
+
+    # Fire-and-forget UX notification — closes the 6.1 wire-on-modernization
+    # note in IDEAS_BACKLOG.
+    await notification_service.create_notification(
+        db,
+        user_id=user_id,
+        notification_type=notification_service.NotificationType.STEP_UP_REQUIRED,
+        title="Conferma richiesta",
+        body=f"Il tuo agente ha bisogno di firmare: {action}",
+        payload={
+            "step_up_id": step_up_id,
+            "action": action,
+            "reason": reason,
+        },
+    )
+
+    return step_up_id
+
+
 # ---------------------------------------------------------------------------
 # Async API
 # ---------------------------------------------------------------------------

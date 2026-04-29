@@ -71,7 +71,7 @@ class StepUpRequired(Exception):
 class MandateVerifier:
     """
     Singolo punto di verifica per ogni azione agente.
-    
+
     Use:
         verifier = MandateVerifier(db)
         try:
@@ -84,8 +84,16 @@ class MandateVerifier:
         except StepUpRequired as step:
             # Push notification all'utente per conferma biometrica
             return queue_step_up(step)
+
+    Async wrappers (DQ-34, brief task 6.3.a): the modernized async tool
+    layer calls `authorize_async` / `record_usage_async` / `log_failed_async`.
+    These delegate to the sync methods via `asyncio.to_thread`, preserving
+    the 100%-coverage scaffold logic untouched. The verifier still owns a
+    sync `Session`; the caller in `tool_layer` runs that thread alongside
+    its async DB ops on a separate `AsyncSession`. Hybrid by design until
+    a 7.x cleanup unifies it.
     """
-    
+
     def __init__(self, db: Session):
         self.db = db
     
@@ -357,3 +365,55 @@ class MandateVerifier:
             if len(parts[-1]) == 2:
                 return parts[-1].upper()
         return None
+
+    # ------------------------------------------------------------------------
+    # Async wrappers (DQ-34, brief task 6.3.a)
+    # ------------------------------------------------------------------------
+    #
+    # The legacy sync methods above own a `sqlalchemy.orm.Session`. The
+    # modernized async tool_layer can't `await` them directly. We bridge
+    # via `asyncio.to_thread`, which runs the sync call on the default
+    # executor's thread pool. Side effects:
+    #   - per-call thread context-switch (~10s of µs); negligible for V0.
+    #   - the Session inside this verifier is bound to the calling thread
+    #     (SQLAlchemy default), so the same `MandateVerifier` instance
+    #     must not be shared across true concurrent threads. In practice
+    #     each agent tick constructs its own verifier — no sharing.
+    #
+    # When 7.x picks up DQ-34, the cleanup is to rewrite this whole class
+    # async + `select()`, then drop these wrappers.
+
+    async def authorize_async(
+        self, agent_id: str, action: str, params: dict
+    ) -> Mandate:
+        import asyncio
+
+        return await asyncio.to_thread(self.authorize, agent_id, action, params)
+
+    async def record_usage_async(
+        self,
+        mandate: Mandate,
+        action: str,
+        params: dict,
+        success: bool,
+        result: Optional[dict] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        import asyncio
+
+        await asyncio.to_thread(
+            self.record_usage,
+            mandate,
+            action,
+            params,
+            success,
+            result,
+            error_code,
+        )
+
+    async def log_failed_async(
+        self, agent_id: str, action: str, error: MandateError
+    ) -> None:
+        import asyncio
+
+        await asyncio.to_thread(self.log_failed, agent_id, action, error)

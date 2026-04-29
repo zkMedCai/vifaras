@@ -1259,3 +1259,74 @@ L'orchestrator (6.3) ora ha tutti i dati per fare un tick:
 
 ### Prossima task
 **6.3 Scheduler agent ticks**. Modernizza tool_layer (DQ-28). orchestrator.py async con Claude API + tool use. Scheduler ogni 60s su agent con `next_action_required`. Closes FASE 6. Attendo via libera + brief denso analogo.
+
+
+---
+
+## [6.3.a] modernize tool_layer async + wire services (2026-04-29)
+
+### Cosa fatto
+- **Migration `3e6079aa6977`** — `user_questions` table per il `ask_user` tool stub. Indexes su (agent_id, status) + (user_id, status). FK su agents + users.
+- **`schema.py`** — `UserQuestion` model. Q+A workflow with status pending|answered|expired, expiry default 24h.
+- **`services/user_question_service.py` (nuovo)** — V0 stub:
+  - `create_question` never-raises (best-effort post-tool-call) + emette AGENT_QUESTION notification.
+  - `list_pending_for_agent` / `list_pending_for_user` per future inbox surfacing.
+  - `answer_question` placeholder (V0.5 mobile UI farà write).
+- **`mandate_verifier.py` esteso** con async wrappers (DQ-34):
+  - `authorize_async` / `record_usage_async` / `log_failed_async` via `asyncio.to_thread`.
+  - Sync logic intoccata (preserva 100% coverage scaffold).
+  - +15 LOC totali.
+- **`step_up_service.create_pending_request_async` (nuovo)** — async sibling di `create_pending_request_sync`. Persiste StepUpRequest row + emette **STEP_UP_REQUIRED notification** (chiude la nota wire-on-modernization di 6.1).
+- **`tool_layer.py` riscritto da scaffold sync a `AsyncToolHandler` async**:
+  - 9 tool wired ai service async esistenti (intent, match, negotiation, deal, agent_state, inbox, user_question).
+  - `AGENT_TOOLS` MCP-compatible JSON schema preserved (con cleanup: drop step_up_signature param che era V0 wrong design).
+  - `ToolResult` standardized class con 4 statuses: `ok` / `error` / `step_up_required` / `limit_exceeded`.
+  - Dispatch via `_resolve_method` + verifier integration.
+  - `_queue_step_up` async per persistenza step-up + notification.
+  - User-id cache (1 DB hit per tick).
+  - `_truncate_for_audit` helper per audit JSONB result (cap 4 KB, preserva keys).
+  - Legacy sync `ToolHandler` stub preserved per import compat — solleva NotImplementedError se istanziato.
+- **`tests/test_step_up.py`** — rimosso il legacy test che usava il sync ToolHandler. Coverage equivalente in `test_tool_layer.py::test_step_up_required_creates_step_up_request`.
+- **DESIGN_QUESTIONS.md** — DQ-28 marcata RESOLVED. DQ-34 nuova: hybrid sync/async pattern per mandate_verifier (decisione + promotion criteria).
+- **IDEAS_BACKLOG** — entry "FASE 7.x — Documentazione privacy esplicita" (founder note su LLM data egress).
+
+### Decisioni prese non esplicite nel brief
+- **Step-up signature param rimosso dal Claude tool schema**. Il scaffold legacy aveva `step_up_signature: object` come optional in `send_offer`/`send_counter_offer`/`accept_offer`. Concept sbagliato: l'agent NON ha la signature del user — il flow è asincrono (verifier raises → server crea step_up_request → user firma via app → next tick l'agent vede approvato in inbox). Cleanup nel rewrite.
+- **9 tool, non 8**. Brief 6.3.a aveva inconsistenza (10-1=9, non 8). Lo scaffold non aveva mai `send_message`. Tools finali: create_intent, search_matches, send_offer, send_counter_offer, accept_offer, reject_offer, check_state, read_inbox, ask_user. Smoke test 26 lo verifica.
+- **`VerifierProtocol` Protocol invece di concrete type**. AsyncToolHandler accetta qualsiasi object con i 3 async methods. Test iniettano `FakeMandateVerifier` (no DB). Production iniettano `MandateVerifier` reale. Loose coupling da type level.
+- **`FakeMandateVerifier` test pattern**. Tests bypass-ano il sync DB session bound to async test transaction (impossibile con savepoint). Real verifier coverage resta in `test_mandate_verifier.py` (100%, sync `db_session`). 2 bridge tests (17/18 di test_tool_layer) verificano end-to-end che i wrapper async funzionino con verifier reale.
+- **`_send_counter_offer` resolves negotiation_id → match_id internally**. Il service `negotiation_service.start_or_continue` prende match_id (non negotiation_id). Il tool API (per Claude) prende negotiation_id (più intuitivo per l'agent). Il handler fa la lookup. Test 7 lo verifica.
+- **`_check_state` ritorna `state.model_dump(mode="json")`** — full Pydantic v2 dump. Volume ~5-10 KB per agent attivo. Truncato in audit via `_truncate_for_audit`.
+- **`_ask_user` accept context come str OR dict**. Tolerant: Claude a volte passa string quando schema asks for object. Wrap defensively (`{"text": str}`). Test 22 verifica.
+- **Audit truncation a 4 KB**. `record_usage_async` riceve il tool result data; per `check_state` il dump è grande. Truncate at 4 KB conserva keys + size_bytes per debugging, evita audit_log JSONB bloat. Per `ok` results, audit conserva il payload utile; per `check_state` il payload viene truncato (lo state full è in `state.snapshot_at` timestamp + cache).
+- **`ToolResult.to_dict` flat o nested**. Brief mostrava nested under "data". Implementato nested. Test 23 verifica shape: `{status, data: {...}, error?, error_code?}`.
+- **Legacy `ToolHandler` stub resta** per import back-compat. Removed in 7.x cleanup. NotImplementedError se istanziato — fast-fail su misuse.
+
+### Test scritti / coverage
+- **26 nuovi test** in `tests/test_tool_layer.py`:
+  - 3 dispatch (unknown tool, authorize-then-execute order, record_usage on success)
+  - 9 tool implementations (one each for create_intent, search_matches, send_offer, send_counter_offer, accept_offer, reject_offer, read_inbox, check_state, ask_user)
+  - 4 verifier integration (StepUpRequired creates row, step_up payload shape, LimitExceeded → limit_exceeded, ActionNotAllowed → error)
+  - 3 sync→async bridge (authorize_async wraps sync, record_usage_async wraps sync, independent handlers)
+  - 4 edge cases (audit truncation, unknown agent, ask_user string context, ToolResult.to_dict shape)
+  - 2 step-up resume (notification emitted, persistence across handler instances)
+  - 1 smoke (AGENT_TOOLS schema 9 tools)
+- **Suite totale**: `pytest` → **311 passed in ~14s** (94 + 25 + 16 + 31 + 28 + 18 + 32 + 20 + 22 + 25 + 1 — wait let me re-check)
+  - 94 (FASE 2) + 25 (4.1) + 16 (4.2) + 31 (4.3) + 28 (5.1) + 18 (5.2) + 32 (5.3) + 20 (6.1) + 22 (6.2) + 26 (6.3.a) - 1 (legacy step_up test removed) = **311**. Match.
+- 2 test bridge usano sia `db_session` (sync, separate fixture) sia `async_db_session`. Le 2 sessioni sono su separate connections allo stesso testcontainer. Sync → seed dati; verifier reads → vede committed sync data.
+
+### Blocker / dubbi
+- **`mandate_verifier` sync coverage non re-tested in 6.3.a**. La logica esistente (140 LOC, 100% coverage) non è toccata. I 2 wrapper async sono test 17-18. Risk negligibile.
+- **Sync session lifecycle in production** quando 6.3.b orchestrator userà real MandateVerifier: ogni tick costruirà un sync session via `SyncSessionLocal()`, da chiudere a fine tick. Pattern: context manager. Detail per 6.3.c integration.
+- **`_truncate_for_audit` lossy** — perde il payload dettagliato per check_state. Trade-off: audit log resta gestibile (4 KB cap), debugging via `state.snapshot_at` timestamp + agent_state_service real-time call. Per 7.x cost monitoring, OK.
+- **Legacy `ToolHandler` import compat** — preservato come stub raising. Rimuovere in 7.x cleanup quando saremo sicuri che no caller V0 importa la sync version.
+- **`ToolResult` non ha `mandate_id` field**. Per audit cross-correlation, il record_usage del verifier scrive `mandate_id` su AuditLog row separately. Bilancio: tool result restituito a Claude senza mandate context (sicurezza), audit row include mandate_id (analytics). Decisa di non esporre mandate info al prompt.
+- **Tools che richiedono tier=2 vs tier=1** — i 9 tool hanno requisiti diversi (accept_offer richiede agent.status='active', search_matches read-only OK per pending). Il MandateVerifier gestisce questo via `mandate.scope.allowed_actions`. tool_layer NON duplica il tier check — delega tutto al verifier. Test 14-16 verificano che mandate denial path funzioni.
+
+### Cosa significa "6.3.a completa"
+DQ-28 è formalmente **risolta**. Il scaffold legacy tool_layer è morto, sostituito da `AsyncToolHandler` async fully-wired. Il path step-up async ora fired (close 6.1 nota). Il pre-requisito per 6.3.b orchestrator è in place: una funzione `await handler.handle(tool_name, params) → ToolResult` che il loop orchestrator potrà chiamare per ogni tool_use block ricevuto da Claude.
+
+311 test verdi. 6.3 ancora aperta (6.3.b orchestrator, 6.3.c scheduler).
+
+### Prossima task
+**6.3.b — Orchestrator + Claude SDK integration**. Riscrivi `orchestrator.py` async. Loop: load state via `get_full_state` → costruisce system prompt + initial message → chiama `client.messages.create()` con AGENT_TOOLS → loop su tool_use blocks chiamando AsyncToolHandler → final response → update last_tick_at. Anthropic mock pattern già esistente per test (`anthropic_mock` fixture). Attendo via libera + brief denso analogo.
