@@ -152,6 +152,19 @@
 - Quando: 7.x cleanup, dopo che 5.2/5.3/6.x avranno popolato i callers (≥10 sites). Prima di V0 launch.
 - Diff piccolo (string rename); minimal risk.
 
+### Test coverage debt — service layer gaps (7.4 pre-launch)
+- 7.0 CI ha settato threshold 80% (real: 83.78%). Gap noti per ripagare prima dell'alpha launch:
+  - `services/mandate_revocation_service.py`: 48% — il revoke flow ha branches non coperti.
+  - `services/match_scheduler.py`: 39% — scheduler lifecycle helpers + tick functions.
+  - `services/kms_service.py`: 62% — error paths (KMSError variants).
+  - `services/auth_service.py`: 62% — register/login flow paths.
+  - `services/mandate_service.py`: 65% — submit_signed_mandate edge cases.
+  - `api/_dev_endpoints.py`: 56% — gated endpoints (incluso `/scheduler/status` di 6.3.c).
+  - `api/deals.py`: 71% — sub-endpoints (sign / cancel / message).
+  - `api/step_up.py`: 79% — completion paths.
+- Strategy: ri-tightenare CI threshold progressivamente (80 → 83 → 85 → 90) man mano che si chiudono i gap.
+- Trigger: 7.4 pre-launch, quando alpha utenti vengono on-boarded e ogni regression è critica.
+
 ### True concurrency stress test su negotiation + match service
 - V0 ha test "lock-check invariant" che verifica logica ma non vera DB-level concurrency (pytest async + savepoint rendono impossibile real contention).
 - Quando: V0.5 pre-launch, con setup pgbench / Locust dedicato.
