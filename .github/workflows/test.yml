@@ -12,6 +12,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # The codebase pins Postgres to localhost:5432 at import time
+    # (`settings = Settings()` in app/core/config.py is a module-level
+    # singleton, and `database_url_sync` is `cached_property`). Local
+    # dev satisfies that via docker-compose; CI satisfies it via this
+    # service container. The pgvector image is required for the
+    # `intent.description_embedding` Vector column.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: marketplace
+          POSTGRES_PASSWORD: marketplace_dev
+          POSTGRES_DB: marketplace
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
