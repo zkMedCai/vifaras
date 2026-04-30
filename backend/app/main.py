@@ -21,7 +21,7 @@ from app.api import (
 from app.core.config import settings
 from app.core.db import engine
 from app.core.logging import configure_logging, log
-from app.services import match_scheduler
+from app.services import agent_scheduler, match_scheduler
 
 
 @asynccontextmanager
@@ -29,9 +29,11 @@ async def lifespan(app: FastAPI):
     configure_logging()
     log.info("app.startup", env=settings.app_env, name=settings.app_name)
     match_scheduler.start_scheduler()
+    agent_scheduler.start_scheduler()
     try:
         yield
     finally:
+        agent_scheduler.shutdown_scheduler()
         match_scheduler.shutdown_scheduler()
         await engine.dispose()
         log.info("app.shutdown")

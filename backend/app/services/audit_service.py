@@ -103,6 +103,19 @@ class AgentActions:
     TICK_SKIPPED: Final[str] = "tick_skipped"
 
 
+class SchedulerActions:
+    """Action codes for the agent scheduler discovery cycle (FASE 6.3.c).
+
+    Per-tick events are already covered by `AgentActions`; these record
+    *meta* events about the scheduler itself — what it discovered, what
+    it skipped, when caps fired. Aggregated, not per-agent.
+    """
+
+    DISCOVERY_RUN: Final[str] = "scheduler_discovery_run"
+    DAILY_CAP_HIT: Final[str] = "scheduler_daily_cap_hit"
+    RATE_LIMIT_HIT: Final[str] = "scheduler_rate_limit_hit"
+
+
 async def log_tier_upgrade(
     *,
     user_id: str,

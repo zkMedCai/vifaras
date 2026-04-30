@@ -299,7 +299,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - Step-up signatures buyer + seller
 - Chat E2E pseudonimizzata
 
-### 🔄 FASE 6 — Agent runtime (in corso)
+### ✅ FASE 6 — Agent runtime
 
 #### ✅ 6.1 Notification service esteso
 - V0: console log + `/api/dev/notifications`
@@ -309,11 +309,10 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - `services/agent_state_service.py.get_full_state(agent_id)`
 - `services/inbox_service.py`
 
-#### 🔄 6.3 Scheduler agent ticks (in corso, splittato)
+#### ✅ 6.3 Scheduler agent ticks
 - ✅ 6.3.a tool_layer modernization (AsyncToolHandler, DQ-28 resolved)
 - ✅ 6.3.b orchestrator + Claude SDK integration
-- 🔲 6.3.c apscheduler tick discovery + end-to-end (next)
-- Rate limiting per cost explosion Claude API
+- ✅ 6.3.c apscheduler tick discovery + rate limiting + daily cost cap
 - Integration test orchestrator + step-up resume cycle (vedi IDEAS_BACKLOG)
 
 ### 🔲 FASE 7 — Hardening & ship

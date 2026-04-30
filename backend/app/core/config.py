@@ -80,6 +80,36 @@ class Settings(BaseSettings):
     # Path is relative to the repo root (cwd at uvicorn boot).
     kms_keys_dir: str = ".secrets/agent_keys"
 
+    # Agent scheduler (6.3.c): in-process apscheduler that ticks agents
+    # with pending work. Disabled by default in tests (lifespan-driven so
+    # `http_client` won't start it); enabled in production via env var.
+    enable_agent_scheduler: bool = False
+    # How often the discovery loop runs. 60s is the V0 baseline cadence.
+    agent_scheduler_interval_seconds: int = 60
+    # Hard cap on candidates returned per discovery cycle. Bounds work
+    # even if the rate limiter is misconfigured.
+    agent_scheduler_max_candidates: int = 50
+    # Concurrency throttle: at most N ticks running simultaneously.
+    # Bounded by both the AsyncAnthropic client's concurrency tolerance
+    # and the sync verifier's pool size.
+    agent_scheduler_max_concurrent: int = 5
+    # Sliding-window cap: at most N tick dispatches in any 60s window.
+    # Pairs with `_max_concurrent`: concurrent caps spike, per-minute
+    # caps sustained throughput.
+    agent_scheduler_max_per_minute: int = 30
+    # Per-agent cooldown: never tick the same agent more often than this.
+    # Belt-and-suspenders next to the rate limiter — applied at discovery
+    # so cooldown'd agents don't even reach the dispatcher.
+    agent_scheduler_cooldown_seconds: int = 30
+    # Stale-intent threshold: agents idle longer than this with active
+    # intents get a periodic refresh tick (low-priority signal).
+    agent_scheduler_stale_hours: int = 6
+    # Daily kill-switch: when today's `daily_cost_tracking.total_cost_usd`
+    # crosses this, the scheduler stops dispatching for the rest of the
+    # UTC day. V0 conservative default; bump in production once cost
+    # patterns stabilise.
+    max_daily_llm_cost_usd: float = 50.0
+
     @cached_property
     def database_url_async(self) -> str:
         return (

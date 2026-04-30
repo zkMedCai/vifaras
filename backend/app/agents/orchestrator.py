@@ -47,10 +47,12 @@ from anthropic import AsyncAnthropic
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session as SyncSession
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from app.agents.tool_layer import AGENT_TOOLS, AsyncToolHandler
 from app.core.db import AsyncSessionLocal, SyncSessionLocal
 from app.core.logging import log
-from app.models.schema import Agent
+from app.models.schema import Agent, DailyCostTracking
 from app.models.views import AgentFullState
 from app.services import audit_service
 from app.services.agent_state_service import AgentNotFound, get_full_state
@@ -488,6 +490,7 @@ You'll receive your full current state as the first user message. Plan first, th
             action=AgentActions.TICK_COMPLETED,
             params=self._build_summary(result),
         )
+        await _upsert_daily_cost(db, cost_usd=result.estimated_cost_usd)
         await db.commit()
 
     async def _record_tick_failure(
@@ -496,7 +499,12 @@ You'll receive your full current state as the first user message. Plan first, th
         state: AgentFullState,
         result: TickResult,
     ) -> None:
-        """Audit a tick that started but didn't finish. No cursor advance."""
+        """Audit a tick that started but didn't finish. No cursor advance.
+
+        Cost still accrues — even a failed tick burns input tokens up to
+        the failure point. We persist whatever we accumulated so the
+        daily cap reflects real spend, not just successful spend.
+        """
         await audit_service.log_agent_event(
             db,
             user_id=state.user_id,
@@ -507,6 +515,8 @@ You'll receive your full current state as the first user message. Plan first, th
             success=False,
             error_code=result.reason,
         )
+        if result.estimated_cost_usd > 0:
+            await _upsert_daily_cost(db, cost_usd=result.estimated_cost_usd)
         await db.commit()
 
     @staticmethod
@@ -520,3 +530,45 @@ You'll receive your full current state as the first user message. Plan first, th
             "tools": result.tool_calls,
             "prompt_version": PROMPT_VERSION,
         }
+
+
+# ---------------------------------------------------------------------------
+# Cost persistence (shared with the scheduler's daily-cap read)
+# ---------------------------------------------------------------------------
+
+
+async def _upsert_daily_cost(db: AsyncSession, *, cost_usd: float) -> None:
+    """Add `cost_usd` + 1 tick to today's `daily_cost_tracking` row.
+
+    Single-statement UPSERT — `INSERT ... ON CONFLICT (date) DO UPDATE`.
+    Atomic at the row level even under concurrent ticks. The agent
+    scheduler reads `total_cost_usd` for today before each discovery
+    cycle to decide whether to keep dispatching.
+
+    Best-effort: a failed write logs a warning and swallows. The audit
+    row already captured the cost in its params; the daily aggregate
+    drifting by a few cents is preferable to losing the tick outcome.
+    """
+    today = datetime.now(timezone.utc).date()
+    try:
+        stmt = pg_insert(DailyCostTracking).values(
+            date=today,
+            total_cost_usd=cost_usd,
+            tick_count=1,
+            updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["date"],
+            set_={
+                "total_cost_usd": DailyCostTracking.total_cost_usd + cost_usd,
+                "tick_count": DailyCostTracking.tick_count + 1,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        await db.execute(stmt)
+    except Exception as exc:
+        log.warning(
+            "orchestrator.daily_cost_upsert_failed",
+            error=type(exc).__name__,
+            message=str(exc),
+        )

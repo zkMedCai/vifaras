@@ -7,7 +7,7 @@ Identità = nullifier opaco da Self Protocol.
 from datetime import datetime, timedelta
 from enum import Enum
 from sqlalchemy import (
-    Column, String, Integer, Numeric, DateTime, Boolean,
+    Column, String, Integer, Numeric, Date, DateTime, Boolean,
     ForeignKey, Text, JSON, BigInteger, Index, UniqueConstraint, LargeBinary
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -575,3 +575,21 @@ class AuditLog(Base):
         Index("ix_audit_user_time", "user_id", "timestamp"),
         Index("ix_audit_agent_time", "agent_id", "timestamp"),
     )
+
+
+class DailyCostTracking(Base):
+    """One row per UTC date holding cumulative LLM spend (brief task 6.3.c).
+
+    UPSERTed by the orchestrator after each tick (`INSERT ... ON CONFLICT
+    (date) DO UPDATE`). Read by the agent scheduler before dispatching:
+    if today's `total_cost_usd >= settings.max_daily_llm_cost_usd`, the
+    discovery cycle skips and waits for next day.
+
+    Storage: 365 rows/year. Negligible.
+    """
+    __tablename__ = "daily_cost_tracking"
+
+    date = Column(Date, primary_key=True)
+    total_cost_usd = Column(Numeric(12, 6), nullable=False, default=0)
+    tick_count = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

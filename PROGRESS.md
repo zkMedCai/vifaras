@@ -1403,3 +1403,89 @@ L'agent è funzionalmente alive. Dato un agent con mandate attivo + intent attiv
 
 ### Prossima task
 **6.3.c — apscheduler tick discovery + end-to-end**. Job ogni 60s che query `agents WHERE next_action_required=True OR last_tick_at < (now - 5min)`, dispatch concorrente con cap, await `orchestrator.run_tick()`. Health endpoint per scheduler status. Closes FASE 6. Attendo via libera + brief denso.
+
+
+---
+
+## [6.3.c] agent scheduler + tick discovery + rate limiting (2026-04-30)
+
+### Cosa fatto
+- **Migration `a4c70b1aee1c`** — `daily_cost_tracking` table (`date PK`, `total_cost_usd NUMERIC(12,6)`, `tick_count`, `updated_at`). UPSERTed dall'orchestrator dopo ogni tick; letta dal scheduler per il daily cap. ~365 righe/anno, storage trascurabile.
+- **`schema.py`** — `DailyCostTracking` model. Import `Date` aggiunto agli import sqlalchemy.
+- **`backend/app/core/rate_limiter.py` (nuovo)** — `TickRateLimiter`:
+  - `asyncio.Semaphore(max_concurrent)` per cap concorrente.
+  - `deque` di timestamp per sliding window per-minute.
+  - `acquire() -> bool` con check minute-window prima del semaphore (no resource held su rejection).
+  - Properties `in_flight`, `minute_window_count` per observability.
+  - Constructor validation: `max_concurrent ≥ 1` e `max_per_minute ≥ 1`.
+- **`backend/app/services/agent_scheduler.py` (nuovo, ~440 LOC)**:
+  - `TickCandidate` dataclass: `agent_id, user_id, last_tick_at, priority_score, work_signals[]`.
+  - `discover_tick_candidates(db, *, max_candidates, cooldown_seconds, stale_hours)`: 1 base query (eligible: active + non-revoked mandate + past cooldown) + 3 signal queries unioned in Python.
+  - 3 signali V0: `deal_pending_signature` (peso 100), `negotiation_active` (peso 30), `stale_intent` (peso 10). Penalty `-20` se `last_tick_at < 5 min`. Score capped a 0 dal basso.
+  - `compute_priority_score` pure function — testabile senza DB.
+  - `get_today_cost_usd(db)`: read del row daily_cost_tracking di oggi, ritorna 0.0 se none.
+  - `_run_tick_safely(orch, agent_id, rl)`: try/except totale + log + finally rl.release(). Mai raise.
+  - `discover_and_dispatch_ticks(*, orchestrator, rate_limiter, spawn)`: main job. Daily cap check → discovery → for each candidate: rl.acquire (break su rejection) → `asyncio.create_task(_run_tick_safely)` (production) o `await spawn(coro)` (test). Returns telemetry dict `{discovered, dispatched, rate_limited, skipped_daily_cap, today_cost_usd}`.
+  - `start_scheduler()` / `shutdown_scheduler()` / `_reset_singletons_for_tests()` mirroring `match_scheduler` pattern.
+  - `_get_default_orchestrator()` / `_get_default_rate_limiter()` lazy singletons.
+- **`audit_service.py`** — `SchedulerActions` class: `DISCOVERY_RUN`, `DAILY_CAP_HIT`, `RATE_LIMIT_HIT` (V0 wired in PROGRESS only — full audit logging del scheduler in 7.2 observability).
+- **`orchestrator.py`** — `_upsert_daily_cost(db, *, cost_usd)` helper async. Postgres-specific `INSERT ... ON CONFLICT (date) DO UPDATE`. Wired in `_record_tick_outcome` (sempre) + `_record_tick_failure` (solo se `cost_usd > 0`, per coprire spend pre-claude_error).
+- **`core/config.py`** — 8 settings nuovi: `enable_agent_scheduler` (default False, on in prod via env), `agent_scheduler_interval_seconds=60`, `agent_scheduler_max_candidates=50`, `agent_scheduler_max_concurrent=5`, `agent_scheduler_max_per_minute=30`, `agent_scheduler_cooldown_seconds=30`, `agent_scheduler_stale_hours=6`, `max_daily_llm_cost_usd=50.0`.
+- **`main.py` lifespan** — `agent_scheduler.start_scheduler()` dopo match_scheduler; shutdown nell'order inverso.
+- **`api/_dev_endpoints.py`** — `GET /api/_dev/scheduler/status` gated. Ritorna: enabled, running, today_cost_usd, daily_cap_usd, daily_cap_reached, rate_limiter snapshot.
+
+### Decisioni prese non esplicite nel brief
+- **3 signal V0, non 6**. Brief proponeva 6 (`deal_pending`, `negotiation_final_round`, `negotiation_awaiting`, `step_up_approved`, `new_offer_received`, `stale_intent_no_match`). Ho ridotto a 3 perché:
+  - `negotiation_active` (broad) copre new_offer_received + negotiation_awaiting + final_round senza necessitare di ispezione del `state` JSONB (che sarebbe SQL-pesante).
+  - `step_up_approved` è gestito naturalmente da Sig A (negotiation diventa awaiting dopo step-up) o da inbox events nel prossimo tick — non necessita signal dedicato V0.
+  - Il cooldown 30s + rate limiter prevengono thrashing anche con signal larghi.
+- **Discovery: 4 query separate Python-side, non big SQL union**. Brief lasciava aperta. Decisione: 1 base + 3 signal queries, intersezioni in Python. Trade-off: 4 round-trip vs 1, ma per 50 candidati/min trascurabile (~ms). Vantaggio: ogni query è semplice, leggibile, unit-testable in isolamento.
+- **Linkage signal via `Intent.user_id`, non `Intent.agent_id`**. `Intent.agent_id` è nullable (intents creati a tier 0 non hanno agent). Tutti gli intents hanno user_id. Per il marketplace V0 con 1 agent per user, user_id è il join naturale. V1+ con multi-agent-per-user: il discovery dovrà fan-out su tutti gli agent del user.
+- **Sig B "deal_pending_signature" via Python iteration su Deal rows**. SQL-pulito sarebbe: `WHERE (buyer_user_id IN (...) AND buyer_signed_at IS NULL) OR (seller_user_id IN (...) AND seller_signed_at IS NULL)`. Ma poi serve sapere QUALE side. Più semplice: SELECT le 4 colonne, itera Python-side. ~50 deals/discovery → trascurabile.
+- **`spawn` parameter su `discover_and_dispatch_ticks`**. Brief mostrava `asyncio.create_task` hardcoded. Aggiunto seam per test: production passa None (default = create_task fire-and-forget); test passano `lambda c: await c` per dispatch deterministico. Pattern allinea ai 3 factory injection points dell'orchestrator (6.3.b).
+- **Daily cap check PRIMA della discovery query**. Risparmia 4 query inutili quando il cap è raggiunto. Microbeneficio ma corretto pattern (fail-fast).
+- **`_default_orchestrator` + `_default_rate_limiter` lazy globals**. Una sola istanza per processo, costruita al primo dispatch. Drop-on-shutdown in `shutdown_scheduler` per consentire `start_scheduler` riavvio pulito (test scenario).
+- **`recent_tick_penalty=20` constante non setting**. Un tuning futuro valuterà se renderlo configurabile. V0 lo lascio in code.
+- **`enable_agent_scheduler` default = False**. Diversamente da `enable_match_scheduler=True`. Motivazione: l'agent scheduler chiama Claude API → costi reali. Production deve esplicitamente abilitarlo via env var (`ENABLE_AGENT_SCHEDULER=true`). Test per default OFF (stessa convenzione).
+- **`shutdown_scheduler` tollera `SchedulerNotRunningError`**. Se per qualche motivo lo scheduler non era partito (env disabled, double-shutdown), shutdown logga warning + procede al cleanup singletons. Pattern: graceful in tutti i path.
+- **`SchedulerActions` definite ma non ancora wired**. V0 logga via structlog (`log.info("scheduler.discovery_complete")`). 7.2 observability le wirerà al `AuditLog` table per query post-mortem. Decisione: non over-engineer V0 audit volume.
+- **Test "shutdown_scheduler clears singletons"** — usa `AsyncIOScheduler()` non avviato per simulare lo state, esercitando il path tolleranza-error. Pattern: testa il post-state, non il side-effect (apscheduler shutdown è esercitato in prod, non in unit).
+- **No retry su tick failures dal scheduler**. Brief confermava. Failed ticks lasciano `last_tick_at` invariato (orchestrator), così la prossima discovery 60s dopo riconsiderà l'agent senza retry custom. Self-healing via re-discovery.
+- **No backpressure dispatch wait**. Quando rate_limiter è saturo, scheduler skip silenzioso (con log + telemetry). NON aspetta che si liberi. La prossima discovery 60s dopo riproverà gli stessi candidati. V1.5+ può aggiungere wait+queue se vediamo head-of-line blocking.
+- **Migrate uno-a-uno → table separata invece di estendere `audit_log`**. Per stessa motivazione del brief: aggregation sopra audit_log JSONB per cap-check è O(n) row scans, daily_cost_tracking è 1 row UPSERT + 1 row read. Trade-off: minor write per tick, dramatic read speedup.
+
+### Test scritti / coverage
+- **22 nuovi test** in `tests/test_scheduler.py`:
+  - **Discovery (6)**: surface negotiation, surface deal-unsigned, surface stale, exclude inactive, exclude revoked-mandate, respect cooldown.
+  - **Ranking (3)**: deal_pending highest, recent-tick penalty, candidates sorted desc.
+  - **Rate limiter (5)**: concurrent cap blocks excess, release frees slot, per-minute cap rejects without sem, minute window slides, invalid args raise ValueError.
+  - **Dispatch (4)**: orchestrator called per candidate, exception swallowed + sem released, rate limit stops further dispatch + reports remaining, daily cap short-circuits.
+  - **Cost (2)**: UPSERT increments existing row, get_today_cost zero when no row.
+  - **Integration (2)**: start_scheduler disabled returns None, shutdown_scheduler clears singletons.
+- **Suite totale**: `pytest` → **355 passed in ~15s** (333 + 22 = 355, match).
+- Pattern `patch_async_session` (monkeypatch `AsyncSessionLocal` a un factory bound al `_async_db_connection`) consente al `discover_and_dispatch_ticks` di vedere le righe seed-ate dai test.
+
+### Blocker / dubbi
+- **Discovery cost**: 4 query/min per scheduler tick. Anche con 100 agent attivi, query semplici su index → <100ms totali. Per V1.5+ con migliaia di agent, considerare: 1 query con CTEs, oppure cache di "next_action_required" precomputato by orchestrator stesso (già presente come field su `AgentFullState` ma non persistito).
+- **Stale signal precision**: `stale_intent` fires per qualsiasi agent con active intent + tick stale. Buyers senza match attivi ricevono comunque il tick (ROI bassissimo). V0 OK; 7.x può stringere a "stale + has_unmatched_intent".
+- **Rate limiter è in-process**. Multi-worker production (V1.5+) ha N rate limiters indipendenti → max throughput = N × max_per_minute. Per V0 single-worker corretto. Documenta in IDEAS_BACKLOG: "FASE 8: distributed rate limiter Redis-based per multi-worker".
+- **Daily cap reset**: implicit via `date PK` — domani `get_today_cost_usd` ritorna 0 (no row), il cap viene effettivamente resettato senza job dedicato. Edge case: se la prima tick di domani arriva DOPO mezzanotte UTC ma il scheduler tick è ad esempio 23:59:30 UTC, il check vede ancora oggi. Resolution naturale al tick successivo.
+- **`_run_tick_safely` non audit-logga il tick outcome al AuditLog**. L'audit del tick è già nell'orchestrator (TICK_COMPLETED/FAILED). Lo scheduler logga via structlog. Non duplicato.
+- **Test 17 (rate limit stops further dispatch)**: il numero esatto di candidates discovered dipende dalla discovery query. Il test verifica `dispatched=2, rate_limited >= 1` invece di una count specifica per essere robusto rispetto a quanti agent stale fire-ano nello stesso run.
+
+### Cosa significa "6.3.c completa" — FASE 6 chiusa
+**Il marketplace è funzionalmente vivo.** Lanciato uvicorn con `ENABLE_AGENT_SCHEDULER=true` + ANTHROPIC_API_KEY + DB Postgres + Self verifier creds:
+1. Utenti firmano mandate via passkey (FASE 2.4).
+2. Creano intent (FASE 4).
+3. Match service trova counterparts (FASE 4.3 + match_scheduler).
+4. **Agent scheduler (6.3.c) sveglia agent con pending work ogni 60s.**
+5. **Orchestrator (6.3.b) carica state, chiede a Claude cosa fare.**
+6. **Claude risponde con tool_use; orchestrator dispatcha via AsyncToolHandler (6.3.a).**
+7. Tool calls eseguono service async (4.x, 5.x) con verifier (DQ-34) e step-up (5.2).
+8. Deal raggiunti, signature richieste via passkey, completati (5.3).
+9. Cost cap impedisce blow-up; rate limiter previene thrashing.
+
+355 test verdi. **FASE 6 chiusa al 100%**. Resta solo FASE 7 (production polish).
+
+### Prossima task
+**FASE 7 — Hardening & ship**. Sub-tasks: 7.1 rate limiting & abuse, 7.2 observability, 7.3 cost monitoring, 7.4 pre-launch checklist. Niente nuove feature; pulizia per il lancio. Attendo brief denso per la prima sub-task quando sei pronto a far partire 7.x.
