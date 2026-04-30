@@ -1,0 +1,58 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: pytest + coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run tests
+        # Tests provision their own Postgres via testcontainers — Docker
+        # is available on ubuntu-latest by default. Schedulers off so
+        # background ticks don't fire during the unit run.
+        env:
+          ANTHROPIC_API_KEY: test-key-not-real
+          OPENAI_API_KEY: test-key-not-real
+          JWT_SECRET: test-secret-32-chars-minimum-aaaaaaa
+          EMBEDDING_BACKEND: fake
+          ENABLE_AGENT_SCHEDULER: "false"
+          ENABLE_MATCH_SCHEDULER: "false"
+          ENABLE_RATE_LIMITING: "false"
+        run: |
+          cd backend
+          uv run pytest -v --tb=short
+
+      # Coverage threshold is a separate step so a flaky test failure
+      # surfaces before the threshold gate, not after.
+      - name: Coverage threshold
+        env:
+          ANTHROPIC_API_KEY: test-key-not-real
+          OPENAI_API_KEY: test-key-not-real
+          JWT_SECRET: test-secret-32-chars-minimum-aaaaaaa
+          EMBEDDING_BACKEND: fake
+          ENABLE_AGENT_SCHEDULER: "false"
+          ENABLE_MATCH_SCHEDULER: "false"
+          ENABLE_RATE_LIMITING: "false"
+        run: |
+          cd backend
+          uv run pytest --cov=app --cov-report=term-missing --cov-fail-under=85

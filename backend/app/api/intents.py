@@ -4,11 +4,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import limiter
 from app.core.security import CurrentUser, require_tier
 from app.services import intent_service, negotiation_service
 
@@ -152,8 +154,20 @@ def _intent_to_list_item(intent) -> IntentListItem:
 # ---------------------------------------------------------------------------
 
 
-@router.post("", response_model=CreateIntentResponse, status_code=201)
+@router.post(
+    "",
+    response_model=CreateIntentResponse,
+    status_code=201,
+    summary="Create a new intent",
+    description=(
+        "Create a buy or sell intent. Tier 0+ allowed (intents can be "
+        "drafted before mandate signing). Returns the persisted intent "
+        "with its computed embedding."
+    ),
+)
+@limiter.limit(lambda: settings.rate_limit_post_strict)
 async def create_intent_endpoint(
+    request: Request,
     body: CreateIntentRequest,
     user: CurrentUser = Depends(require_tier(0)),
     db: AsyncSession = Depends(get_db),

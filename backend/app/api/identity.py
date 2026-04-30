@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import limiter
 from app.core.security import CurrentUser, create_access_token, require_tier
 from app.services import identity_service
 from app.services.kms_service import KMSError
@@ -67,8 +69,19 @@ def _next_step_for_tier(tier: int) -> NextStep:
     )
 
 
-@router.post("/verify-self", response_model=VerifySelfResponse)
+@router.post(
+    "/verify-self",
+    response_model=VerifySelfResponse,
+    summary="Verify Self ZK proof, upgrade tier 0 → tier 1",
+    description=(
+        "Idempotent: an already-tier-1 caller gets `already_upgraded=true` "
+        "instead of 409. Tightly rate-limited because each call hits the "
+        "external Self verifier."
+    ),
+)
+@limiter.limit(lambda: settings.rate_limit_self_verifier)
 async def verify_self(
+    request: Request,
     body: VerifySelfRequest,
     user: CurrentUser = Depends(require_tier(0)),
     db: AsyncSession = Depends(get_db),

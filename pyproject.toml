@@ -28,6 +28,7 @@ dependencies = [
   "jcs>=0.2",
   "tenacity>=8.2",
   "cachetools>=5.3",
+  "slowapi>=0.1.9",
 ]
 
 [project.optional-dependencies]

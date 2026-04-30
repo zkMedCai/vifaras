@@ -4,11 +4,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import limiter
 from app.core.security import CurrentUser, require_tier
 from app.services import mandate_revocation_service, mandate_service
 
@@ -71,8 +73,19 @@ def _to_http(exc: mandate_service.MandateError) -> HTTPException:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/draft", response_model=DraftResponse)
+@router.post(
+    "/draft",
+    response_model=DraftResponse,
+    summary="Create a pending mandate draft",
+    description=(
+        "Generates the canonical payload + WebAuthn challenge for the "
+        "caller to sign with their passkey. The draft expires shortly; "
+        "submit via `/submit` before then."
+    ),
+)
+@limiter.limit(lambda: settings.rate_limit_mandate_critical)
 async def draft_mandate(
+    request: Request,
     body: DraftRequest,
     user: CurrentUser = Depends(require_tier(1)),
     db: AsyncSession = Depends(get_db),
@@ -98,8 +111,19 @@ async def draft_mandate(
     )
 
 
-@router.post("/submit", response_model=SubmitResponse)
+@router.post(
+    "/submit",
+    response_model=SubmitResponse,
+    summary="Submit signed mandate, upgrade tier 1 → tier 2",
+    description=(
+        "Verifies the WebAuthn assertion against the draft challenge, "
+        "persists the signed mandate, and returns a fresh access token "
+        "reflecting the new tier."
+    ),
+)
+@limiter.limit(lambda: settings.rate_limit_mandate_critical)
 async def submit_mandate(
+    request: Request,
     body: SubmitRequest,
     user: CurrentUser = Depends(require_tier(1)),
     db: AsyncSession = Depends(get_db),

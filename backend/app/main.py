@@ -3,6 +3,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 
 from app.api import (
@@ -10,6 +13,7 @@ from app.api import (
     _test_endpoints,
     auth as auth_routes,
     deals as deal_routes,
+    health as health_routes,
     identity as identity_routes,
     intents as intent_routes,
     mandates as mandate_routes,
@@ -21,6 +25,7 @@ from app.api import (
 from app.core.config import settings
 from app.core.db import engine
 from app.core.logging import configure_logging, log
+from app.core.rate_limit import limiter, rate_limit_exceeded_handler
 from app.services import agent_scheduler, match_scheduler
 
 
@@ -39,7 +44,32 @@ async def lifespan(app: FastAPI):
         log.info("app.shutdown")
 
 
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    lifespan=lifespan,
+)
+
+# Rate limiting (7.0). The limiter must be registered on `app.state` so
+# slowapi's middleware + exception handler can find it; the middleware
+# enforces `default_limits` for every route, and per-route decorators
+# tighten or relax those limits as needed.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# CORS (7.0). Origins from env (`CORS_ALLOWED_ORIGINS=a.com,b.com`).
+# Credentials enabled so the frontend can send cookies / Authorization
+# headers; the production origin must be explicit (not wildcard) for
+# `allow_credentials=True` to be valid per the CORS spec.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 app.include_router(auth_routes.router)
 app.include_router(identity_routes.router)
 app.include_router(mandate_routes.router)
@@ -49,6 +79,7 @@ app.include_router(match_routes.router)
 app.include_router(negotiation_routes.router)
 app.include_router(deal_routes.router)
 app.include_router(notification_routes.router)
+app.include_router(health_routes.router)
 app.include_router(_test_endpoints.router)
 app.include_router(_dev_endpoints.router)
 

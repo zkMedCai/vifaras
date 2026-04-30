@@ -315,12 +315,13 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - ✅ 6.3.c apscheduler tick discovery + rate limiting + daily cost cap
 - Integration test orchestrator + step-up resume cycle (vedi IDEAS_BACKLOG)
 
-### 🔲 FASE 7 — Hardening & ship
+### 🔄 FASE 7 — Hardening & ship
 
-- 7.1 Rate limiting & abuse
-- 7.2 Observability
-- 7.3 Cost monitoring
-- 7.4 Pre-launch checklist (refresh token rotation, JWT secret rotation, email DB-level partial unique)
+- ✅ 7.0 Frontend-ready hardening (slowapi rate limiting, CORS, /api/health, CI, OpenAPI minimal)
+- 🔲 7.1 Rate limiting & abuse (Redis storage, X-Forwarded-For trust, per-user caps)
+- 🔲 7.2 Observability (Prometheus, OpenTelemetry tracing, structured audit on scheduler)
+- 🔲 7.3 Cost monitoring (per-agent / per-user dashboard, soft cap notifications)
+- 🔲 7.4 Pre-launch checklist (refresh token rotation, JWT secret rotation, email DB-level partial unique, KMS reale)
 
 ### 🔲 FASE 8 — TRADE bilaterale (V1)
 

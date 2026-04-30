@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     app_env: str = "dev"
     app_name: str = "marketplace"
+    app_version: str = "0.1.0"
     log_level: str = "INFO"
 
     host: str = "0.0.0.0"
@@ -109,6 +110,21 @@ class Settings(BaseSettings):
     # UTC day. V0 conservative default; bump in production once cost
     # patterns stabilise.
     max_daily_llm_cost_usd: float = 50.0
+
+    # CORS (7.0): comma-separated origin list (env var
+    # `CORS_ALLOWED_ORIGINS=https://a.com,https://b.com`). Pydantic v2
+    # parses lists from comma-separated strings out of the box.
+    cors_allowed_origins: list[str] = ["http://localhost:3000"]
+
+    # Rate limiting (7.0): slowapi-driven. Off in tests by default; on in
+    # production. Test cases that exercise the limiter flip the flag via
+    # monkeypatch.
+    enable_rate_limiting: bool = False
+    rate_limit_default: str = "100/minute"  # IP-keyed, applied to every route
+    rate_limit_post_strict: str = "30/minute"  # generic POST writes
+    rate_limit_mandate_critical: str = "10/minute"  # mandate / identity / step-up
+    rate_limit_self_verifier: str = "5/minute"  # external-call cost protection
+    rate_limit_health: str = "60/minute"  # public, polling-friendly
 
     @cached_property
     def database_url_async(self) -> str:
