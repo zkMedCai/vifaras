@@ -74,6 +74,13 @@
 - Niente da fare ora — solo memoria che il loop si chiude in 6.3.
 - Riferimento: DQ-28 + brief 6.1 §"STEP_UP_REQUIRED non emesso in V0".
 
+### Pattern @limiter.limit lambda lazy-resolve (preserve)
+- Tutti i `@limiter.limit()` decorator devono usare lambda (`@limiter.limit(lambda: settings.rate_limit_X)`), mai stringa diretta.
+- Motivazione: stringa è captured at decoration time → monkeypatch nei test non propaga + settings env override a runtime non funzionerebbe.
+- Lambda lazy-resolve risolve entrambi.
+- Caught in 7.0 mentre debuggavo i rate-limit test (404 invece di 429 perché slowapi catturava il default valore al import-time).
+- Riferimento: 7.0 PROGRESS decisioni.
+
 ### Step-up biometrico su PATCH price update (V0.5)
 - V0 (4.1): tier=2 da solo è sufficient gate per modifiche a `reservation_price_eur` / `ideal_price_eur`. Razionale: passkey già firmata recentemente con il mandate (max 30gg), `intent.status != active` blocca update durante negoziazione, niente settlement = niente impatto monetario diretto.
 - Attack surface noto: device sbloccato + JWT valido = attacker può modificare floor/cap senza biometria fresh.
@@ -258,6 +265,17 @@ Vedi `TRADE_WINDOW_FLOW.md` per dettaglio completo.
 ### QR code handoff web → mobile (V0.5)
 - Per Tier 1 NFC: utente browse da web, scansiona QR, completa NFC su mobile
 - Auto-resume sessione web post-verifica
+
+### OpenAPI deep documentation pass (FASE 7.4, pre-launch)
+- 7.0 ha fatto pass minimale: 4 critical POST endpoint hanno `summary` + `description`. Restano ~75 endpoint (matches, negotiations, deals, notifications, step_up, mandate revocation, dev, test) senza description completa.
+- Da fare in 7.4 pre-launch:
+  - (a) Pass su ogni endpoint per `summary` + `description` (markdown OK).
+  - (b) `responses={...}` con status codes documentati per ogni endpoint (404, 422, 409, 429).
+  - (c) Esempi nei Pydantic models via `model_config = ConfigDict(json_schema_extra={"example": ...})`.
+  - (d) Verificare che ogni endpoint abbia `response_model` esplicito (la maggior parte ce l'ha già).
+- **Trigger**: pre-launch alpha, quando `/openapi.json` verrà esposto a developer/partner esterni o quando il frontend richiede tipi più rigorosi per response examples.
+- Costo stimato: 3-4 giorni di lavoro per ~75 endpoint × ~5 fields. Zero feature value pre-frontend, alto value pre-public-launch.
+- Riferimento: 7.0 PROGRESS decisioni "OpenAPI pass minimale, non deep".
 
 ---
 
