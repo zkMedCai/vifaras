@@ -311,8 +311,8 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 
 #### 🔄 6.3 Scheduler agent ticks (in corso, splittato)
 - ✅ 6.3.a tool_layer modernization (AsyncToolHandler, DQ-28 resolved)
-- 🔲 6.3.b orchestrator + Claude SDK integration (next)
-- 🔲 6.3.c apscheduler tick discovery + end-to-end
+- ✅ 6.3.b orchestrator + Claude SDK integration
+- 🔲 6.3.c apscheduler tick discovery + end-to-end (next)
 - Rate limiting per cost explosion Claude API
 - Integration test orchestrator + step-up resume cycle (vedi IDEAS_BACKLOG)
 

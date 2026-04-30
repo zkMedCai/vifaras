@@ -95,6 +95,14 @@ class DealActions:
     SEND_MESSAGE: Final[str] = "send_message"
 
 
+class AgentActions:
+    """Action codes for orchestrator tick lifecycle (FASE 6.3)."""
+
+    TICK_COMPLETED: Final[str] = "tick_completed"
+    TICK_FAILED: Final[str] = "tick_failed"
+    TICK_SKIPPED: Final[str] = "tick_skipped"
+
+
 async def log_tier_upgrade(
     *,
     user_id: str,
@@ -213,3 +221,39 @@ async def log_intent_event(
             )
         except Exception:
             pass
+
+
+async def log_agent_event(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    agent_id: str,
+    action: str,
+    params: dict[str, Any],
+    result: dict[str, Any] | None = None,
+    success: bool = True,
+    error_code: str | None = None,
+    mandate_id: str | None = None,
+) -> None:
+    """Insert an `AuditLog` row for an orchestrator tick lifecycle event.
+
+    Thin wrapper over `log_intent_event` with `agent_id` required (every
+    tick has an agent). Used by the orchestrator (FASE 6.3) to record
+    `tick_completed` / `tick_failed` / `tick_skipped` rows. Per-tool-call
+    audit rows are still emitted by individual services through the
+    `MandateVerifier.record_usage` path — this function is for the
+    tick-meta event only, no double logging.
+
+    Never raises (delegates to `log_intent_event`).
+    """
+    await log_intent_event(
+        db,
+        user_id=user_id,
+        action=action,
+        params=params,
+        result=result,
+        success=success,
+        error_code=error_code,
+        agent_id=agent_id,
+        mandate_id=mandate_id,
+    )

@@ -231,9 +231,27 @@ async def authenticated_client(http_client):
 # ---------------------------------------------------------------------------
 
 
-def _make_message(content_blocks: list[Any], stop_reason: str) -> SimpleNamespace:
-    """Mimic anthropic.types.Message just enough for the orchestrator loop."""
-    return SimpleNamespace(content=content_blocks, stop_reason=stop_reason)
+def _make_message(
+    content_blocks: list[Any],
+    stop_reason: str,
+    *,
+    input_tokens: int = 1000,
+    output_tokens: int = 200,
+) -> SimpleNamespace:
+    """Mimic anthropic.types.Message just enough for the orchestrator loop.
+
+    Default usage values (1000 in, 200 out) keep cost-tracking tests
+    deterministic without forcing every test to pass them explicitly.
+    """
+    usage = SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    return SimpleNamespace(
+        content=content_blocks,
+        stop_reason=stop_reason,
+        usage=usage,
+    )
 
 
 def text_block(text: str) -> SimpleNamespace:
@@ -249,7 +267,11 @@ def tool_use_block(
 
 
 class FakeAnthropicClient:
-    """Drop-in for `anthropic.Anthropic` — pops responses from a queue.
+    """Drop-in for `anthropic.AsyncAnthropic` — pops responses from a queue.
+
+    Async since the 6.3.b orchestrator uses `AsyncAnthropic`. Each entry in
+    the queue is either a fake `Message` (returned) or an `Exception`
+    (raised) — the second form lets tests cover the `claude_error` branch.
 
     Construct via the `anthropic_mock` fixture factory:
 
@@ -262,24 +284,27 @@ class FakeAnthropicClient:
                 [anthropic_mock.text_block("Done.")], stop_reason="end_turn",
             ),
         ])
-        AgentOrchestrator(db, anthropic_client=client)
+        AgentOrchestrator(anthropic_client=client)
 
     Inspect `client.calls` to assert how the orchestrator drove the model.
     """
 
-    def __init__(self, responses: list[SimpleNamespace]) -> None:
+    def __init__(self, responses: list[Any]) -> None:
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
         self.messages = SimpleNamespace(create=self._create)
 
-    def _create(self, **kwargs: Any) -> SimpleNamespace:
+    async def _create(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
         if not self._responses:
             raise RuntimeError(
                 "FakeAnthropicClient ran out of canned responses; "
                 "the test is asking the model to do more than it scripted for."
             )
-        return self._responses.pop(0)
+        nxt = self._responses.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
 
 
 @pytest.fixture
@@ -287,7 +312,7 @@ def anthropic_mock() -> Callable[..., FakeAnthropicClient]:
     """Factory: `anthropic_mock([msg1, msg2, ...])` → FakeAnthropicClient."""
 
     def _make(
-        responses: list[SimpleNamespace] | None = None,
+        responses: list[Any] | None = None,
     ) -> FakeAnthropicClient:
         return FakeAnthropicClient(responses or [])
 

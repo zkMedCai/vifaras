@@ -1330,3 +1330,76 @@ DQ-28 è formalmente **risolta**. Il scaffold legacy tool_layer è morto, sostit
 
 ### Prossima task
 **6.3.b — Orchestrator + Claude SDK integration**. Riscrivi `orchestrator.py` async. Loop: load state via `get_full_state` → costruisce system prompt + initial message → chiama `client.messages.create()` con AGENT_TOOLS → loop su tool_use blocks chiamando AsyncToolHandler → final response → update last_tick_at. Anthropic mock pattern già esistente per test (`anthropic_mock` fixture). Attendo via libera + brief denso analogo.
+
+
+---
+
+## [6.3.b] orchestrator async + claude sdk integration (2026-04-30)
+
+### Cosa fatto
+- **`backend/app/agents/orchestrator.py` riscritto da scaffold sync a async** (~360 LOC, dal vecchio 216 sync):
+  - `AgentOrchestrator(anthropic_client, *, verifier_factory, async_session_factory, sync_session_factory)` — production usa default (`AsyncAnthropic`, real `MandateVerifier`, `AsyncSessionLocal`, `SyncSessionLocal`); test seam su tre dimensioni.
+  - `run_tick(agent_id) -> TickResult` — entry point. Lifecycle pre-tick → loop → post-tick atomico.
+  - `TickResult` dataclass con `success`, `reason`, `turns_used`, `tool_calls_count`, `estimated_cost_usd`, `final_response_text`, `error`, `tool_calls[]`. `reason` è la stringa actionable per il scheduler 6.3.c.
+  - Pre-tick gates: `AgentNotFound` → reason='agent_not_found'; `agent.status != 'active'` → 'early_return:not_active'; `mandate is None` → 'early_return:no_mandate'. Tutti audit-loggati come `tick_skipped`.
+  - Tool loop async: `await client.messages.create(...)` con `AGENT_TOOLS` → per ogni tool_use block, `await handler.handle(name, input)` → result.to_dict() serializzato JSON nel `tool_result` content del prossimo user turn.
+  - `MAX_TURNS_PER_TICK=10`, `MAX_TOKENS_PER_RESPONSE=4096`. Cap detection: `turns >= MAX and last_stop_reason not in {'end_turn','stop_sequence'}` → reason='max_turns_exceeded', success=False.
+  - Sync session lifecycle: `with self._sync_session_factory() as sync_db` apre/chiude la sync session **per tick** (non per app), garantito da context manager anche su exception. DQ-34 hybrid bridge in piena luce.
+  - Cost tracker: `(input/1M)*3 + (output/1M)*15` USD per Sonnet 4.5. Accumulato per turn, persistito in `last_tick_summary.cost_usd`.
+  - Post-tick: solo su success aggiorna `agents.last_tick_at` + `last_tick_summary` (la cursor advance dell'inbox); su fail audit-only (`tick_failed`), cursor invariato → next tick re-processa lo stesso inbox.
+  - System prompt ~80 righe in inglese: identità, 9 tool elencati, format `{status, data?, error?, error_code?}`, comportamento per i 4 status, strategia di negoziazione, "WHEN TO STOP". Personalizzato per agent (mandate_id, days_until_expiry, allowed_actions, limits, remaining). `PROMPT_VERSION="1.0"` salvato nel summary per correlare tuning futuri.
+  - Initial user message: `state.model_dump(mode='json')` dumpato in fenced code block, framing istruttivo.
+
+- **`backend/app/services/audit_service.py`**:
+  - `AgentActions` class: `TICK_COMPLETED` / `TICK_FAILED` / `TICK_SKIPPED`.
+  - `log_agent_event(db, *, user_id, agent_id, action, params, ...)` — thin wrapper over `log_intent_event` con agent_id required.
+
+- **`backend/tests/conftest.py`**:
+  - `FakeAnthropicClient._create` convertito a `async def` (orchestrator usa `AsyncAnthropic`).
+  - `_make_message` ora include `usage` block (default 1000 in / 200 out) per cost tracking deterministico.
+  - Queue accetta `Exception` instances → raise on pop (per test claude_error path).
+
+- **`backend/tests/test_orchestrator.py` (nuovo, 22 test)**.
+
+### Decisioni prese non esplicite nel brief
+- **Tre factory injection points (verifier, async_session, sync_session) invece di solo verifier_factory**. Brief proponeva injection sul verifier. Ma per test che condividono il `_async_db_connection` (per visibility writes test→orchestrator via savepoint), serve anche injectable async_session_factory. Sync_session_factory aggiunto per simmetria + per test lifecycle. Default in production: tutto None → comportamento brief originale.
+- **Sync session lifecycle: aperta DOPO i pre-tick gates**. Brief proponeva apertura subito. Decisione: aprire solo se entriamo nel tool loop. Skipped tick non consumano connections sync. Microbeneficio ma corretto.
+- **Cursor advance solo su success**. Pre-tick gates e claude_error → `last_tick_at` invariato. Motivazione: agent_state_service.docstring (linee 19-20) lo chiede esplicitamente — "a failed tick doesn't move the cursor and miss inbox events". Audit-only su fail garantisce traceability senza perdere eventi inbox.
+- **`TickResult.tool_calls` (compact log)**. Per ogni tool_use dispatched: `{tool, status}`. Sufficient per debugging post-tick + scheduler decisions, niente leak di params/data nel summary (che va in JSONB on-disk).
+- **`hit_cap` detection via `last_stop_reason`**. Più robusta di "ispeziona ultimo messaggio per tool_result". Track esplicito di `response.stop_reason` ad ogni turn. Se loop esce con turns=MAX e last_stop_reason era 'tool_use' → cap; altrimenti success.
+- **Defensive break su tool_use stop_reason senza tool_use blocks**. Se Claude restituisce stop_reason='tool_use' ma content non contiene tool_use blocks (degenerate state), break silenzioso (success=True). Don't infinite-loop on bug.
+- **`final_response_text` — latest non-empty text block** anche se intercalato a tool_use turns. La logica "join text di ogni turn, keep latest non-vuoto" preserva il summary finale di Claude anche quando lo emette in turno intermedio.
+- **`PROMPT_VERSION="1.0"` in summary**. Tuning futuro del prompt sarà confrontabile per agent. Bumpa quando il system_prompt cambia in modo non-additivo.
+- **`final_response` truncato a 500 char in summary**. Evita JSONB bloat. Full text non persistito (è in messages list ephemeral del tick).
+- **Cost based on list price (no cache discount)**. V0 stima conservativa. 7.3 cost monitoring potrà incorporare cache hit ratio.
+- **Niente retry su Claude API error**. Brief lo lasciava aperto. Decisione: scheduler 6.3.c re-fire al prossimo minuto. Nessun retry mirato in V0.
+- **Niente soft lock su `last_tick_at`** per idempotency. Brief lo flaggava come opzionale. Decisione: defer a 6.3.c (single-thread scheduler de-dup at job level). Aggiunto a IDEAS_BACKLOG.
+- **`_estimate_cost` static + tolerant**. `getattr(usage, 'input_tokens', 0) or 0` — sopravvive a usage None o senza fields.
+- **Test FakeVerifier locale, non importato da test_tool_layer**. Stessa shape ma copia indipendente per evitare cross-file coupling. ~30 LOC di duplicazione, accettabile.
+
+### Test scritti / coverage
+- **22 nuovi test** in `tests/test_orchestrator.py`:
+  - **Pre-tick gates (4)**: agent_not_found, inactive, no_mandate, revoked_mandate.
+  - **Happy path (4)**: text-only ends in 1 turn, single tool call in 2 turns, multi-tool in 1 turn, tool dispatch routes through handler.
+  - **Tool result handling (4)**: ok status, error+code, step_up_required+id, limit_exceeded.
+  - **Cap & safety (3)**: max turns breaks loop, claude_error no cursor advance, unknown_tool handled by handler.
+  - **Audit & state (3)**: last_tick_at updated, tick_completed AuditLog row, summary metrics.
+  - **Cost (2)**: accumulates across turns, computed from usage block.
+  - **Session lifecycle (2)**: sync session closed on exception, async session closed on exception.
+- **Suite totale**: `pytest` → **333 passed in ~14s** (311 + 22 = 333, match).
+- Coverage qualitativo: tutti e 4 gli statuses ToolResult forwardati correttamente; tutti e 4 i path exit (tick_completed, max_turns_exceeded, claude_error, agent_not_found + 2 early_return) coperti.
+
+### Blocker / dubbi
+- **`uv.lock` aveva drift pre-existing** (`cachetools` in pyproject.toml ma mancava dal lock). Sync incluso nel commit per repo consistency. Non è dipendenza di 6.3.b.
+- **Sync session connection pool dimensioning per V0**. Ogni tick = 1 sync connection. Con 50 agent attivi e tick di 60s, picco simultaneo limitato da pool size sync_engine. Default è 5+10. Per V0 OK; 7.x può sintonizzare.
+- **Real MandateVerifier sync session sotto async loop**. Quando V0 lancerà real (no factory injection), `MandateVerifier(sync_db)` usa SQLAlchemy `Session.query()` sync sotto async event loop. I 3 async wrapper (`authorize_async`, etc.) usano `asyncio.to_thread` (DQ-34) → niente blocking. Verificato in 6.3.a tests 17-18.
+- **`final_response_text` parsing**: assume tutti i text block siano text concatenable. Se Claude emette structured output (non `type=text`), non viene catturato. V0 OK; 7.x può estendere.
+- **Token budget difensivo**: 4096 max output tokens per turn × 10 turn = 40 KB output max per tick. + ~3-4 KB system prompt + ~5-15 KB initial state dump + tool_results progressivi. Worst-case input ~80 KB cumulative (re-sent ogni turn). Cost worst-case: ~$0.30 per tick. Per 50 agent × 24h × 1 tick/min = ~720 USD/giorno se TUTTI a worst-case. Realistico: 1-3 turn medi → ~$50/giorno worst-case totale. 7.3 cost monitoring deve dashboardare.
+
+### Cosa significa "6.3.b completa"
+L'agent è funzionalmente alive. Dato un agent con mandate attivo + intent attivo + Claude API key, `await orchestrator.run_tick(agent_id)` esegue: load state → Claude legge state → Claude decide tool → executor dispatcha → audit log → summary persistito. Il pezzo che manca (6.3.c) è solo il **trigger**: chi dice "tick this agent now". 
+
+333 test verdi. 6.3 ancora aperta (6.3.c scheduler).
+
+### Prossima task
+**6.3.c — apscheduler tick discovery + end-to-end**. Job ogni 60s che query `agents WHERE next_action_required=True OR last_tick_at < (now - 5min)`, dispatch concorrente con cap, await `orchestrator.run_tick()`. Health endpoint per scheduler status. Closes FASE 6. Attendo via libera + brief denso.
