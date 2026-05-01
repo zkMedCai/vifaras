@@ -1556,3 +1556,49 @@ L'agent è funzionalmente alive. Dato un agent con mandate attivo + intent attiv
 
 ### Prossima task
 **Frontend setup + landing** (Next.js 14 + TypeScript + Tailwind + shadcn/ui + openapi-typescript client). Fuori dal scope del backend repo — separato in repo frontend. Il backend resta in pausa fino a quando frontend richiede modifiche o si parte con 7.1+. Attendo brief denso quando vuoi partire con la prima task frontend o tornare su 7.x.
+
+
+---
+
+## [7.0.1] WebAuthn origin hotfix (2026-05-01)
+
+### Cosa fatto
+- **`backend/app/core/config.py:37`** — default `webauthn_origin: "http://localhost:8000"` → `"http://localhost:3000"`. Allinea WebAuthn `expected_origin` all'URL del frontend (dove gira `navigator.credentials.create()`), come richiesto dalla spec WebAuthn (anti-phishing fundamental, browser invia origin in `clientDataJSON`).
+- **`.env.example:35`** — `WEBAUTHN_ORIGIN=http://localhost:3000`. Allineamento documentazione per setup fresh.
+- **`.env:35`** (gitignored, non in commit) — stesso fix. **Questo è ciò che fixa il bug e2e runtime in dev**: uvicorn legge `.env` al boot via Pydantic Settings.
+- **`IDEAS_BACKLOG.md`** — entry "WebAuthn config pre-launch (7.4)" sotto Sicurezza/Auth, con env var per dominio prod (`WEBAUTHN_ORIGIN=https://app.vifaras.com`, `WEBAUTHN_RP_ID=app.vifaras.com`, `WEBAUTHN_RP_NAME=Vifaras`), nota su rp.id exact match (no wildcard / subdomain), e gancio a rebrand commit per `RP_NAME`.
+- **`PROJECT_BRIEF.md:321`** — checkbox `✅ 7.0.1 WebAuthn webauthn_origin default localhost:8000 → :3000 (hotfix da integrazione frontend e2e)` sotto FASE 7.
+
+### Decisioni prese non esplicite nel brief
+- **Niente nuove env var `AUTH_EXPECTED_ORIGIN` / `AUTH_EXPECTED_RP_ID`** come proponeva il brief originale. Discovery ha rivelato che `WEBAUTHN_ORIGIN` / `WEBAUTHN_RP_ID` esistevano già parametrizzati. Pattern: niente rename gratuiti, naming esistente (`WEBAUTHN_*`) è descrittivo + coerente con altre env var dello stesso gruppo. Il brief assumeva hardcode, la realtà del codebase batte il brief.
+- **Tutti i 6 call site `verify_*_response()` già usano settings**, niente da toccare in services:
+  - `auth_service.py:203` (register complete) + `:299` (login complete)
+  - `mandate_service.py:518` (mandate sign)
+  - `deal_service.py:488` (deal sign)
+  - `step_up_service.py:388` (step-up auth)
+  - `mandate_revocation_service.py:344` (mandate revoke)
+- **Anche i `begin` endpoint sono parametrizzati** — `auth_service.py:163, 256` (`generate_registration_options` / `generate_authentication_options`) usano `settings.webauthn_rp_id` / `settings.webauthn_rp_name`. Niente hardcode da pulire.
+- **`webauthn_rp_id` lasciato a `"localhost"`** — già corretto per dev (rp.id deve essere il dominio, non l'origin completo). Production override via env in 7.4.
+- **`webauthn_rp_name` lasciato a `"Marketplace V0"`** — non rinominato a "Vifaras". Coerente con memory `project_product_name_vifaras.md` (codebase identifiers stay `marketplace` until deliberate rebrand commit). Backlog 7.4 cattura il rename.
+- **`.env` non in commit** — gitignored (`.gitignore:21`). Verificato con `git check-ignore -v .env`. Pattern healthy: `.env.example` tracked + `.env` untracked. Il fix runtime locale vive solo sulla mia macchina; il fix "ambiente fresh" vive nel default di `config.py` + `.env.example`.
+- **Coerenza già parziale pre-fix**: `cors_allowed_origins` (config.py:117) puntava già a `localhost:3000`. Il bug era isolato a `webauthn_origin`.
+
+### Test scritti / coverage
+- **Nessun test nuovo**. La suite esistente esercita già i flow WebAuthn estensivamente (test_auth.py, test_identity.py, test_mandates.py, test_deal.py, test_step_up.py, test_revocation.py, test_notification.py).
+- **`pytest -x` → 370 passed in 16.35s**, invariati da `fce0a04`. I test fanno monkeypatch di `verify_registration_response` / `verify_authentication_response` con tutti i parametri controllati dal test, quindi `settings.webauthn_origin` non viene letto durante il verify nei test. Default change in `config.py` zero-impact sulla suite.
+
+### Blocker / dubbi
+- **Bug originale**: `POST /api/auth/register/complete` ritornava 401 con `{"code":"invalid_credential","message":"Unexpected client data origin \"http://localhost:3000\", expected \"http://localhost:8000\""}` durante test e2e in browser. Il browser inviava (correttamente) l'origin del frontend `:3000`, il backend si aspettava `:8000` (suo proprio URL).
+- **Per spec WebAuthn**, `expected_origin` deve essere l'URL della pagina che ha invocato `navigator.credentials.create()` o `.get()`. Browser inietta automaticamente in `clientDataJSON`. Anti-phishing fundamental, non falsificabile.
+- **Il fix runtime e2e è in `.env`** (non tracked). Se elimino il dev environment / clono fresh / nuovo team mate, il default in `config.py` + `.env.example` allineati garantiscono setup pulito.
+- **Restart uvicorn richiesto** per pickup `.env` change — Pydantic Settings legge file al boot, non hot-reload. Se uvicorn gira con `--reload` flag, modifica a `config.py` triggera reload che re-instanzia Settings; modifica solo a `.env` no.
+- **Production deploy (7.4)** dovrà settare `WEBAUTHN_ORIGIN=https://app.vifaras.com` + `WEBAUTHN_RP_ID=app.vifaras.com` come env (non `.env` file). Backlog cattura.
+- **Pattern di disciplina cross-repo**: hotfix emerso da integrazione frontend (repo separato) ha portato fuori dal flow standard backend. Memo per il futuro: dopo hotfix cross-repo, quick check `git log --oneline -1` + `tail -20 PROGRESS.md` prima di chiudere sessione per verificare allineamento workflow `task → test → commit → checkbox → PROGRESS.md`. Questo log entry è side-effect di quel check (mancava al primo commit `4fbb995`, aggiunto qui in `[chore]` separato).
+
+### Cosa significa "7.0.1 completa"
+**WebAuthn signup/login e2e sblocca**. Il browser invia origin `http://localhost:3000`, il backend lo accetta. `register/complete` (e `login/complete` quando 10.0.6 sarà testato) può completare verifica. Frontend Vifaras può procedere a testare flow signup → "Hello {email}" su dashboard.
+
+370 test verdi (invariati). **FASE 7.0.1 chiusa**. Backend torna in pausa fino a frontend richieste o brief 7.1.
+
+### Prossima task
+**Ritest frontend signup e2e** (terminal frontend). Se passa: backend pausa fino a 7.1+. Se emerge altro bug backend cross-repo, nuovo hotfix `[7.0.x]`. Brief denso 7.1 (Rate limiting Redis-backed + X-Forwarded-For trust + per-user caps) attende via libera dal founder quando frontend è stabile.
