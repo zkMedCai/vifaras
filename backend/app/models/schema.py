@@ -549,12 +549,20 @@ class AuditLog(Base):
     Log immutabile di ogni azione agente.
     Naturalmente pseudonimo (user_id punta a nullifier).
     AI Act compliant by design.
+
+    7.1.5 — `user_id` relaxed to nullable so pre-auth security events
+    (rate limit hit on auth endpoints, sequential register-attempt
+    burst from one IP) can be recorded without a sentinel UUID hack.
+    `actor_ip` added as a first-class column so analytics (`who/what/
+    when/where`) doesn't require parsing JSONB. Existing rows keep
+    `user_id NOT NULL`-shape data — the relaxed constraint only
+    accepts new NULL writes.
     """
     __tablename__ = "audit_log"
-    
+
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    
-    user_id = Column(UUID(as_uuid=False), nullable=False)  # no FK per immutabilità
+
+    user_id = Column(UUID(as_uuid=False), nullable=True)  # no FK per immutabilità; nullable post-7.1.5 for anonymous events
     # agent_id / mandate_id nullable: marketplace actions at tier 0 (intent CRUD
     # before mandate exists) write audit rows with NULL agent + NULL mandate.
     # Identity-lifecycle events (tier upgrade, mandate signed) still go via
@@ -562,18 +570,26 @@ class AuditLog(Base):
     # with relaxed FKs. See migration 8df1d6891fd9.
     agent_id = Column(UUID(as_uuid=False), nullable=True)
     mandate_id = Column(UUID(as_uuid=False), nullable=True)
-    
+
     action = Column(String(50), nullable=False)  # create_intent, send_offer, accept, ...
     params = Column(JSONB)
     result = Column(JSONB)
     success = Column(Boolean, nullable=False)
     error_code = Column(String(50), nullable=True)
-    
+
+    # 7.1.5 — IPv6-max length (45 = "ffff:ffff:..." with embedded IPv4
+    # tail or a `%zone` suffix). Set on every security/abuse event;
+    # legacy intent/agent rows leave it NULL.
+    actor_ip = Column(String(45), nullable=True)
+
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    
+
     __table_args__ = (
         Index("ix_audit_user_time", "user_id", "timestamp"),
         Index("ix_audit_agent_time", "agent_id", "timestamp"),
+        # 7.1.5 — supports the sequential-email detection query
+        # (`WHERE action='register_complete' AND timestamp > now-24h`).
+        Index("ix_audit_action_time", "action", "timestamp"),
     )
 
 

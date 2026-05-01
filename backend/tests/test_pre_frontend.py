@@ -39,19 +39,7 @@ from app.models.schema import Agent
 from tests.factories import setup_active_mandate_async
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def enable_limiter(monkeypatch):
-    """Flip slowapi on for the duration of one test, then reset state."""
-    monkeypatch.setattr(limiter, "enabled", True)
-    limiter.reset()
-    yield
-    limiter.reset()
-    monkeypatch.setattr(limiter, "enabled", False)
+# `enable_limiter` lives in conftest.py (shared with `test_rate_limit_deep`).
 
 
 # ---------------------------------------------------------------------------

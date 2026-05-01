@@ -884,23 +884,30 @@ async def test_negative_price_cents_raises(async_db_session) -> None:
 
 
 # ===========================================================================
-# 24. message > 500 chars truncated silently
+# 24. message > 500 chars rejected by moderation (was: truncated silently)
 # ===========================================================================
 
 
 @pytest.mark.db
-async def test_long_message_truncated(async_db_session) -> None:
+async def test_long_message_rejected_by_moderation(async_db_session) -> None:
+    """Brief 7.1.4 swapped the V0 policy from silent truncation to hard
+    rejection — `_truncate_message` is now defensive backstop only, the
+    authoritative cap is enforced by `moderate_optional`."""
+    from app.services.content_moderation import TooLong
+
     s = await _seed_setup(async_db_session)
     long_msg = "X" * 700
-    result = await negotiation_service.start_or_continue(
-        async_db_session,
-        user_id=s.seller_user_id,
-        agent_id=s.seller_agent_id,
-        match_id=s.match_id,
-        price_cents=120000,
-        message=long_msg,
-    )
-    assert len(result.last_turn["message"]) == negotiation_service.MAX_MESSAGE_LENGTH
+    with pytest.raises(TooLong) as exc:
+        await negotiation_service.start_or_continue(
+            async_db_session,
+            user_id=s.seller_user_id,
+            agent_id=s.seller_agent_id,
+            match_id=s.match_id,
+            price_cents=120000,
+            message=long_msg,
+        )
+    assert exc.value.field == "message"
+    assert exc.value.code == "too_long"
 
 
 # ===========================================================================

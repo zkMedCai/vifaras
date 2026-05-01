@@ -116,6 +116,34 @@ class SchedulerActions:
     RATE_LIMIT_HIT: Final[str] = "scheduler_rate_limit_hit"
 
 
+class SecurityActions:
+    """Action codes for security / abuse-detection events (FASE 7.1).
+
+    These are signals worth a manual review pass — not lifecycle. Distinct
+    from `SchedulerActions.RATE_LIMIT_HIT` (scheduler-side, per-agent
+    pacing) since this family covers HTTP-side abuse signals visible at
+    the request boundary.
+    """
+
+    RATE_LIMIT_API_HIT: Final[str] = "rate_limit_api_hit"
+    MODERATION_REJECTED: Final[str] = "moderation_rejected"
+    SEQUENTIAL_EMAIL_DETECTED: Final[str] = "sequential_email_detected"
+    # Constant only at 7.1 — the failure-aggregation hook is V0.5+
+    # (no real attacker pattern observed yet to calibrate threshold).
+    BURST_LOGIN_ATTEMPTS: Final[str] = "burst_login_attempts"
+
+
+class AuthActions:
+    """Action codes for authentication lifecycle events (FASE 7.1).
+
+    Distinct from `SecurityActions` (anomaly signals) — this family is
+    normal-flow auth lifecycle. Will grow with `LOGIN_COMPLETE`,
+    `LOGOUT`, `REFRESH`, etc. when the corresponding hooks land.
+    """
+
+    REGISTER_COMPLETE: Final[str] = "register_complete"
+
+
 async def log_tier_upgrade(
     *,
     user_id: str,
@@ -270,3 +298,56 @@ async def log_agent_event(
         agent_id=agent_id,
         mandate_id=mandate_id,
     )
+
+
+async def log_security_event(
+    db: AsyncSession,
+    *,
+    action: str,
+    user_id: str | None = None,
+    actor_ip: str | None = None,
+    params: dict[str, Any] | None = None,
+    success: bool = True,
+    error_code: str | None = None,
+) -> None:
+    """Insert an `AuditLog` row for a security / abuse-detection event (7.1.5).
+
+    Distinct from `log_intent_event` on three axes:
+
+      - `user_id` is optional — pre-auth events (rate-limit hit on
+        `/api/auth/*`, anonymous register-burst from one IP) genuinely
+        have no user context. Schema relaxed at migration `a522942e0df5`.
+      - `actor_ip` is first-class — `who/what/when/where` audit shape.
+      - No `agent_id`/`mandate_id` — security signals are pre-mandate
+        by definition (mandate flow itself is hardened by the existing
+        `MandateActions` / step-up audit path).
+
+    Never raises. Flush-only, no commit — caller controls the
+    transaction boundary (handlers that don't have a session in scope
+    can mint one via `AsyncSessionLocal()` and `await session.commit()`
+    around this call).
+    """
+    try:
+        row = AuditLog(
+            user_id=user_id,
+            agent_id=None,
+            mandate_id=None,
+            action=action,
+            params=params,
+            result=None,
+            success=success,
+            error_code=error_code,
+            actor_ip=actor_ip,
+        )
+        db.add(row)
+        await db.flush()
+    except Exception as exc:
+        try:
+            log.warning(
+                "audit.security_event.write_failed",
+                action=action,
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+        except Exception:
+            pass

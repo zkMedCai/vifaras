@@ -125,6 +125,21 @@ class Settings(BaseSettings):
     rate_limit_mandate_critical: str = "10/minute"  # mandate / identity / step-up
     rate_limit_self_verifier: str = "5/minute"  # external-call cost protection
     rate_limit_health: str = "60/minute"  # public, polling-friendly
+    # 7.1: deep coverage tier — auth endpoints (IP-keyed) and per-user
+    # buckets for authenticated routes. `auth_strict` for register
+    # (anti-enumeration), `auth_normal` for login (UX-friendlier),
+    # `auth_refresh` for token rotation, `user_read` for GET endpoints.
+    rate_limit_auth_strict: str = "5/minute"
+    rate_limit_auth_normal: str = "10/minute"
+    rate_limit_auth_refresh: str = "30/minute"
+    rate_limit_user_read: str = "100/minute"
+
+    # Abuse detection (7.1.5). Sequential-email registration: a same-prefix
+    # email pattern (e.g. john1@/john2@/john3@) repeated from the same IP
+    # within the window emits a SEQUENTIAL_EMAIL_DETECTED audit row.
+    # Inclusive threshold: trigger at the Nth attempt where N == threshold.
+    abuse_sequential_email_threshold: int = 3
+    abuse_sequential_email_window_hours: int = 24
 
     @cached_property
     def database_url_async(self) -> str:

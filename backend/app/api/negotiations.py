@@ -20,11 +20,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import limiter, user_key
 from app.core.security import CurrentUser, require_tier
 from app.services import negotiation_service
 
@@ -163,7 +165,9 @@ def _list_item(nego) -> NegotiationListItem:
 
 
 @router.post("", response_model=TurnResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def start_or_continue_endpoint(
+    request: Request,
     body: StartOrContinueRequest,
     user: CurrentUser = Depends(require_tier(1)),
     db: AsyncSession = Depends(get_db),
@@ -191,7 +195,9 @@ async def start_or_continue_endpoint(
 
 
 @router.post("/{negotiation_id}/accept", response_model=AcceptResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def accept_endpoint(
+    request: Request,
     negotiation_id: str,
     body: AcceptRequest,
     user: CurrentUser = Depends(require_tier(2)),
@@ -215,7 +221,9 @@ async def accept_endpoint(
 
 
 @router.post("/{negotiation_id}/reject", response_model=RejectResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def reject_endpoint(
+    request: Request,
     negotiation_id: str,
     body: RejectRequest,
     user: CurrentUser = Depends(require_tier(1)),
@@ -239,7 +247,9 @@ async def reject_endpoint(
 
 
 @router.get("/{negotiation_id}", response_model=NegotiationStateResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def get_negotiation_endpoint(
+    request: Request,
     negotiation_id: str,
     user: CurrentUser = Depends(require_tier(1)),
     db: AsyncSession = Depends(get_db),
@@ -254,7 +264,9 @@ async def get_negotiation_endpoint(
 
 
 @router.get("", response_model=NegotiationListResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def list_negotiations_endpoint(
+    request: Request,
     user: CurrentUser = Depends(require_tier(1)),
     db: AsyncSession = Depends(get_db),
     status: str | None = Query(default=None),

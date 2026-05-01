@@ -1602,3 +1602,74 @@ L'agent è funzionalmente alive. Dato un agent con mandate attivo + intent attiv
 
 ### Prossima task
 **Ritest frontend signup e2e** (terminal frontend). Se passa: backend pausa fino a 7.1+. Se emerge altro bug backend cross-repo, nuovo hotfix `[7.0.x]`. Brief denso 7.1 (Rate limiting Redis-backed + X-Forwarded-For trust + per-user caps) attende via libera dal founder quando frontend è stabile.
+
+---
+
+## [7.1.5] abuse detection logging — 2026-05-01
+
+### Cosa è stato fatto
+
+- Migration `audit_log`: `user_id` nullable, `actor_ip String(45)` aggiunta, `ix_audit_action_time (action, timestamp)` index per la query del sequential-email detection.
+- `SecurityActions` class (audit_service.py): `RATE_LIMIT_API_HIT`, `MODERATION_REJECTED`, `SEQUENTIAL_EMAIL_DETECTED`, `BURST_LOGIN_ATTEMPTS` (constant-only, hook V0.5+).
+- `AuthActions` class: `REGISTER_COMPLETE`. Separata da SecurityActions per coerenza tassonomica (lifecycle vs anomaly).
+- `log_security_event(db, *, action, user_id=None, actor_ip=None, params=None, success=True, error_code=None)` helper. Supporta `user_id None` per anonymous events. Never raises (graceful fallback su structlog warning).
+- `try_extract_user_id(authorization)` helper in `core/security.py` — non-raising JWT extraction per uso negli error handler.
+- Hook `rate_limit_exceeded_handler` (rate_limit.py): handler convertito a async, mintra `AsyncSessionLocal()`, emette `RATE_LIMIT_API_HIT` con `params={endpoint, method, limit}`. `user_id` da JWT se presente (auth endpoints → NULL).
+- Hook `moderation_error_handler` (error_handlers.py): emette `MODERATION_REJECTED` con `params={endpoint, method, field}`.
+- Hook `auth_service.complete_registration`: emette `REGISTER_COMPLETE` post-commit user. Sequential detection inclusive `matching_count >= 3` (configurabile via `abuse_sequential_email_threshold`), window 24h (configurabile via `abuse_sequential_email_window_hours`), keyed su `(action, actor_ip, params->'email_prefix')` con index supporto. Skip detection on emails con dot/underscore/dash in local part — solo `^[a-z]+\d+@` shape entra (legitimate non-pattern names sono ignorati).
+- 2 nuovi settings in config.py: `abuse_sequential_email_threshold: int = 3`, `abuse_sequential_email_window_hours: int = 24`.
+- Plumb `actor_ip = request.client.host` da route `/api/auth/register/complete` al service.
+- 8 test in `test_abuse_detection_logging.py`: rate limit auth+anon, moderation, register_complete emit, sequential 3rd-attempt trigger, below-threshold, complex local-part skip, different-IPs no-aggregation. Total **429**.
+
+### Decisioni prese non esplicite nel brief
+
+- **Migration scope `audit_log` only**: la discovery ha scoperto che alembic autogenerate produceva spurious diff su HNSW index, partial indexes su matches, DESC ordering su notifications, server_defaults, `deal_messages.sent_at` NOT NULL — drift sistemico schema.py vs DB pre-esistente. Migration manualmente filtrata per applicare SOLO i 3 op target su `audit_log`. Future autogenerate richiede stesso pattern di filtering manuale fino a reconciliation completa (vedi `IDEAS_BACKLOG.md` "Schema reconciliation pass").
+- **Sessione handler-side mintata propria** via `AsyncSessionLocal()`. Handler globali girano fuori dal dependency graph FastAPI (niente `Depends(get_db)` injectable), quindi sessione propria + commit + try/except pass è il pattern giusto. Caveat futuro: per logica più complessa nel handler V0.5+ (side effect cross-table) attenzione a coordination tra sessioni.
+- **Sessione service-side: audit dopo `db.commit()` user in seconda transazione**. Audit failure non rollback user creation. User created + audit failed > User not created + audit not attempted. Caveat futuro: audit failure recurrent (DB hiccup) perdi visibility, V0.5+ aggiungere fallback structlog write.
+- **Skip detection su email con dot/underscore/dash**: regex `^[a-z]+\d+@` matcha solo `<letters><digits>@` shape. Email tipo `john.doe1@`, `mario_rossi2@`, `anna-bianchi3@` sono legitimate non-pattern → skip detection. Calibrazione conservativa V0 (false negative > false positive). Test esplicito `test_sequential_email_skips_complex_local_part` lock il behavior.
+- **IP axis nella detection key**: stessa prefix da IP diversi NON triggera (residential NAT pool indistinguibile da burst legitimate). Test `test_sequential_email_different_ips_no_aggregation` lock.
+- **Threshold inclusive con flush prima della query**: `log_security_event` fa `db.flush()` rendendo register_complete row visibile alla stessa session. Query count include la row appena flushed. Threshold=3 → 3 matching row → trigger. Più chiaro di "count exclusive prior + this".
+- **`BURST_LOGIN_ATTEMPTS` constant-only, hook V0.5+**: V0 alpha non ha pattern di brute force osservabile (niente attaccanti reali, niente data per calibrare threshold). Constant defined preserva hook futuro senza scope creep ora.
+- **Refresh endpoint resta IP-keyed** (deviation [7.1.2]): refresh_token nel body, slowapi key_func sync impossibile estrarre senza rompere body parsing. Documentato in IDEAS_BACKLOG come V0.5+ enhancement (move to Bearer header → per-user keying).
+
+### Schema drift discovered
+
+Durante alembic autogenerate per migration audit_log, scoperto drift sistemico schema.py vs DB:
+- HNSW index `ix_intents_embedding_hnsw` (CRITICAL: required for FASE 4.3 vector match)
+- Partial indexes su `matches` (`ix_matches_buy_intent_discovered_score`, `sell_intent_discovered_score`)
+- DESC vs ASC ordering su `ix_notifications_user_*` (model says ASC, DB has DESC)
+- `server_default` parametri mancanti su ~10 columns
+- `deal_messages.sent_at` NOT NULL discrepancy
+
+Migration manualmente filtrata per applicare solo target diff. Documented in `IDEAS_BACKLOG.md` "Schema reconciliation pass" come V0.5+ task urgente. **Future autogenerate richiede stesso pattern di filtering manuale fino a reconciliation completa**.
+
+### Test scritti / coverage
+
+Pre-7.1.5: 421 test. Post-7.1.5: **429 test** (delta +8 in `test_abuse_detection_logging.py`).
+
+`pytest backend/tests/` → 429 passed in ~16s.
+
+Migration `a4c70b1aee1c → a522942e0df5` applicata clean su DB locale. Schema verificato:
+- `audit_log.user_id` nullable=YES
+- `audit_log.actor_ip varchar(45)` aggiunta
+- `ix_audit_action_time (action, timestamp)` indice creato
+- Tutti gli altri indici (HNSW, partial scores, DESC ordering, ecc.) **preservati intatti**
+
+### Blocker / dubbi
+
+- **Schema reconciliation è blocker per future migration non-banali** (es. nuova table, alter column complex). Prima di tale task, eseguire reconciliation pass (~2-4 ore) per allineare schema.py declarations alla realtà del DB. Trigger naturale: prima task in [7.4] pre-launch checklist con migration KMS keys table o simile.
+- **Audit row dell'handler-minted session NON è dentro la test outer transaction** (sessione separata commit-direct). Test rate-limit/moderation fanno cleanup explicit della row dopo l'assertion per evitare cross-test pollution. Pattern fragile se test fallisce prima della cleanup, ma il filter `WHERE user_id = ctx["user_id"]` su UUID random per test isola lo scenario.
+- **Skip detection su `john.doe1@` ecc.** è calibrazione V0 conservativa. Possibile false negative: attaccante con shape `john.doe1@`, `john.doe2@` non triggera. V0.5+ valutare estendere regex per coprire pattern con separatori.
+
+### Cosa significa "FASE 7.1 completa"
+
+Backend production-ready su 4 dimensioni di hardening:
+- **Rate limiting deep** ([7.1.2]): coverage completa endpoint authenticated (per-user) + auth (IP), 30 test
+- **Content moderation** ([7.1.3-7.1.4]): service layer rifiuta empty/too_long/profanity prima di DB ops, global handler 422 con `{detail: {code, message, field}}` envelope, 21 test
+- **Abuse detection** ([7.1.5]): audit log entries on rate-limit hits, moderation rejections, sequential email burst con detection threshold-driven, 8 test
+
+429 test verdi. **FASE 7.1 chiusa**. Resta FASE 7.2 (observability), 7.3 (cost monitoring + per-user soft cap), 7.4 (pre-launch checklist).
+
+### Prossima task
+
+**FASE 7.2 — Observability** (Prometheus + OpenTelemetry, 6-10h). Brief denso atteso quando founder dà via libera. Backend pausa fino ad allora.

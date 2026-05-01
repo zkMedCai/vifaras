@@ -63,6 +63,23 @@
   - Test signup/login e2e in staging prima di production
 - Riferimento: [7.0.1] hotfix default `webauthn_origin` localhost:8000 → :3000.
 
+### Refresh token as Bearer header (V0.5+ enhancement)
+
+**Trigger**: pre-launch alpha quando l'API surface si stabilizza, prima del lock breaking change.
+
+**Background**: V0 `/api/auth/refresh` rate limit è IP-keyed (non per-user) perché refresh_token sta nel body, e slowapi `key_func` è sync — consumare lo stream rompe FastAPI body parsing. 30/min IP è generoso ma non ottimale (un attaccante con refresh token validi multipli da una NAT condivide il bucket con utenti legitimate).
+
+**Action V0.5+**:
+- Move `refresh_token` from body to `Authorization: Bearer <refresh>` header
+- Update key_func a `user_key` (decodifica refresh token from header invece che access token)
+- Apply `rate_limit_auth_refresh` per-user invece di per-IP
+
+**Breaking change**: frontend deve aggiornare logica refresh per inviare token come header invece che body. Coordinare con frontend release.
+
+**Effort**: ~1 ora backend + 30 min frontend + test integration.
+
+**Riferimento**: [7.1.2] deviation documentata nel docstring `auth.py:refresh` endpoint.
+
 ### KMS reale (V1+)
 - Da file-based ed25519 (V0) a AWS KMS / GCP KMS
 - ed25519 supportato nativamente da AWS KMS dal 2025
@@ -97,6 +114,34 @@
 - Mitigazione naturale V0: mandate scade a 30gg, refresh richiede nuovo step-up.
 - **Trigger di promozione**: implementare il pattern draft+submit (analogo a mandate revocation) per il PATCH price update **quando >100 utenti attivi tier=2**.
 - Riferimento: DQ-29
+
+---
+
+## Categoria: Schema / Migrations
+
+### Schema reconciliation pass [URGENT, blocker per future autogenerate]
+
+**Discovered**: [7.1.5 step 1] durante autogenerate per audit_log migration.
+
+**Problem**: `alembic --autogenerate` produce spurious DROP/REWRITE su elementi DB esistenti che non sono dichiarati in model `schema.py`:
+- HNSW index `ix_intents_embedding_hnsw` (CRITICAL: required for FASE 4.3 vector match)
+- Partial indexes su `matches` table (`ix_matches_buy_intent_discovered_score`, `ix_matches_sell_intent_discovered_score`)
+- DESC vs ASC ordering su `ix_notifications_user_*` (model says ASC, DB has DESC)
+- `server_default` parametri mancanti su ~10 columns (notifications.payload, daily_cost_tracking.*, users.tier, deals.*)
+- `deal_messages.sent_at` NOT NULL discrepancy
+
+**Risk**: future autogenerate mid-flight di altra migration rischia di applicare spurious diff, rompendo features critiche (HNSW = match pipeline).
+
+**Mitigation V0** (immediate): documento in PROGRESS.md di [7.1.5] che ogni autogenerate output va manualmente filtrato per applicare SOLO i diff intenzionali.
+
+**Action V0.5+** (task [7.X] dedicata, ~2-4 ore):
+1. Audit complete schema.py vs live DB con `alembic check` o equivalent
+2. Per ogni drift, decidere: reflect in model OR document as intentional drift in comments
+3. Sync `server_default` parametri
+4. Add missing index declarations in model
+5. Verify autogenerate produce clean diff (no spurious changes) post-reconciliation
+
+**Trigger**: prima task che richiede nuova migration NON banale (es. nuova table, alter column complex).
 
 ---
 

@@ -227,6 +227,34 @@ async def authenticated_client(http_client):
 
 
 # ---------------------------------------------------------------------------
+# Rate limiter toggle (7.0 / 7.1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def enable_limiter(monkeypatch):
+    """Flip slowapi on for the duration of one test, then reset state.
+
+    The limiter is OFF by default in the test suite (`enable_rate_limiting
+    = False`) so the 370+ existing tests don't trip caps when they fire
+    bursts of requests in parametrize loops. Tests that need to assert
+    429 behaviour explicitly opt in via this fixture.
+
+    `limiter.reset()` clears the in-memory bucket state both on entry and
+    teardown — between tests we want zero leakage of counters.
+    """
+    from app.core.rate_limit import limiter
+
+    monkeypatch.setattr(limiter, "enabled", True)
+    limiter.reset()
+    try:
+        yield
+    finally:
+        limiter.reset()
+        monkeypatch.setattr(limiter, "enabled", False)
+
+
+# ---------------------------------------------------------------------------
 # Mock: Anthropic client (canned responses)
 # ---------------------------------------------------------------------------
 

@@ -59,6 +59,7 @@ from app.services import (
     match_service,
     negotiation_service,
 )
+from app.services.content_moderation import moderate_optional, moderate_text
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +454,8 @@ async def create_intent(
     """
     # 1. Field validation — fast-fail before any DB work or network call.
     _validate_side_for_create(input.side)
+    moderate_text(input.title, "title", MAX_TITLE_LEN)
+    moderate_optional(input.description, "description", MAX_DESCRIPTION_LEN)
     _validate_title(input.title)
     _validate_description(input.description)
     _validate_category(input.category)
@@ -633,6 +636,13 @@ async def update_intent(
             "side is not modifiable; cancel and create a new intent"
         )
 
+    # 1a. Content moderation — stateless, fast-fail before the DB lock.
+    # Section 5 also calls `_validate_title`/`_validate_description` for
+    # the HTML/URL/format checks; running moderation here avoids paying
+    # a row lock on a request that's going to 422 anyway.
+    moderate_optional(input.title, "title", MAX_TITLE_LEN)
+    moderate_optional(input.description, "description", MAX_DESCRIPTION_LEN)
+
     # 2. Tier gate on price changes.
     price_change = (
         input.reservation_price_eur is not None
@@ -680,13 +690,13 @@ async def update_intent(
     embedding_relevant_changed = False
 
     if input.title is not None:
-        _validate_title(input.title)
+        _validate_title(input.title)  # moderation already ran in 1a
         intent.title = input.title.strip()
         changed["title"] = intent.title
         embedding_relevant_changed = True
 
     if input.description is not None:
-        _validate_description(input.description)
+        _validate_description(input.description)  # moderation already ran in 1a
         intent.description = input.description
         changed["description"] = "<changed>"
         embedding_relevant_changed = True

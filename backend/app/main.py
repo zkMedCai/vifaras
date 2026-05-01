@@ -24,9 +24,11 @@ from app.api import (
 )
 from app.core.config import settings
 from app.core.db import engine
+from app.core.error_handlers import moderation_error_handler
 from app.core.logging import configure_logging, log
 from app.core.rate_limit import limiter, rate_limit_exceeded_handler
 from app.services import agent_scheduler, match_scheduler
+from app.services.content_moderation import ModerationError
 
 
 @asynccontextmanager
@@ -57,6 +59,11 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+# Content moderation (7.1.4). Cross-cutting service-layer error → 422
+# with the canonical detail envelope, so any service that calls
+# `moderate_text(...)` automatically participates without router work.
+app.add_exception_handler(ModerationError, moderation_error_handler)
 
 # CORS (7.0). Origins from env (`CORS_ALLOWED_ORIGINS=a.com,b.com`).
 # Credentials enabled so the frontend can send cookies / Authorization

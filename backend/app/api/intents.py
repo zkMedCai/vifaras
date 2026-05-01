@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.rate_limit import limiter
+from app.core.rate_limit import limiter, user_key
 from app.core.security import CurrentUser, require_tier
 from app.services import intent_service, negotiation_service
 
@@ -165,7 +165,7 @@ def _intent_to_list_item(intent) -> IntentListItem:
         "with its computed embedding."
     ),
 )
-@limiter.limit(lambda: settings.rate_limit_post_strict)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def create_intent_endpoint(
     request: Request,
     body: CreateIntentRequest,
@@ -188,7 +188,9 @@ async def create_intent_endpoint(
 
 
 @router.get("", response_model=IntentListResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def list_intents_endpoint(
+    request: Request,
     user: CurrentUser = Depends(require_tier(0)),
     db: AsyncSession = Depends(get_db),
     status: str | None = Query(default=None),
@@ -213,7 +215,9 @@ async def list_intents_endpoint(
 
 
 @router.get("/{intent_id}", response_model=IntentResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def get_intent_endpoint(
+    request: Request,
     intent_id: str,
     user: CurrentUser = Depends(require_tier(0)),
     db: AsyncSession = Depends(get_db),
@@ -233,7 +237,9 @@ async def get_intent_endpoint(
 
 
 @router.patch("/{intent_id}", response_model=IntentResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def update_intent_endpoint(
+    request: Request,
     intent_id: str,
     body: UpdateIntentRequest,
     user: CurrentUser = Depends(require_tier(0)),
@@ -253,7 +259,9 @@ async def update_intent_endpoint(
 
 
 @router.delete("/{intent_id}", response_model=CancelIntentResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def cancel_intent_endpoint(
+    request: Request,
     intent_id: str,
     user: CurrentUser = Depends(require_tier(0)),
     db: AsyncSession = Depends(get_db),

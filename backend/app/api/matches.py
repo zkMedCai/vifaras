@@ -19,11 +19,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import limiter, user_key
 from app.core.security import CurrentUser, require_tier
 from app.services import match_service
 
@@ -141,7 +143,9 @@ def _match_scores(match) -> MatchScores:
 @router.get(
     "/api/intents/{intent_id}/matches", response_model=MatchListResponse
 )
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def list_intent_matches(
+    request: Request,
     intent_id: str,
     user: CurrentUser = Depends(require_tier(0)),
     db: AsyncSession = Depends(get_db),
@@ -197,7 +201,9 @@ async def list_intent_matches(
 
 
 @router.get("/api/matches/{match_id}", response_model=MatchDetailResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def get_match_detail(
+    request: Request,
     match_id: str,
     user: CurrentUser = Depends(require_tier(2)),
     db: AsyncSession = Depends(get_db),

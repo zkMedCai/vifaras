@@ -17,11 +17,13 @@ import base64
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
+from app.core.rate_limit import limiter, user_key
 from app.core.security import CurrentUser, require_tier
 from app.services import deal_message_service, deal_service
 from app.services.mandate_service import WebAuthnAssertionPayload
@@ -180,7 +182,9 @@ def _deal_to_list_item(deal) -> DealListItem:
 
 
 @router.get("", response_model=DealListResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def list_deals_endpoint(
+    request: Request,
     user: CurrentUser = Depends(require_tier(2)),
     db: AsyncSession = Depends(get_db),
     status: str | None = Query(default=None),
@@ -203,7 +207,9 @@ async def list_deals_endpoint(
 
 
 @router.get("/{deal_id}", response_model=DealDetailResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def get_deal_endpoint(
+    request: Request,
     deal_id: str,
     user: CurrentUser = Depends(require_tier(2)),
     db: AsyncSession = Depends(get_db),
@@ -218,7 +224,9 @@ async def get_deal_endpoint(
 
 
 @router.post("/{deal_id}/sign/draft", response_model=SignDraftResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def sign_draft_endpoint(
+    request: Request,
     deal_id: str,
     user: CurrentUser = Depends(require_tier(2)),
     db: AsyncSession = Depends(get_db),
@@ -240,7 +248,9 @@ async def sign_draft_endpoint(
 
 
 @router.post("/{deal_id}/sign/submit", response_model=SignSubmitResponse)
+@limiter.limit(lambda: settings.rate_limit_mandate_critical, key_func=user_key)
 async def sign_submit_endpoint(
+    request: Request,
     deal_id: str,
     body: SignSubmitRequest,
     user: CurrentUser = Depends(require_tier(2)),
@@ -265,7 +275,9 @@ async def sign_submit_endpoint(
 
 
 @router.post("/{deal_id}/cancel/draft", response_model=SignDraftResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def cancel_draft_endpoint(
+    request: Request,
     deal_id: str,
     body: CancelDraftRequest = CancelDraftRequest(),
     user: CurrentUser = Depends(require_tier(2)),
@@ -290,7 +302,9 @@ async def cancel_draft_endpoint(
 
 
 @router.post("/{deal_id}/cancel/submit", response_model=CancelSubmitResponse)
+@limiter.limit(lambda: settings.rate_limit_mandate_critical, key_func=user_key)
 async def cancel_submit_endpoint(
+    request: Request,
     deal_id: str,
     body: CancelSubmitRequest,
     user: CurrentUser = Depends(require_tier(2)),
@@ -328,7 +342,9 @@ def _b64encode(b: bytes) -> str:
 
 
 @router.post("/{deal_id}/messages", response_model=MessageItem, status_code=201)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
 async def send_message_endpoint(
+    request: Request,
     deal_id: str,
     body: SendMessageRequest,
     user: CurrentUser = Depends(require_tier(2)),
@@ -354,7 +370,9 @@ async def send_message_endpoint(
 
 
 @router.get("/{deal_id}/messages", response_model=MessageListResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
 async def list_messages_endpoint(
+    request: Request,
     deal_id: str,
     user: CurrentUser = Depends(require_tier(2)),
     db: AsyncSession = Depends(get_db),

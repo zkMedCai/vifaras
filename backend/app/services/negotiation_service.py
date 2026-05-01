@@ -58,6 +58,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.schema import Agent, Intent, Match, Negotiation
 from app.services import audit_service, notification_service
+from app.services.content_moderation import moderate_optional
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +249,13 @@ def _validate_price(price_cents: int) -> None:
 
 
 def _truncate_message(message: str | None) -> str:
-    """Brief 5.1 chose truncation over validation: don't reject a verbose
-    user, just trim. UI mobile is the authoritative input length anyway."""
+    """Coerce optional message to storage form.
+
+    7.1.4 introduced content moderation at the call sites (start/reject)
+    that rejects `len > MAX_MESSAGE_LENGTH` outright with `TooLong`.
+    The slice here is now defensive: in the normal flow it sees only
+    inputs already ≤ cap. The function is retained for the `None → ""`
+    coercion (turns store `message: str`, never `null`)."""
     if message is None:
         return ""
     return message[:MAX_MESSAGE_LENGTH]
@@ -353,6 +359,7 @@ async def start_or_continue(
 ) -> TurnResult:
     """First offer or subsequent counter-offer on `match_id`. Tier ≥ 1."""
     _validate_price(price_cents)
+    moderate_optional(message, "message", MAX_MESSAGE_LENGTH)
 
     # 1. Auth — agent owned, in usable state.
     await _verify_agent_ownership(
@@ -794,6 +801,7 @@ async def reject_offer(
     reason: str | None = None,
 ) -> RejectResult:
     """Reject the counterparty's last turn. Tier ≥ 1."""
+    moderate_optional(reason, "reason", MAX_MESSAGE_LENGTH)
     await _verify_agent_ownership(
         db, agent_id=agent_id, user_id=user_id, accept_pending=True
     )

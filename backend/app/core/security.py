@@ -196,6 +196,27 @@ def _bearer_token(authorization: str | None) -> str:
     return parts[1]
 
 
+def try_extract_user_id(authorization: str | None) -> str | None:
+    """Best-effort user_id from a bearer header, never raises (7.1.5).
+
+    Used by exception handlers (rate-limit, moderation) that want the
+    user_id when present but must continue without it on a missing or
+    malformed header. Distinct from `require_tier` / `_bearer_token`,
+    which raise; this returns `None`.
+    """
+    if not authorization:
+        return None
+    parts = authorization.strip().split(maxsplit=1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+        return None
+    try:
+        payload = decode_access_token(parts[1])
+        sub = payload.get("sub")
+        return sub if isinstance(sub, str) and sub else None
+    except Exception:
+        return None
+
+
 def require_tier(min_tier: int):
     """Factory: returns a FastAPI dependency that requires `tier >= min_tier`.
 

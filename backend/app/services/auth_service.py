@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from webauthn import (
     generate_authentication_options,
@@ -43,7 +44,21 @@ from app.core.security import (
     create_refresh_token,
     decode_challenge_token,
 )
-from app.models.schema import User
+from app.models.schema import AuditLog, User
+from app.services import audit_service
+
+
+# ^([a-z]+)\d+@ — captures the leading-letters prefix of a "name + digits"
+# email shape (e.g. john1@, john2@, attacker99@). Returns None for emails
+# that don't fit the pattern (john.doe@, foo+spam@, jane@). Detection only
+# fires on this shape — sequential burst on diverse addresses isn't
+# distinguishable from organic registration.
+_SEQUENTIAL_EMAIL_PREFIX_RE = re.compile(r"^([a-z]+)\d+@", re.IGNORECASE)
+
+
+def _extract_sequential_prefix(email: str) -> str | None:
+    m = _SEQUENTIAL_EMAIL_PREFIX_RE.match(email)
+    return m.group(1).lower() if m else None
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +199,15 @@ async def complete_registration(
     *,
     credential: dict[str, Any] | str,
     challenge_token: str,
+    actor_ip: str | None = None,
 ) -> tuple[str, str, str]:
-    """Verify attestation; persist tier=0 user; return (user_id, access, refresh)."""
+    """Verify attestation; persist tier=0 user; return (user_id, access, refresh).
+
+    `actor_ip` (7.1.5): when supplied, drives the audit + sequential-
+    email detection emit. Optional — direct service callers (tests,
+    agent runtime) that don't have a request scope simply skip the
+    audit emit. The HTTP route always passes it.
+    """
     try:
         payload = decode_challenge_token(
             challenge_token, expected_purpose="register"
@@ -232,9 +254,80 @@ async def complete_registration(
     db.add(user)
     await db.commit()
 
+    # 7.1.5 — audit emit + sequential-email detection. Runs in a
+    # second transaction so a failing audit write can't roll back the
+    # already-durable user. Only fires when the caller supplied an IP
+    # (HTTP route always does; agent / test direct calls may not).
+    if actor_ip is not None:
+        await _emit_register_audit_and_detect(
+            db, user_id=user_id, email=email, actor_ip=actor_ip
+        )
+
     access = create_access_token(user_id=user_id, tier=0)
     refresh = create_refresh_token(user_id=user_id)
     return user_id, access, refresh
+
+
+async def _emit_register_audit_and_detect(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    email: str,
+    actor_ip: str,
+) -> None:
+    """Write the `register_complete` audit row, then check sequential-
+    burst threshold and emit `SEQUENTIAL_EMAIL_DETECTED` if exceeded.
+
+    The threshold check is INCLUSIVE of the just-flushed register
+    row, so threshold=3 means "trigger on the 3rd matching attempt"
+    (1 prior + 1 prior + this one = 3). Never raises — `log_security_
+    event` and the count query are wrapped to swallow failures so a
+    DB hiccup can't break a successful registration."""
+    try:
+        prefix = _extract_sequential_prefix(email)
+        await audit_service.log_security_event(
+            db,
+            action=audit_service.AuthActions.REGISTER_COMPLETE,
+            user_id=user_id,
+            actor_ip=actor_ip,
+            params={"email_prefix": prefix} if prefix else None,
+        )
+
+        if prefix is not None:
+            cutoff = datetime.utcnow() - timedelta(
+                hours=settings.abuse_sequential_email_window_hours
+            )
+            stmt = (
+                select(func.count())
+                .select_from(AuditLog)
+                .where(
+                    AuditLog.action == audit_service.AuthActions.REGISTER_COMPLETE,
+                    AuditLog.actor_ip == actor_ip,
+                    AuditLog.params["email_prefix"].astext == prefix,
+                    AuditLog.timestamp > cutoff,
+                )
+            )
+            matching = await db.scalar(stmt) or 0
+            if matching >= settings.abuse_sequential_email_threshold:
+                await audit_service.log_security_event(
+                    db,
+                    action=audit_service.SecurityActions.SEQUENTIAL_EMAIL_DETECTED,
+                    user_id=user_id,
+                    actor_ip=actor_ip,
+                    params={
+                        "email_prefix": prefix,
+                        "matching_count": int(matching),
+                    },
+                )
+
+        await db.commit()
+    except Exception:
+        # Audit failure must not break registration. Roll back the audit
+        # transaction so the session stays usable.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
