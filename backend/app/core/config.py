@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     webauthn_rp_id: str = "localhost"
     webauthn_rp_name: str = "Marketplace V0"
-    webauthn_origin: str = "http://localhost:8000"
+    webauthn_origin: str = "http://localhost:3000"
 
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5"

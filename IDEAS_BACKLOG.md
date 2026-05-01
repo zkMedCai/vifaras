@@ -53,6 +53,16 @@
 - Rolling key, kid claim, graceful rotation
 - Pre-launch checklist obbligatoria
 
+### WebAuthn config pre-launch (7.4)
+- Trigger: pre-launch alpha (deploy pubblico).
+- Action:
+  - `WEBAUTHN_ORIGIN=https://app.vifaras.com` (o dominio finale)
+  - `WEBAUTHN_RP_ID=app.vifaras.com` (rp.id match exact, niente wildcard / subdomain)
+  - `WEBAUTHN_RP_NAME=Vifaras` (allinea al rebrand commit dedicato)
+  - Verify frontend deploy sullo stesso dominio esatto del rp.id
+  - Test signup/login e2e in staging prima di production
+- Riferimento: [7.0.1] hotfix default `webauthn_origin` localhost:8000 → :3000.
+
 ### KMS reale (V1+)
 - Da file-based ed25519 (V0) a AWS KMS / GCP KMS
 - ed25519 supportato nativamente da AWS KMS dal 2025

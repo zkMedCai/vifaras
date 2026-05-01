@@ -318,6 +318,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 ### 🔄 FASE 7 — Hardening & ship
 
 - ✅ 7.0 Frontend-ready hardening (slowapi rate limiting, CORS, /api/health, CI, OpenAPI minimal)
+- ✅ 7.0.1 WebAuthn `webauthn_origin` default localhost:8000 → :3000 (hotfix da integrazione frontend e2e)
 - 🔲 7.1 Rate limiting & abuse (Redis storage, X-Forwarded-For trust, per-user caps)
 - 🔲 7.2 Observability (Prometheus, OpenTelemetry tracing, structured audit on scheduler)
 - 🔲 7.3 Cost monitoring (per-agent / per-user dashboard, soft cap notifications)
