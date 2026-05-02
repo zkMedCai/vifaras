@@ -2239,3 +2239,134 @@ JWT secret rotation production-grade end-to-end:
 ### Prossima task
 
 **[7.4.4] privacy policy custom GDPR-compliant** (1-2h). Scope: testo legale strutturato + integrazione sito/app. Closure FASE 7.4 + closure FASE 7.
+
+---
+
+## [7.4.4] privacy policy custom GDPR-compliant IT/EU — 2026-05-02
+
+### Cognitive switch
+
+Sub-task scope diverso da tutte le altre della FASE 7: niente refactor architetturale, niente migration, niente test code complex. Deliverable = documentazione legale + minimal backend wiring. Pattern: cognitive switch da "engineering" a "legal documentation review", founder è il decisore principale (data inventory, retention, processor), Claude è collaboratore strutturato (template GDPR, best practice format, discovery validation).
+
+### Cosa è stato fatto
+
+#### Document `docs/PRIVACY_POLICY.md` (~350 righe, italiano)
+
+Privacy policy GDPR-structured con 11 sezioni + disclaimer header prominente ⚠ ("draft V0 alpha, legal review obbligatoria pre-launch"):
+
+- **Sezione 1**: Titolare del trattamento (TBD placeholders esplicit, no PII founder leak)
+- **Sezione 2**: Cosa è Vifaras (descrizione service + "decisioni economicamente rilevanti sempre umane")
+- **Sezione 3**: Dati raccolti — inventory 17 categorie consolidate in 9 sotto-sezioni utente-readable (account / credenziali / identità / mandato / marketplace / sicurezza-antiabuso / chiavi crypto / notifiche / domande agente)
+- **Sezione 4**: Decisioni automatizzate Art. 22 (matching + negotiation + step-up biometric human-in-loop esplicito)
+- **Sezione 5**: Mitigazioni Privacy by Design Art. 25 — 8 mitigations già implementate elencate (truncation 300 chars, pseudonimization, AES-GCM, hash-only refresh tokens, step-up biometric, audit log, rate limiting, cost cap)
+- **Sezione 6**: Trasferimenti internazionali — 4 sub-sezioni (Anthropic mitigated, OpenAI ⚠ pending decision, Self ZK-clean, V0.5+ TBD) + caveat pseudonimization embedding
+- **Sezione 7**: Diritti utente Art. 15-22 — V0 esercizio via email (no endpoint UI promise), reclamo Garante
+- **Sezione 8**: Cookie — V0 solo funzionali, V0.5+ banner se analytics
+- **Sezione 9**: Modifiche policy — versioning semantico
+- **Sezione 10**: Sicurezza Art. 32 + breach notification Art. 33-34 (72h)
+- **Sezione 11**: Contatti (TBD placeholders esplicit)
+
+**17 occorrenze [TBD pre-launch]** flagged esplicit nel testo per chiarezza review legale.
+
+#### Backend endpoint `app/api/legal.py` (nuovo router)
+
+- `GET /api/legal/privacy` — `PlainTextResponse` markdown del file
+- `GET /api/legal/privacy/version` — JSON metadata `{version: "1.0.0", effective_date: "TBD-pre-launch", language: "it"}`
+- Public, no auth (GDPR transparency Art. 12-14 — prospective user deve poter leggere pre-registration)
+- Path resolution defensive (500 error se file missing)
+- Niente cache headers V0 (low traffic; V0.5+ refinement)
+
+Router registered in `app/main.py` alphabetically (dopo `intents`, prima di `mandates`) + include order naturale (dopo `health_routes`, prima di `_test_endpoints`).
+
+#### Test (`backend/tests/test_legal.py`, 4 test)
+
+- `test_privacy_policy_endpoint_returns_markdown` — 200 + Italian title + Vifaras + disclaimer header (OR-pattern future-proof)
+- `test_privacy_policy_endpoint_no_auth_required` — public access verified
+- `test_privacy_policy_version_endpoint` — JSON shape verified
+- `test_privacy_policy_version_matches_v0_baseline` — `version="1.0.0"`, `language="it"`, `effective_date` non-empty (OR-pattern)
+
+#### IDEAS_BACKLOG additions
+
+Nuova categoria **"Privacy / GDPR (V0.5+ pre-launch)"** in cima al file (BLOCKER prominence). 11 entries:
+
+1. 🚨 **BLOCKER**: Privacy policy + ToS legal review pre-launch (€1500-3500 EUR avvocato italiano specializzato)
+2. Privacy policy DB-backed versioning + user acceptance
+3. GDPR right exercise endpoints (Art. 15-22)
+4. Pre-launch DPA inventory
+5. Article 22 explicit pause-matching feature
+6. Intent description PII detection
+7. Agent prompt data minimization (DOWNGRADED post-discovery — V0 mitigations già in place)
+8. Italian commercial retention validation pre-launch
+9. Audit log params PII review
+10. OpenAI embedding text policy review (4 path decision pre-launch)
+11. Breach notification procedure (Art. 33-34)
+
+Esistente entry "Privacy policy + ToS custom (7.4)" in legacy "Compliance / Legal" categoria aggiornata partial DONE: privacy ✅ in [7.4.4], ToS 🔲 ancora TBD, cross-reference a entry BLOCKER #1.
+
+### Discovery findings durante implementation
+
+Pattern stop-gate strict ha catturato 2 critical finding non considerati nel brief originale:
+
+1. **AgentFullState data flow verified** (orchestrator.py:479-487 + views.py:206-232):
+   - `payload = state.model_dump(mode="json")` → Anthropic
+   - State include: agent_id (UUID), user_id (UUID, no PII direct), `nullifier_pseudonym` (TRUNCATED), mandate, intents (descriptions truncated 300 chars al view-builder layer)
+   - **Niente email, niente nullifier_hash raw, niente PII direct leak** ✓
+   - `DESCRIPTION_TRUNCATE_CHARS = 300` already in place — data minimization V0 robusta
+   - DQ-31 privacy invariants enforced (counterparty `ideal_price_eur` mai esposto)
+   - Severity update: V0.5+ entry "Agent prompt data minimization" DOWNGRADED da CRITICAL a refinement
+
+2. **OpenAI embedding full-text confirmed** (`build_embedding_text(*, title, description)`):
+   - Full title + description concat passato a OpenAI text-embedding-3-small
+   - **NO truncation** — embedding fidelity per similarity search
+   - Severity ⚠ confirmed: 4-path decision required pre-launch (full-text accept / truncate / regex anonymization / local model switch)
+
+3. **UserQuestion model**: question è AGENT-generated (non user-generated). Risk medio, non alto. PII risk indirect via Q&A flow.
+
+### Test scritti / coverage
+
+Pre-7.4.4: 494 test. Post-7.4.4: **498 test** (delta +4, zero regression).
+
+`pytest backend/tests/` → 498 passed in ~17s. Run time invariato.
+
+### Decisioni V0 documentate
+
+- **Static markdown file V0** (V0.5+ DB-backed con user acceptance log + versioning track)
+- **Italiano primary V0** (audience IT first; V0.5+ EN translation pre-launch internazionale)
+- **Endpoint pubblico no-auth** (GDPR transparency Art. 12-14 principle, prospective user deve leggere pre-registration)
+- **Effective date "TBD-pre-launch"** coerente con disclaimer (niente lying via metadata)
+- **4 retention defaults proposti con caveat "TBD pre-launch validare"**:
+  - Mandate: 10 anni post-revoca (Codice del Consumo IT D.Lgs. 206/2005 Art. 134)
+  - Deal: 10 anni post-completion (D.P.R. 633/1972 fatturazione + Codice del Consumo)
+  - Audit log: 12 mesi (Art. 32 GDPR security best practice)
+  - Cost tracking: 90 giorni (operational best practice)
+- **OR-pattern future-proof su test assertions**: lock contract semantico ("disclaimer visible", "metadata not empty"), non textual exact match
+- **Helper inline `_PROJECT_ROOT`** in legal.py (4× parent traversal): scope-locale, no over-abstraction
+- **Categoria "Privacy / GDPR" rinominata** dopo collision check con esistente "Compliance / Legal": naming distinct preserva clarity, scope distintivi
+
+### CRITICAL DISCLAIMER
+
+Il documento è draft strutturato basato su best practice GDPR pubbliche. **NON è validato da legale qualificato**. Pre-launch alpha esterno richiede review obbligatoria da avvocato italiano specializzato GDPR + diritto digitale. IDEAS_BACKLOG entry "🚨 BLOCKER: Privacy policy + ToS legal review pre-launch" è BLOCKER non-negotiable per launch.
+
+### Placeholder TBD pre-launch (consolidato)
+
+- Nome legale founder/entity + indirizzo fisico
+- DPO designation (se Article 37 trigger raggiunto)
+- Effective date privacy policy (al momento prima pubblicazione)
+- DPA chain con Anthropic + OpenAI + Self Protocol + hosting V0.5+ + email service V0.5+
+- Region selection processor (preferenza EU per Article 44 minimization)
+- Retention specifici per categorie operational (intent / match / negotiation / notifications / user_questions)
+- ToS / Terms of Service text (separato concern V0.5+)
+
+### Cosa significa "FASE 7.4.4 completa"
+
+Privacy V0 baseline:
+- Documento legale draft GDPR-structured + endpoint pubblico + test + roadmap V0.5+ esplicita
+- Niente illusion di production-ready: disclaimer header + 17 TBD esplicit + IDEAS_BACKLOG BLOCKER entry
+- Discipline preservata: discovery rivelato 2 finding critical (mitigations V0 già in place + OpenAI ⚠), severity calibrata accuratamente
+- Future legale review ha checklist chiara: 11 V0.5+ entries + 17 TBD inline = no guessing
+
+498 test verdi. **FASE 7.4.4 chiusa**. **FASE 7.4 al 100%** (5/5 sub-task: 7.4.0 reconciliation + 7.4.1 KMS + 7.4.2 refresh rotation + 7.4.3 JWT rotation + 7.4.4 privacy).
+
+### Prossima task
+
+**[7.4.5+] FASE 7 closure** (~30-45 min residui): test consolidation finale + PROGRESS entry "FASE 7 complete" + PROJECT_BRIEF flip + tag `v0-backend-fase-7-complete`.

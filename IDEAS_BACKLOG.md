@@ -6,6 +6,214 @@
 
 ---
 
+## Categoria: Privacy / GDPR (V0.5+ pre-launch)
+
+### 🚨 BLOCKER: Privacy policy + ToS legal review pre-launch
+
+**Severity**: BLOCKER per launch alpha esterno.
+
+**Trigger**: PRIMA di qualsiasi launch alpha esterno.
+
+**Background**: V0 [7.4.4] privacy policy (`docs/PRIVACY_POLICY.md`) è draft strutturato basato su best practice GDPR pubbliche (Reg. UE 2016/679 + D.Lgs. 196/2003). NON è validato da legale qualificato. Pre-launch deve essere reviewed da avvocato italiano specializzato GDPR + diritto digitale.
+
+**Action OBBLIGATORIA pre-launch**:
+- Engage legale qualificato GDPR (avvocato italiano specializzato)
+- Review completa privacy policy + Terms of Service (ToS è separato concern, non scritto V0)
+- Verifica DPA in essere con tutti i processor (Anthropic, OpenAI, Self Protocol; V0.5+ DB hosting + email)
+- Article 28 GDPR contract chain documented
+- Article 22 consent flow per automated decision-making validated
+- Article 30 record of processing activities (RoPA) creato
+- Breach notification procedure validated (Art. 33-34, vedi entry dedicata sotto)
+- Privacy policy IT (primary V0) + EN translation pre-launch internazionale
+- Cookie policy review (V0.5+ se aggiunti analytics)
+- Risoluzione delle 17 voci `[TBD pre-launch]` documentate in `docs/PRIVACY_POLICY.md`
+
+**Cost stimato**: €1500-3500 EUR (avvocato italiano specializzato GDPR + diritto digitale).
+
+**Dependencies risolte**: tutte le altre 10 entry di questa sezione contribuiscono alla checklist legale.
+
+---
+
+### Privacy policy DB-backed versioning + user acceptance
+
+**Trigger**: pre-launch alpha esterno con user reali.
+
+**Background**: V0 [7.4.4] privacy policy è static markdown file servito as-is via `/api/legal/privacy`. Niente tracking di chi ha accettato quale versione.
+
+**Action V0.5+**:
+- DB schema: `privacy_policy_versions(version, effective_date, content_hash, content_md)`
+- DB schema: `user_privacy_acceptance(user_id, version, accepted_at, ip)`
+- Acceptance UI alla prima login dopo policy update
+- Endpoint `/api/legal/privacy/accept` per user acceptance log
+- Block su feature critical (matching, deal signing) se user non ha accettato versione corrente
+
+**Effort**: 6-10 ore (schema + backend + frontend banner + test).
+
+---
+
+### GDPR right exercise endpoints (Art. 15-22)
+
+**Trigger**: pre-launch alpha esterno o user request first.
+
+**Background**: V0 [7.4.4] privacy policy promette diritti GDPR (Art. 15-22). Implementation backend mancante. V0 esercizio gestito su richiesta via email a privacy@vifaras.com.
+
+**Action V0.5+**:
+- `GET /api/users/me/data-export` — Article 20 portability (ZIP/JSON dump)
+- `DELETE /api/users/me/account` — Article 17 right to erasure
+- `POST /api/users/me/data-correction` — Article 16 rectification
+- `POST /api/users/me/processing-objection` — Article 21 objection
+- `POST /api/users/me/automated-decision-review` — Article 22 human review request
+- Tutti gated by JWT + step-up auth (sensitive operations)
+- Audit trail per ogni invocation
+
+**Effort**: 12-16 ore (5 endpoint + auth flow + test).
+
+---
+
+### Pre-launch DPA inventory
+
+**Trigger**: pre-launch alpha esterno reale.
+
+**Background**: V0 niente DPA in place. Pre-launch è obbligatorio per processor data flow Article 28 GDPR.
+
+**Action V0.5+**:
+- Verifica Anthropic T&C + DPA (data flow Vifaras → Anthropic Claude API)
+- Verifica OpenAI T&C + DPA (data flow Vifaras → OpenAI text-embedding-3-small)
+- Verifica Self Protocol DPA (Tier 1 verification flow)
+- DB hosting region selection (preferenza EU per Article 44 minimization)
+- Email service procurement + DPA signed
+- Document chain di Article 28 sub-processor in privacy policy
+- (Opzionale) Designare DPO se Article 37 trigger raggiunto
+
+**Effort**: 4-8 ore (legal review + procurement).
+
+---
+
+### Article 22 explicit pause-matching feature
+
+**Trigger**: V0.5+ feature work post-launch alpha.
+
+**Background**: V0 [7.4.4] privacy policy menciona Article 22 (decisioni automatizzate). User può "opt-out" cancellando intent. Pattern UX poor — Article 22 user right è concreto ma exercise difficult.
+
+**Action V0.5+**:
+- DB schema: `intents.matching_paused: bool`
+- Frontend toggle "pause matching" per ogni intent
+- Backend skip user intent quando paused
+- Audit log per pause/unpause events
+
+**Effort**: 2-3 ore (schema + endpoint + frontend toggle + test).
+
+---
+
+### Intent description PII detection
+
+**Trigger**: V0.5+ alpha esterno con user reali.
+
+**Background**: V0 content moderation copre profanity (~25 termini blacklist). Niente PII detection in user-generated intent description. Risk: user scrive email / phone / codice fiscale / IBAN direttamente nella descrizione, finisce in DB + embedding (irreversibly linked via similarity search) + processor (OpenAI embedding API + Anthropic agent prompt).
+
+**Action V0.5+**:
+- PII detection regex pattern (email, phone IT, codice fiscale, IBAN)
+- Pre-submit warning UX: "il tuo testo contiene un'email — rimuoverla?"
+- Optional: server-side strip o block submit
+- Audit log entry per PII detection event
+
+**Effort**: 2-4 ore (regex + frontend warning + test).
+
+---
+
+### Agent prompt data minimization (DOWNGRADED post-discovery)
+
+**Trigger**: V0.5+ refinement (NOT critical V0 fix).
+
+**Background**: V0 [7.4.4.2] discovery rivela mitigations già in place al view-builder layer (`backend/app/models/views.py`):
+- Description truncation 300 chars (`DESCRIPTION_TRUNCATE_CHARS`)
+- Pseudonimization (`nullifier_pseudonym` truncated, niente email leak)
+- DQ-31 privacy invariants enforced (counterparty `ideal_price_eur` mai esposto)
+
+**Severity update post-discovery**: V0 niente critical fix needed. V0.5+ refinement micro-improvements.
+
+**Action V0.5+**:
+- `user_id` pseudonymization (UUID → opaque per-call ID per spezzare profile-building cross-tick lato Anthropic)
+- Negotiation history truncation policy (last N messages vs full)
+- DPA Anthropic confirma "no training on customer data"
+- Document data flow Vifaras → Anthropic in privacy policy DPA section
+
+**Effort**: 2-3 ore (pseudonymization layer + history truncation + privacy policy update).
+
+---
+
+### Italian commercial retention validation pre-launch
+
+**Trigger**: pre-launch alpha esterno (sub-task del legal review BLOCKER sopra).
+
+**Background**: V0 [7.4.4] privacy policy proposta retention 10 anni per mandate + deal basata su best-effort interpretation Codice del Consumo IT (D.Lgs. 206/2005 Art. 134, Art. 50) + D.P.R. 633/1972 (fatturazione/tax). Validation richiesta da avvocato.
+
+**Action V0.5+**:
+- Validare retention 10 anni mandate + deal con avvocato italiano
+- Distinguere transazioni B2C vs B2B (retention diversa potrebbe applicare)
+- Distinguere "fatturazione fiscale" (10 anni) vs "contract retention" (varia)
+- Document references legali specifiche in privacy policy text
+
+**Effort**: 1-2 ore (legale review focused on retention) — incluso nel cost del BLOCKER sopra.
+
+---
+
+### Audit log params PII review (data minimization)
+
+**Trigger**: pre-launch alpha esterno.
+
+**Background**: V0 [7.4.4.2] inventory rivela `audit_log.params` (JSONB) contiene metadata per ogni action. Audit hooks già implementati V0:
+- RATE_LIMIT_API_HIT: `params={endpoint, method, limit}` — niente PII
+- MODERATION_REJECTED: `params={endpoint, method, field}` — niente PII
+- REGISTER_COMPLETE: `params={email_prefix}` — partial PII (email prefix)
+- USER_COST_CAP_REACHED: `params={today_cost_usd, cap_usd}` — niente PII
+- REFRESH_TOKEN_REUSE: `params={revoked_count}` — niente PII
+
+V0 niente full PII leak osservato. **Pattern futuro deve essere disciplinato**.
+
+**Action V0.5+**:
+- Audit completo callsite `log_security_event` per data minimization compliance
+- Documentation di params schema atteso per ogni `SecurityAction`
+- Pre-launch: review che niente full email / IP raw / PII viene loggato accidentalmente
+- Pattern futuro: action-specific TypedDict per params, prevenire PII drift
+
+**Effort**: 2-3 ore (audit + schema doc + test che lock contract).
+
+---
+
+### OpenAI embedding text policy review
+
+**Trigger**: pre-launch alpha esterno + DPA OpenAI signing.
+
+**Background**: V0 [7.4.4.2] inventory rivela `build_embedding_text(*, title, description)` passa **full-text non-truncated** a OpenAI text-embedding-3-small. Trade-off: embedding fidelity (similarity search funziona meglio con full context) vs data minimization Art. 5.1.c.
+
+**Decisione richiesta pre-launch**:
+- **Path A**: full-text acceptable — DPA OpenAI assicura "no training on customer data", trade-off accettato. Documenta solo.
+- **Path B**: truncate description per embedding (es. 500 chars) — embedding fidelity loss, rischio false negative match.
+- **Path C**: pre-process description (anonymization light: strip email/phone regex pre-embedding) — combinabile con A.
+- **Path D**: switch to local embedding model (sentence-transformers o equivalent) — niente external transfer ma compute cost on-prem.
+
+**Effort post-decision**: varies per path (Path A: 0h documentation only; Path C: ~2h regex strip + test; Path D: 1-2 settimane refactor + GPU/CPU compute).
+
+---
+
+### Breach notification procedure (Art. 33-34)
+
+**Trigger**: pre-launch alpha esterno.
+
+**Background**: V0 [7.4.4.3] privacy policy (sezione 10) promette breach notification 72h Art. 33 GDPR. Implementation operational mancante.
+
+**Action V0.5+**:
+- Procedure documentation (`docs/BREACH_NOTIFICATION_PROCEDURE.md` analoga a `JWT_ROTATION_PROCEDURE.md`)
+- Detection capabilities (Prometheus alert su anomaly metrics: spike `vifaras_refresh_token_reuse_total`, spike `audit_log.action="rate_limit_api_hit"`, etc.)
+- User notification email template GDPR-compliant
+- Authority notification template (Italy: Garante per la protezione dei dati personali, www.garanteprivacy.it)
+- Retention 5 anni breach log Art. 33.5
+
+**Effort**: 4-6 ore (procedure + detection setup + templates).
+
+---
+
 ## Categoria: Auth tokens hardening (V0.5+)
 
 ### Refresh token reuse detection: chain-only invalidation (V0.5+ multi-device)
@@ -680,10 +888,10 @@ Vedi `TRADE_WINDOW_FLOW.md` per dettaglio completo.
 - Setup account Self + scope identifier "marketplace-it-v0"
 - Riferimento: TODO 2.3 placeholder
 
-### Privacy policy + ToS custom (7.4)
-- Non template generici
-- Specifici per marketplace agent-mediato
-- Coperti AI Act, GDPR, eIDAS, Consumer Rights Directive
+### ~~Privacy policy + ToS custom (7.4)~~ — Privacy DONE in [7.4.4]
+- ✅ Privacy policy V0 draft completata in `[7.4.4]`: `docs/PRIVACY_POLICY.md` (350 righe, italiano, GDPR-structured) + endpoint `/api/legal/privacy`.
+- 🔲 ToS / Termini di Servizio: ANCORA TBD (separato concern, non scritto V0).
+- ⚠ Privacy V0 è DRAFT — review legale obbligatoria pre-launch (vedi entry "🚨 BLOCKER: Privacy policy + ToS legal review pre-launch" nella sezione "Privacy / GDPR (V0.5+ pre-launch)" in cima al file).
 
 ### Cookie banner / consent management
 - Anche se ZK-by-design riduce PII, serve comunque per email marketing, analytics

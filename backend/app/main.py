@@ -17,6 +17,7 @@ from app.api import (
     health as health_routes,
     identity as identity_routes,
     intents as intent_routes,
+    legal as legal_routes,
     mandates as mandate_routes,
     matches as match_routes,
     negotiations as negotiation_routes,
@@ -110,6 +111,7 @@ app.include_router(negotiation_routes.router)
 app.include_router(deal_routes.router)
 app.include_router(notification_routes.router)
 app.include_router(health_routes.router)
+app.include_router(legal_routes.router)
 app.include_router(_test_endpoints.router)
 app.include_router(_dev_endpoints.router)
 
