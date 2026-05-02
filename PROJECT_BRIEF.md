@@ -315,14 +315,23 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - ✅ 6.3.c apscheduler tick discovery + rate limiting + daily cost cap
 - Integration test orchestrator + step-up resume cycle (vedi IDEAS_BACKLOG)
 
-### 🔄 FASE 7 — Hardening & ship
+### ✅ FASE 7 — Hardening & ship — COMPLETE
+
+Tag: `v0-backend-fase-7-complete` · Commits: 11 · Test: 370 → 498 (+128) · Vedi PROGRESS.md "FASE 7 COMPLETE" entry per closure narrative.
 
 - ✅ 7.0 Frontend-ready hardening (slowapi rate limiting, CORS, /api/health, CI, OpenAPI minimal)
 - ✅ 7.0.1 WebAuthn `webauthn_origin` default localhost:8000 → :3000 (hotfix da integrazione frontend e2e)
 - ✅ 7.1 Rate limiting deep (per-user caps) + content moderation + abuse detection logging. Redis storage e X-Forwarded-For trust deferred (single-server V0, flagged in IDEAS_BACKLOG).
 - ✅ 7.2 Observability (Prometheus + 11 custom metrics, OpenTelemetry SDK + manual spans agent, structlog trace_id correlation, k8s liveness/readiness probes)
 - ✅ 7.3 Cost monitoring + per-user soft cap (composite PK `daily_cost_tracking`, `anthropic_pricing` service, soft cap $0.50/day, 3 Prometheus metrics)
-- 🔲 7.4 Pre-launch checklist (refresh token rotation, JWT secret rotation, email DB-level partial unique, KMS reale)
+- ✅ 7.4 Pre-launch checklist (5/5 sub-task):
+  - ✅ 7.4.0 Schema reconciliation pass (23 drift resolved, future autogenerate clean — proven 3× post-7.4.0)
+  - ✅ 7.4.1 KMS reale per-agent custody (AES-256-GCM envelope encryption, db-backed)
+  - ✅ 7.4.2 Refresh token rotation + reuse detection (opaque DB-backed, parent_id chain, audit + metric su reuse)
+  - ✅ 7.4.3 JWT secret rotation overlap window (current/previous pattern, zero-downtime, founder procedure)
+  - ✅ 7.4.4 Privacy policy GDPR draft IT/EU (350 righe + endpoint + 11 IDEAS_BACKLOG entries, 1 BLOCKER pre-launch)
+
+**Pre-launch BLOCKER** (V0.5+ alpha esterno): privacy policy + ToS legal review da avvocato italiano specializzato GDPR (~€1500-3500 EUR). Vedi IDEAS_BACKLOG categoria "Privacy / GDPR (V0.5+ pre-launch)".
 
 ### 🔲 FASE 8 — TRADE bilaterale (V1)
 

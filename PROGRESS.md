@@ -2370,3 +2370,110 @@ Privacy V0 baseline:
 ### Prossima task
 
 **[7.4.5+] FASE 7 closure** (~30-45 min residui): test consolidation finale + PROGRESS entry "FASE 7 complete" + PROJECT_BRIEF flip + tag `v0-backend-fase-7-complete`.
+
+---
+
+## 🎯 FASE 7 COMPLETE — Backend production-grade for V0 alpha — 2026-05-02
+
+**Status**: Backend FASE 7 chiusa. Production-ready per V0 alpha tester deployment. Pre-launch alpha esterno richiede review legale GDPR (BLOCKER documentato in IDEAS_BACKLOG).
+
+### Sub-fasi shipped
+
+| # | Sub-fase | Commit | Test delta | Highlight |
+|---|---|---|---|---|
+| 7.0 | Pre-frontend hardening | `b2e2083` | +0 (370 baseline) | slowapi rate limiting, CORS, /api/health, CI, OpenAPI minimal |
+| 7.0.1 | WebAuthn origin hotfix | `4fbb995` | +0 | localhost:8000 → :3000 fix da integrazione frontend e2e |
+| 7.1 | Rate limiting deep + moderation + abuse detection | `7d170a7` | +59 | Per-user caps, ProfanityModeration, sequential email detection, audit hooks |
+| 7.2 | Observability foundation | `8cf07c9` | +27 | Prometheus 11 custom metrics, OpenTelemetry SDK + manual spans agent, structlog trace_id correlation, k8s liveness/readiness probes |
+| 7.3 | Cost monitoring + per-user soft cap | `ff13ed2` | +8 | Composite PK `daily_cost_tracking`, `anthropic_pricing` service, soft cap $0.50/day per-user, hard cap $50/day global, 3 Prometheus metrics |
+| 7.4.0 | Schema reconciliation pass | `55716f0` | +0 | 23 drift resolved, two-layer defaults, future autogenerate clean (proven 3× post-7.4.0) |
+| 7.4.1 | KMS reale per-agent custody | `74d8f5d` | +13 | AES-256-GCM envelope encryption, db-backed `kms_agent_keys`, KMSProvider abstract (V0.5+ AWS swap) |
+| 7.4.1.fix | Hotfix CI: hermetic KMS_MASTER_KEY in conftest | `f8712e1` | 0 | Bug latent intercepted: tests non hermetici rispetto a env var |
+| 7.4.2 | Refresh token rotation + reuse detection | `5516b2b` | +7 | Opaque random tokens, parent_id chain, atomic rotation con SELECT FOR UPDATE, audit + Prometheus su reuse |
+| 7.4.3 | JWT secret rotation overlap window | `5de1695` | +10 | current/previous secret pattern, fallback metric, 145-line founder procedure |
+| 7.4.4 | Privacy policy GDPR draft | `5c527c4` | +4 | 350-line italiano, /api/legal/privacy endpoint, 11 IDEAS_BACKLOG entries (1 BLOCKER) |
+
+**Test count progression**: 370 → **498** (+128 totali)
+**Commits FASE 7**: 11 (10 sub-task + 1 hotfix)
+**Tag**: `v0-backend-fase-7-complete`
+
+### Capacità backend post-FASE 7
+
+#### Security
+- WebAuthn auth (Tier 0 anonymous + Tier 1+2 verified)
+- Rate limiting per-user keyed (4 bucket settings)
+- Content moderation (25-term blacklist + typed exception hierarchy)
+- Abuse detection (sequential email pattern, IP-keyed, audit trail)
+- KMS production-grade (AES-256-GCM envelope encryption, master key from env, hard-fail validation in lifespan)
+- Refresh token rotation (parent_id chain, reuse detection invalidates entire chain, atomic commit con audit)
+- JWT secret rotation (zero-downtime overlap window, ExpiredSignatureError short-circuit, founder procedure documented)
+- Audit log centralized (`SecurityActions` + `AuthActions` + `AgentActions` + `MandateActions` + `DealActions`)
+
+#### Observability
+- Prometheus 14+ custom metrics (`vifaras_*` namespace): signup/login, rate limit, moderation, intents, matches, deals, agent API calls, scheduler tick, cost tracking, refresh reuse, JWT decode fallback
+- OpenTelemetry SDK + auto-instrumentation HTTP/DB/HTTPX + manual spans agent semantici
+- Structlog trace_id correlation (auto-injected su active span)
+- Health probes Kubernetes-ready (`/api/health/live` + `/ready`)
+
+#### Cost protection
+- Per-user daily soft cap ($0.50/day default)
+- Global daily hard cap ($50/day kill switch)
+- Per-turn cost tracking (Anthropic pricing pluggable)
+- Cap-hit audit + Prometheus counter (anomaly signal)
+
+#### Data discipline
+- Schema reconciliation completed (23 drift resolved, two-layer defaults preserved)
+- 3 migration consecutive post-7.4.0 (kms_agent_keys, refresh_tokens, future) producono autogenerate clean — pattern definitively proven
+- Self-FK + partial index + JSONB defaults tutti gestiti correttamente da autogenerate
+
+#### Legal compliance V0
+- Privacy policy draft GDPR-compliant IT/EU (350 righe)
+- `/api/legal/privacy` endpoint (public, no auth, GDPR transparency Art. 12-14)
+- `/api/legal/privacy/version` metadata endpoint
+- 11 IDEAS_BACKLOG V0.5+ entries (1 BLOCKER: legal review pre-launch ~€1500-3500 EUR)
+- 17 occorrenze `[TBD pre-launch]` flagged esplicit in policy text per chiarezza review legale
+- 8 mitigations Privacy by Design Art. 25 enumerate (truncation 300, pseudonymisation, AES-GCM, hash-only refresh, step-up biometric, audit, rate limit, cost cap)
+
+### Disciplina di processo preservata FASE 7
+
+- **Schema reconciliation as first-class step** ([7.4.0]): debt cleanup pre-emptive ha sbloccato 3 migration successive con autogenerate clean. ROI alto, pattern preservato come standard pre-major-feature work.
+- **Discovery-first per ogni sub-task densa**: catched mismatch architetturale Pattern X vs Y in [7.4.1] (KMS per-agent vs shared signing keys), data minimization già in place [7.4.4.2] (DESCRIPTION_TRUNCATE_CHARS), settings caching anti-pattern in [7.4.1.fix].
+- **Stop-gate strict tra sub-task**: no shortcut, ogni decisione architetturale validata da founder. Bug field naming `kms_master_key_b64` intercettato in [7.4.1.3] boot verify, hotfix CI [7.4.1.fix] ha catchato test non hermetici.
+- **OR-pattern future-proof in test assertions**: lock contract semantico, no textual exact match. Test continuano a passare a V0.5+ deploy senza rotture al primo update.
+- **Exception carry metadata** (Opzione A pattern in [7.4.2.5]): canonical Python idiom, niente extra DB round-trip per audit hooks.
+- **Documentation as artifact founder-facing**: `JWT_ROTATION_PROCEDURE.md` + `PRIVACY_POLICY.md` scritte per "stressed-future-self", verbose intentional su high-risk operational ops.
+
+### Deferred a V0.5+ pre-launch
+
+#### 🚨 Critical BLOCKER
+- Privacy policy + ToS legal review pre-launch (€1500-3500 EUR avvocato italiano specializzato GDPR + diritto digitale)
+
+#### High priority
+- Self Protocol real integration (current backend usa placeholder verifier — entry IDEAS_BACKLOG)
+- DPA inventory (Anthropic + OpenAI + Self Protocol + hosting V0.5+ + email service V0.5+)
+- DPO designation se Article 37 trigger raggiunto
+- GDPR right exercise endpoints (Art. 15-22 — 5 endpoints, 12-16h)
+- ToS / Termini di Servizio text (separato concern V0.5+)
+
+#### Refinements (90+ entries IDEAS_BACKLOG)
+- Auth tokens hardening: `kid` header, automation rotation, KMS asymmetric (V1+)
+- KMS hardening: AWS/Vault/GCP swap, granular exception hierarchy
+- Privacy/GDPR: DB-backed versioning, user acceptance log, breach notification procedure
+- Conftest settings caching refactor (anti-pattern intercepted in [7.4.1.fix])
+- TZ-naive datetime audit codebase-wide
+- Concurrent refresh load test harness
+
+### Status check post-closure
+
+- ✅ Backend FASE 1-6: feature-complete (registrazione + identity + mandate + intent + match + negotiation + deal + orchestrator + step-up)
+- ✅ Backend FASE 7.0-7.4: production-grade hardening (rate limit + moderation + observability + cost cap + KMS + refresh rotation + JWT rotation + privacy policy)
+- ✅ Frontend FASE 10.0: tag `v0-frontend-auth-alive` (auth flow login/register Tier 0)
+- 🔲 Frontend FASE 10.1+: Tier 1+2 onboarding + intent + match + deal signing UI
+- 🔲 FASE 8+: Self Protocol real integration (post-discovery [10.1.0]), TRADE bilaterale V1
+- 🔲 V0.5+ pre-launch: legal review BLOCKER + DPA inventory + GDPR endpoints + breach procedure
+
+**Next decision point**: post-tag, decide direction (FASE 8 Self real OR Frontend FASE 10.1.x continuation OR alternative).
+
+### Prossima task
+
+**TBD founder** post-tag `v0-backend-fase-7-complete`. Backend in pausa pending direction decision.
