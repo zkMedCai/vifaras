@@ -43,7 +43,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.logging import log
 from app.models.schema import Agent, User
-from app.services import audit_service, kms_service
+from app.services import audit_service
+from app.services.kms import get_kms
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +383,9 @@ async def upgrade_user_to_tier_1(
 
     # 6. Generate the agent keypair via KMS. Done BEFORE mutating user fields
     #    so a KMS failure leaves the open transaction with no pending writes
-    #    (rollback is a no-op). For V0 file-based KMS this is microseconds.
-    pubkey_b64, kms_ref = await kms_service.generate_agent_keypair()
+    #    (rollback is a no-op). The KMS row is staged on the same `db` session,
+    #    so it commits atomically with the Agent insert below.
+    kms_ref, pubkey_b64 = await get_kms().generate_agent_keypair(db)
 
     # 7. Mutate user.
     user.nullifier_hash = verified.nullifier_hash

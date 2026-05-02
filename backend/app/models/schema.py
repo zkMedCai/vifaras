@@ -717,3 +717,37 @@ class DailyCostTracking(Base):
         # for the per-user lookup.
         Index("ix_daily_cost_user_date", "user_id", "date"),
     )
+
+
+# ============================================================================
+# KMS LAYER
+# ============================================================================
+
+
+class KMSAgentKey(Base):
+    """Per-agent ed25519 privkey, AES-256-GCM-encrypted at rest ([7.4.1]).
+
+    Owned exclusively by `app.services.kms.local_db_provider.LocalDBProvider`.
+    No other service reads this table; callers see only the opaque
+    `Agent.privkey_kms_ref` string ("db:<id>") returned from `generate_agent_keypair`.
+
+    No FK from here back to Agent (or vice versa): the kms_ref is opaque from
+    the Agent's perspective, mirroring how a future `aws:<arn>` ref would also
+    have no relational tie. Trade-off: cascade delete is not automatic — if
+    Agent rows are ever deleted (V0.5+), an explicit `revoke()` hook will need
+    to clean these rows. V0 has no Agent deletion path, so the orphan risk is
+    deferred (entry in IDEAS_BACKLOG).
+    """
+    __tablename__ = "kms_agent_keys"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # AES-GCM ciphertext of the 32-byte ed25519 private key. Tag is appended.
+    privkey_encrypted = Column(LargeBinary, nullable=False)
+    # 12-byte random nonce; never reused with the same master key.
+    nonce = Column(LargeBinary, nullable=False)
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        server_default=func.now(),
+    )

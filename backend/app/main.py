@@ -31,12 +31,14 @@ from app.core.rate_limit import limiter, rate_limit_exceeded_handler
 from app.core.telemetry import setup_telemetry, shutdown_telemetry
 from app.services import agent_scheduler, match_scheduler
 from app.services.content_moderation import ModerationError
+from app.services.kms.encryption import validate_master_key
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     log.info("app.startup", env=settings.app_env, name=settings.app_name)
+    validate_master_key()  # hard-fail if KMS_MASTER_KEY missing or malformed
     setup_telemetry(app)
     match_scheduler.start_scheduler()
     agent_scheduler.start_scheduler()

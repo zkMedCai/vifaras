@@ -76,10 +76,13 @@ class Settings(BaseSettings):
     self_verifier_scope: str = "marketplace-it-v0"
     self_verifier_timeout_seconds: float = 10.0
 
-    # V0 stub for the agent-keypair custody seam. Real KMS (AWS/GCP) is V1.
-    # File-based: per-agent JSON in `.secrets/agent_keys/<agent_id>.json`.
-    # Path is relative to the repo root (cwd at uvicorn boot).
-    kms_keys_dir: str = ".secrets/agent_keys"
+    # KMS envelope encryption ([7.4.1]). Per-agent ed25519 privkeys are
+    # AES-256-GCM-encrypted at rest in `kms_agent_keys`; this is the master
+    # key as a base64-encoded 32-byte value. Validated at lifespan startup —
+    # missing or wrong-size = hard fail (no soft default). Bootstrap with
+    # `openssl rand -base64 32`. V0.5+ replaces the env var with cloud KMS
+    # Encrypt/Decrypt; the master key never enters the process.
+    kms_master_key: str = ""
 
     # Agent scheduler (6.3.c): in-process apscheduler that ticks agents
     # with pending work. Disabled by default in tests (lifespan-driven so

@@ -12,7 +12,7 @@ from app.core.db import get_db
 from app.core.rate_limit import limiter
 from app.core.security import CurrentUser, create_access_token, require_tier
 from app.services import identity_service
-from app.services.kms_service import KMSError
+from app.services.kms import KMSError
 
 router = APIRouter(prefix="/api/identity", tags=["identity"])
 

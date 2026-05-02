@@ -145,7 +145,7 @@ async def test_tier_0_can_upgrade_to_tier_1_happy_path(
     assert agent is not None
     assert agent.status == "pending_mandate"
     assert agent.pubkey == body["agent_pubkey"]
-    assert agent.privkey_kms_ref.startswith("file:")
+    assert agent.privkey_kms_ref.startswith("db:")
 
     # Verifier was called exactly once with the expected scope and userIdentifier.
     assert len(self_verifier_mock.calls) == 1
@@ -389,13 +389,14 @@ async def test_atomic_rollback_on_agent_creation_failure(
 
     # KMS keygen explodes. The proof has already been verified by Self,
     # but no user fields should have been mutated and no agent should exist.
-    from app.services import kms_service
+    from app.services.kms import KMSError
 
-    async def _boom() -> tuple[str, str]:
-        raise kms_service.KMSError("simulated KMS outage")
+    async def _boom(self, db) -> tuple[str, str]:
+        raise KMSError("simulated KMS outage")
 
     monkeypatch.setattr(
-        "app.services.kms_service.generate_agent_keypair", _boom
+        "app.services.kms.local_db_provider.LocalDBProvider.generate_agent_keypair",
+        _boom,
     )
 
     response = await client.post(

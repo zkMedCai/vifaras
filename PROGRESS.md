@@ -1952,3 +1952,96 @@ Eliminato il drift latente accumulato tra `schema.py` e DB live. Reconciliation 
 ### Prossima task
 
 **[7.4.1] KMS reale implementation** — replace mock KMS con cloud-managed (AWS KMS / GCP KMS / Hashicorp Vault). Migration probabile per `kms_keys` table (versioning + rotation history). Brief denso atteso.
+
+---
+
+## [7.4.1] kms reale: per-agent envelope encryption + db-backed custody — 2026-05-02
+
+### Discovery — finding architetturale critico
+
+Brief originale assumeva Pattern X (shared signing keys per-purpose: jwt/mandate/deal con versioning). Discovery ha rivelato realtà del codebase = Pattern Y (per-agent ed25519 identity custody, 1 keypair per user, file-based JSON plaintext via `kms_service.py` stub). Brief revised post-escalation: scope = production-readiness del KMS per-agent attuale, niente shared signing keys (rinviati a [7.4.3] JWT rotation). Catch ha salvato 1-2h refactor sbagliato.
+
+### Cosa è stato fatto
+
+#### Architettura (`backend/app/services/kms/` package)
+- `interface.py` — `KMSProvider` ABC + `KMSError` typed exception. 2 metodi astratti: `generate_agent_keypair(db)` e `sign(db, kms_ref, message)`. Entrambi prendono `AsyncSession` per transactional consistency col caller (la KMS row commit atomica con Agent insert).
+- `encryption.py` — AES-256-GCM envelope encryption via `cryptography.hazmat.primitives.ciphers.aead.AESGCM`. `load_master_key()` (decode + validate length 32B), `validate_master_key()` (lifespan probe, raise-only), `encrypt(plaintext) -> (ciphertext, nonce)` (fresh 12B nonce/call), `decrypt(ciphertext, nonce)` (`InvalidTag` → `KMSError` con messaggio generico, no leakage failure mode).
+- `local_db_provider.py` — `LocalDBProvider`: genera ed25519 raw, encrypta privkey, INSERT su `kms_agent_keys`, `db.flush()` per autoincrement id senza commit, ritorna `("db:<id>", pubkey_b64url_nopad)`. `sign()` parsea ref, `db.get()` row, decrypta, firma raw bytes.
+- `__init__.py` — `get_kms()` singleton lazy + `load_pubkey_b64()` utility sync (pure function, NON sull'interface — polymorphism evitato per identità across providers).
+
+#### Schema + migration
+- `KMSAgentKey` model in `schema.py` (sezione "KMS LAYER" nuova al fondo): id PK autoincrement, privkey_encrypted bytea NOT NULL, nonce bytea NOT NULL, created_at timestamp NOT NULL DEFAULT now(). Niente FK to/from Agent — `kms_ref` è opaque dal lato Agent (mirror del futuro `aws:<arn>` pattern). Orphan risk su Agent deletion deferito a IDEAS_BACKLOG (V0.5+).
+- Migration `0fa63545292d_add_kms_agent_keys_table.py`: **prima migration post-[7.4.0] reconciliation** — autogenerate ha prodotto **ZERO spurious diff**, solo `op.create_table('kms_agent_keys', ...)` + downgrade reverse. ROI di [7.4.0] confermato empiricamente.
+
+#### Config + lifespan
+- `config.py`: rimosso `kms_keys_dir: str = ".secrets/agent_keys"` (pattern legacy file-based), aggiunto `kms_master_key: str = ""` (base64 32-byte master key da env var `KMS_MASTER_KEY`).
+- `main.py`: `validate_master_key()` chiamato in lifespan dopo `configure_logging()`, prima di `setup_telemetry`. Hard-fail su missing/wrong-size/non-base64.
+
+#### Refactor callsites
+- `identity_service.py`: import diretto da `app.services.kms`, callsite `kms_service.generate_agent_keypair()` → `await get_kms().generate_agent_keypair(db)`. Tuple ordering allineato a interface: `(kms_ref, pubkey_b64)` (era `(pubkey_b64, kms_ref)`).
+- `api/identity.py`: `from app.services.kms import KMSError` (era `from app.services.kms_service`).
+- `tests/test_identity.py`: mock target su `LocalDBProvider.generate_agent_keypair` con signature `(self, db)`. Assertion `agent.privkey_kms_ref.startswith("file:")` aggiornata a `"db:"` (catched da full-suite run).
+- `kms_service.py` legacy: `git rm` (orphan post-refactor, zero importatori verificato).
+
+#### Operational
+- `scripts/cleanup_legacy_kms_keys.py`: idempotent cleanup `.secrets/agent_keys/`. Usa structlog (`app.core.logging`) per audit footprint con `removed_files=N` + `path=...`. Eseguito una volta: rimossi **196 file JSON** (test residue accumulato cross-session, non solo founder #0001 — anti-pattern test isolation pre-[7.4.1]).
+- Master key bootstrap operativo: `openssl rand -base64 32` → `KMS_MASTER_KEY` in `.env` gitignored.
+
+### Bug catched durante esecuzione
+
+**Field naming pydantic-settings mismatch**: field iniziale `kms_master_key_b64` faceva pydantic-settings cercare env var `KMS_MASTER_KEY_B64`, ma docs/error message/`.env` usavano `KMS_MASTER_KEY`. Bug silente che sarebbe esploso al primo run reale (env var ignored → default `""` → hard fail al lifespan). Fix: rename field a `kms_master_key` (suffix `_b64` ridondante, docstring documenta format). Step 3 boot verify ha catturato il bug — conferma valore disciplina "verify ogni step manuale".
+
+### Test scritti / coverage
+
+Pre-7.4.1: 464 test. Post-7.4.1: **477 test** (delta +13).
+
+| Test funzione | Param cases | Coverage |
+|---|---|---|
+| `test_generate_keypair_returns_db_ref_and_pubkey` | 1 | Tuple shape: `db:<id>` ref + 32B raw ed25519 pubkey |
+| `test_generate_keypair_persists_encrypted_in_db` | 1 | Encryption-at-rest contract: ciphertext == 48B (32 plaintext + 16 GCM tag) |
+| `test_sign_and_verify_roundtrip` | 1 | Full E2E: generate → sign → `pubkey.verify()` non raise |
+| `test_sign_with_unknown_id_raises` | 1 | `db:99999999` → `KMSError("not found")` |
+| `test_sign_with_malformed_ref_raises` | 5 | Bad scheme/id: 5 parametrizzazioni coprono branch `_parse_ref` |
+| `test_sign_with_wrong_master_key_raises` | 1 | Master key swap post-generate → `KMSError("authentication tag mismatch")` |
+| `test_validate_master_key_rejects_invalid` | 3 | Empty / wrong-size 16B / non-base64 |
+| **Total delta** | **+13** | |
+
+`pytest backend/tests/` → 477 passed in 16.46s.
+
+### Decisioni V0 documentate
+
+- **Pattern Y (per-agent custody) confermato vs Pattern X (shared signing keys)**: Pattern X resta in scope per [7.4.3] JWT rotation. Scope discipline preservata.
+- **AES-256-GCM via `cryptography` library** (already dep). Authenticated encryption con auth tag inline al ciphertext.
+- **Hard fail su master key missing** (Decisione C confermata, no soft default V0).
+- **Drop+recreate keypair** (V0 dev consistency con [7.3.2], [7.4.0]). Founder ri-fa tier upgrade a 30s. Niente data migration cross-format file→DB encrypted (risk surface per beneficio asimmetrico).
+- **`KMSError` typed exception** invece di `RuntimeError`. V0.5+ refinement possibile: granular hierarchy (`KMSMasterKeyError`, `KMSDecryptError`, `KMSNotFoundError`).
+- **`load_master_key()` non cached**: re-read ogni encrypt/decrypt. V0 KMS ops rare (~1/tier upgrade). V0.5+ cache se `sign()` diventa hot path (caveat in docstring).
+- **`db.flush()` in `generate_agent_keypair`** senza commit: boundary commit caller-controlled. Atomicità garantita via session rollback se KMS insert fallisce.
+- **`load_pubkey_b64()` NON sull'interface**: pure function (no IO, no provider state), identica across providers. Polymorphism evitato dove non serve. Vive a livello package come utility sync.
+- **Tuple ordering `(kms_ref, pubkey_b64)`**: deliberate flip dall'esistente `(pubkey_b64, kms_ref)`. Brief revised explicit, primary identifier first.
+- **Cleanup legacy in script separato** invece di inline lifespan: cleanup migration-style sono one-shot, non vanno in startup persistente. Pattern coerente con `scripts/seed_dev.py`.
+
+### Schema reconciliation [7.4.0] verified
+
+**Empirical proof**: prima migration post-reconciliation autogenerate ha prodotto **ZERO spurious diff**. Solo `op.create_table('kms_agent_keys', ...)` come atteso. Pattern filter manuale `[7.1.5]`/`[7.3.2]` confermato eliminato — future migration produce clean output direttamente applicabile.
+
+### Blocker / dubbi
+
+- **`COST_USER_DAILY_USD` gauge cross-restart**: irrilevante per KMS, ma ricordato come pattern simile (in-memory observability vs DB source of truth).
+- **`sign()` placeholder mai usato a runtime**: implementato + testato comunque per FASE 5+ A2A messaging quando V0.5+. Non hardenarlo significava stub plaintext — anti-pattern.
+- **Granular KMS exception hierarchy**: V0 single `KMSError` OK. V0.5+ refinement quando call site discrimine error type per recovery logic.
+
+### Cosa significa "FASE 7.4.1 completa"
+
+Per-agent KMS production-grade end-to-end:
+- **Pluggable provider**: V0.5+ AWS KMS / Vault / GCP swap = nuovo provider class implementing `KMSProvider`, niente refactor caller.
+- **Encryption-at-rest**: privkey ed25519 mai plaintext su filesystem post-migration. AES-256-GCM authenticated encryption, master key from env (V0.5+ cloud KMS).
+- **Atomic transaction**: KMS row + Agent row commit/rollback insieme via shared `AsyncSession`.
+- **Hard-fail validation**: backend rifiuta boot senza master key configurata (no silent fallback con dev key).
+- **Test coverage**: 13 test parametrizzati coprono happy path + 5 malformed ref scenarios + key mismatch + lifespan validation.
+
+477 test verdi. **FASE 7.4.1 chiusa**. Resta FASE 7.4.2-4 (refresh rotation + JWT rotation + privacy policy, 6-10h totali).
+
+### Prossima task
+
+**[7.4.2] refresh token rotation** (1-2h). Pattern: ogni use del refresh token genera nuovo refresh + invalida vecchio. Detection di token reuse (concurrent use con stesso refresh = signal di compromise). Brief denso atteso.

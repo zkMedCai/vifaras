@@ -6,6 +6,89 @@
 
 ---
 
+## Categoria: KMS hardening (V0.5+)
+
+### KMS provider AWS / Vault / GCP swap
+
+**Trigger**: deploy production con multi-replica scaling.
+
+**Background**: V0 `LocalDBProvider` con envelope encryption AES-256-GCM. Master key in env var = OK dev su single host, ma single point of failure per production. Cloud KMS preserves separation of concerns: encryption key never touches application memory (Encrypt/Decrypt API).
+
+**Action V0.5+**:
+- Implement `AWSKMSProvider` con boto3 + KMS Encrypt/Decrypt API (alternativa: `VaultProvider`, `GCPKMSProvider`)
+- Master key vive in cloud KMS, application never sees it
+- Migration backend keys da Local-encrypted a cloud-KMS-encrypted (re-encrypt loop su `kms_agent_keys` table)
+- Setting `kms_provider: str = "local" | "aws" | "vault" | "gcp"` con factory dispatch in `app.services.kms.__init__.get_kms()`
+
+**Effort**: 4-6 ore (provider impl + migration script + integration test).
+
+---
+
+### Agent keypair cleanup orphan post-deletion
+
+**Trigger**: V0.5+ implementation di user/agent deletion logic (V0 niente Agent.delete() path).
+
+**Background**: V0 niente FK cascade da Agent a `kms_agent_keys` (deliberate — `kms_ref` opaque). Se Agent viene cancellato, KMSAgentKey resta orphan in DB. Niente immediate impact (storage trascurabile) ma è debt accumulato.
+
+**Action V0.5+**:
+- Pre-delete hook: `await kms.revoke(agent.privkey_kms_ref)` prima di `db.delete(agent)`
+- `KMSProvider.revoke(db, kms_ref)` aggiunto all'interface
+- `LocalDBProvider.revoke()`: hard delete row OR status='revoked' (compliance signal)
+- Audit trail: `SecurityActions.KMS_REVOKE` constant + log entry
+- Bonus: scheduled job che identifica orphan rows (`kms_agent_keys` senza Agent.privkey_kms_ref matching) per cleanup retroattivo
+
+**Effort**: 30-60 min.
+
+---
+
+### KMS access audit logging
+
+**Trigger**: pre-launch alpha esterno o GDPR compliance review.
+
+**Background**: V0 niente audit per chi accede a quale privkey quando. Per compliance (es. user demanda chi ha firmato cosa), serve trail. `sign()` è ancora placeholder (zero callsite V0), ma quando FASE 5+ A2A messaging lo cabla audit diventa requirement.
+
+**Action V0.5+**:
+- `SecurityActions.KMS_SIGN` + `KMS_GENERATE` constants
+- Audit log entry su ogni `sign()` call: actor_user_id, kms_ref, timestamp, message_hash (sha256 del payload, no plaintext)
+- Audit log entry su `generate_agent_keypair`: user_id, kms_ref creato
+- Query audit per user_id → discovery legale "what did this user sign and when"
+
+**Effort**: 1 ora (audit hooks + test).
+
+---
+
+### Granular `KMSError` hierarchy
+
+**Trigger**: caller code che vuole discrimine error type per recovery logic.
+
+**Background**: V0 single `KMSError` OK — caller (`identity_service`) tratta tutto come 500 + transaction rollback. V0.5+ se introduciamo retry logic, fallback path, alerting per categoria error → granular hierarchy facilita.
+
+**Action V0.5+**:
+- `KMSMasterKeyError` (lifespan validation, missing/wrong-size master key — startup-only)
+- `KMSDecryptError` (auth tag mismatch, key rotation senza re-encrypt — alerting trigger)
+- `KMSKeyNotFoundError` (`db.get` returns None — possibly orphan or DB drift)
+- `KMSRefError` (malformed `kms_ref` parsing — caller bug signal)
+- Tutti subclass di `KMSError` (backward compat: existing `except KMSError` continua a funzionare)
+
+**Effort**: 30 min (refactor exception classes + test update).
+
+---
+
+### `load_master_key` cache for hot signing path
+
+**Trigger**: `sign()` diventa hot path (es. A2A messaging frequente, V0.5+).
+
+**Background**: V0 `load_master_key()` re-decoda + valida settings ogni call. KMS ops V0 sono rare (~1/tier upgrade), zero performance impact. V0.5+ se `sign()` cabla A2A messaging che fanno multipli sign per tick, base64 decode per call diventa overhead misurable.
+
+**Action V0.5+**:
+- Module-level `_cached_master_key: bytes | None = None`
+- Test fixture invalidation: `clear_master_key_cache()` helper chiamato in `fresh_master_key` fixture teardown
+- Threading consideration: GIL protegge module-global assignment, niente lock necessario
+
+**Effort**: 30 min (cache + invalidation + test fixture update).
+
+---
+
 ## Categoria: Provider linking (V1.5+)
 
 ### OAuth "Collega Claude"
