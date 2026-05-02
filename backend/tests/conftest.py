@@ -26,13 +26,29 @@ settings before the container is up.
 """
 from __future__ import annotations
 
+import base64
 import os
+import secrets
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
 from testcontainers.postgres import PostgresContainer
+
+
+# Hermetic default master key for the whole test session. Set BEFORE any
+# `app.*` import so the cached `Settings()` instance picks it up. Without
+# this, any test that boots the lifespan (TestClient(app)) or exercises the
+# KMS path (tier-1 upgrade → generate_agent_keypair) hard-fails on the
+# `validate_master_key` probe in environments that don't ship a `.env`
+# (notably CI). Per-test isolation is still available via the
+# `fresh_master_key` fixture in test_kms.py — it monkeypatches over this
+# default.
+os.environ.setdefault(
+    "KMS_MASTER_KEY",
+    base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+)
 
 
 # ---------------------------------------------------------------------------
