@@ -12,6 +12,7 @@ from sqlalchemy import text
 from app.api import (
     _dev_endpoints,
     _test_endpoints,
+    agents as agents_routes,
     auth as auth_routes,
     deals as deal_routes,
     health as health_routes,
@@ -103,6 +104,7 @@ _instrumentator.instrument(app).expose(app, endpoint="/metrics", include_in_sche
 
 app.include_router(auth_routes.router)
 app.include_router(identity_routes.router)
+app.include_router(agents_routes.router)
 app.include_router(mandate_routes.router)
 app.include_router(step_up_routes.router)
 app.include_router(intent_routes.router)
