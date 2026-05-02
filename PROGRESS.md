@@ -2045,3 +2045,117 @@ Per-agent KMS production-grade end-to-end:
 ### Prossima task
 
 **[7.4.2] refresh token rotation** (1-2h). Pattern: ogni use del refresh token genera nuovo refresh + invalida vecchio. Detection di token reuse (concurrent use con stesso refresh = signal di compromise). Brief denso atteso.
+
+---
+
+## [7.4.1.fix] hotfix CI: hermetic KMS_MASTER_KEY in conftest — 2026-05-02
+
+CI rosso post-[7.4.1] push: 4 test failuti (3 in `test_identity` tier-upgrade + 1 in `test_pre_frontend` lifespan via `TestClient(app)`) per `KMSError: KMS_MASTER_KEY env var not set`. Locale era mascherato dal `.env` con master key, CI no.
+
+**Fix**: `backend/tests/conftest.py` +16 righe — `os.environ.setdefault("KMS_MASTER_KEY", base64.b64encode(secrets.token_bytes(32)).decode())` al module top, prima di qualsiasi `app.*` import. Per-test isolation rimane via `fresh_master_key` fixture in `test_kms.py`.
+
+**Verifica**: `env -u KMS_MASTER_KEY uv run pytest backend/tests/` → 477 passed (simulando CI).
+
+**Commit**: `f8712e1`. CI verde post-push.
+
+**Lezione**: per "hard-fail su env var" feature, run tests SENZA quella env var prima di pushare. Pattern preservato: simulating CI condition è step disciplinare, non opzionale.
+
+**Bonus finding non bloccante**: scoperto bug latente settings caching in conftest — `_pg_container` setta `POSTGRES_*` env vars MA `app.core.config.settings` è già cached da test collection time. Risultato: `alembic upgrade head` runa contro DB locale, non testcontainer. Tests funzionano per via di transactional rollback, ma è anti-pattern. Entry IDEAS_BACKLOG aggiunta (V0.5+ refactor).
+
+---
+
+## [7.4.2] refresh token rotation + reuse detection — 2026-05-02
+
+### Discovery — Scenario A pieno
+
+Refresh flow funzionale ma JWT-only stateless, niente DB-backed token, niente rotation. Comment esplicito in `auth_service.refresh_access_token:426` rivelava DESIGN_QUESTIONS DQ-25 "rotation deferred to V1" — questa sub-task chiude quel debt esplicitamente.
+
+### Cosa è stato fatto
+
+#### Architettura — refresh come opaque DB-backed
+- **Token format flip**: JWT stateless → opaque random URL-safe (`secrets.token_urlsafe(32)`, ~43 chars, ~256 bit entropy). Server stora solo SHA-256 hex digest — DB compromise non yieldha token usabili.
+- **Schema** `refresh_tokens` table (migration `99d1cbef5405`): id (UUID PK), user_id (FK CASCADE), token_hash (varchar 64 UNIQUE), parent_id (self-FK), status ('active'|'consumed'|'revoked' default 'active'), expires_at, created_at (default now()), consumed_at. Partial index `WHERE status='active'` per "active sessions per user" V0.5+ "logout all devices".
+- **Service** `app/services/refresh_token_service.py` (single-file flat, ~155 lines): `issue_refresh_token`, `consume_refresh_token`, `_invalidate_user_tokens`, 5 typed exception (RefreshTokenError base + NotFound/Expired/AlreadyConsumed/Revoked).
+- **Pessimistic lock** `SELECT FOR UPDATE` durante consume: 2 request concorrenti sullo stesso token serializzano. Una vince rotation, l'altra cade nel reuse-detection path. Niente race window.
+- **Status check ordering** in `consume_refresh_token`: revoked → consumed (reuse) → expired. Reuse beats expiry intenzionale — leaked-token replay post-expiry è ancora compromise signal.
+- **V0 simplification reuse detection**: `_invalidate_user_tokens` revoke ALL active/consumed tokens per user (single-device assumption alpha). Recursive CTE chain-only deferred a V0.5+ multi-device (IDEAS_BACKLOG).
+
+#### API surface refactor
+- **Setting rename** `jwt_refresh_ttl_days` → `refresh_token_ttl_days` (suffix legacy post-format change, naming clarity). Comment `"opaque, DB-backed since [7.4.2]"` per future maintainer.
+- **Response shape change** `/api/auth/refresh`: `RefreshResponse` aggiunto field `refresh_token`. **Breaking change frontend-side** — entry IDEAS_BACKLOG per FASE 10.1.x update.
+- **2 callsite refactor** `complete_registration:270` + `complete_login:411`: `create_refresh_token` JWT helper → `await issue_refresh_token(db, user_id=...)` + `await db.commit()` (terza transazione, coerente con triple-commit pattern esistente per failure isolation).
+- **`refresh_access_token` riscritto**: signature `→ tuple[str, str, int]` (3-tuple), maps `RefreshTokenAlreadyConsumed` → `RefreshTokenReuse(AuthError)`, maps `RefreshTokenError` → `InvalidRefreshToken`. User active check post-consume con `_invalidate_user_tokens` cascade su user inactive.
+
+#### Audit + metric (security signal)
+- **`SecurityActions.REFRESH_TOKEN_REUSE`** in `audit_service.py` con commento esplicito su semantic compromise.
+- **Prometheus counter** `vifaras_refresh_token_reuse_total` in `core/metrics.py` (sezione Security). Niente labels — global aggregate, per-user breakdown via audit log query (coerente pattern [7.3.4] `USER_COST_CAP_HITS_TOTAL`).
+- **Hook in API endpoint** `/api/auth/refresh`: `except auth_service.RefreshTokenReuse as exc:` PRIMA del generic AuthError catch — stage audit row + counter.inc() + commit (chain revoke + audit insert in singolo transaction atomic) + raise via `_to_http(exc)`.
+- **Exception carry metadata** (Opzione A): `RefreshTokenAlreadyConsumed.__init__(*, user_id, revoked_count)` + `RefreshTokenReuse.__init__(*, user_id, revoked_count)`. Audit hook accede senza extra DB round-trip.
+- **Commit boundary spostato a API layer** per reuse path: chain invalidation + audit row in singolo transaction. Service success path mantiene commit interno (coerente con `complete_registration` / `complete_login` pattern).
+
+#### Cleanup legacy
+- `core/security.py`: rimosso `create_refresh_token` (12 lines), `decode_refresh_token` (2 lines), constante `_KIND_REFRESH`, `import secrets` (era usato solo da removed helpers). Module docstring aggiornato per documentare "refresh tokens are NOT JWT — opaque DB-backed via refresh_token_service".
+- **3 test esistenti refactored** (Path 2 — refactor + lock new contract):
+  - `test_auth.py`: rimosso import `decode_refresh_token`; assertion JWT-decode su refresh → assertion shape opaque (`isinstance(str)`, `len >= 32`); aggiunta `rbody["refresh_token"] != body["refresh_token"]` per lock rotation contract.
+  - `test_rate_limit_deep.py:404` (`test_user_key_falls_back_when_token_uses_wrong_kind`): `create_refresh_token` → hand-craft JWT inline con `pyjwt.encode({"kind": "refresh"}, ...)` per esercitare stessa branch fallback.
+  - `test_tier_gating.py:127` (rinominato a `test_non_access_jwt_used_as_access_returns_401`): stesso pattern. Naming preciso post-format change.
+
+### Bug catched durante esecuzione
+
+**Field naming pydantic-settings mismatch**: `kms_master_key_b64` field cercava env var `KMS_MASTER_KEY_B64` ma docs dicevano `KMS_MASTER_KEY`. Catched in [7.4.1.3] boot verify, fixed in [7.4.1.fix] hotfix. **Pattern preventivo per V0.5+**: audit `core/config.py` per field naming convention compliance. IDEAS_BACKLOG entry aggiunta.
+
+### Test scritti / coverage
+
+Pre-7.4.2: 477 test. Post-7.4.2: **484 test** (delta +7, zero regression).
+
+| Test | Param | Coverage |
+|---|---|---|
+| `test_issue_refresh_token_returns_plaintext_and_id` | 1 | Plaintext returned, hash stored ≠ plaintext, parent_id None su issue iniziale |
+| `test_consume_rotates_atomically` | 1 | Old → consumed, new → active, parent_id link, user_id surfaced |
+| `test_consume_expired_token_raises` | 1 | Forced past expires_at → `RefreshTokenExpired` |
+| `test_consume_revoked_token_raises` | 1 | Manual revoked → `RefreshTokenRevoked` |
+| `test_consume_unknown_token_raises` | 1 | Random token → `RefreshTokenNotFound` |
+| `test_reuse_detection_invalidates_chain` | 1 | Replay consumed → `RefreshTokenAlreadyConsumed` con metadata, all user tokens revoked |
+| `test_refresh_endpoint_emits_audit_and_metric_on_reuse` | 1 | API endpoint replay → 401 + audit row + counter inc, atomic commit |
+| **Total delta** | **+7** | |
+
+`pytest backend/tests/` → 484 passed in 17.25s (run time invariato).
+
+### Decisioni V0 documentate
+
+- **Token format opaque random** vs JWT — opaque (RFC 6749 best practice + simpler reuse detection structure DB-side + niente leakage metadati su JWT readable client-side).
+- **Service file location single-file flat** vs package — single-file (~155 lines, scope-fit; coerente con `cost_tracking_service.py`, `anthropic_pricing.py`).
+- **Reuse detection scope V0 simplification** (revoke ALL user tokens) vs full recursive CTE — simplification per V0 single-device alpha (false positive multi-device acceptable, pre-launch fix se servirà). Recursive CTE in IDEAS_BACKLOG V0.5+.
+- **Concurrent refresh test skipped V0**: PG row lock empirically affidabile, test concurrent in pytest = friction sproporzionata. IDEAS_BACKLOG V0.5+ con load testing harness (k6/locust).
+- **Refresh TTL 30 giorni**: default OAuth2 standard, balance UX (alpha tester comodo) vs security (rotation rate acceptable).
+- **Exception carry metadata** (Opzione A): `user_id` + `revoked_count` nell'exception per audit hook senza extra DB round-trip. Pythonic idiom.
+- **Triple commit pattern preservato** (user + audit + refresh in transazioni separate): coerente con disciplina pre-esistente "audit in second transaction so a failing audit can't roll back the durable user".
+- **Status check ordering reuse > expiry**: deliberate priority. Leaked-token replay post-expiry è compromise signal, non routine "expired".
+- **`_seed_user` helper inline test_refresh_token_rotation.py** vs nuova fixture conftest: scope locale, niente conftest pollution. Promote a conftest se cross-file V0.5+.
+- **Hand-craft JWT inline** per cross-kind tests: niente reintroduzione di `create_refresh_token` solo per esigenze test. Test rispetta architecture change.
+- **Decisione 4 audit scope**: skip audit per `UserNotActive` / `InvalidRefreshToken` — V0 audit only per high-signal compromise event (`REUSE`). Pattern: audit log per anomaly events, non per expected user errors.
+
+### Schema reconciliation [7.4.0] verified
+
+**Empirical proof terza migration**: `99d1cbef5405_add_refresh_tokens_table.py` autogenerate produce **ZERO spurious diff**. Solo `op.create_table('refresh_tokens', ...)` + 1 `op.create_index` partial. Self-FK `parent_id` correctly emitted by autogenerate, niente manual adjustment. Pattern definitively proven cross-migration.
+
+### Blocker / dubbi
+
+- **Frontend impact pendente**: `/api/auth/refresh` response shape cambiata (aggiunto `refresh_token` field). Frontend FASE 10.1.x dovrà aggiornare `RefreshResponse` type + auth store per persistere new refresh. IDEAS_BACKLOG entry V0.5+ per coordinarlo.
+- **Granular `RefreshTokenError` hierarchy**: V0 5 typed exception OK. V0.5+ refinement se servirà ulteriore branching su API error code.
+- **Concurrent refresh test V0.5+**: skipped V0 (vedi sopra).
+
+### Cosa significa "FASE 7.4.2 completa"
+
+Refresh token production-grade end-to-end:
+- **Format hardening**: opaque random + SHA-256 at rest. DB compromise non yieldha token usabili.
+- **Rotation**: ogni consume → new active + old consumed, parent_id chain visualizzabile.
+- **Reuse detection**: replay → entire user chain revoked + 401 + audit + Prometheus counter.
+- **Atomicity**: pessimistic lock + atomic commit (chain revoke + audit in singolo transaction).
+- **Test coverage**: 7 test parametrizzati coprono lifecycle + edge cases + endpoint integration con audit/metric.
+
+484 test verdi. **FASE 7.4.2 chiusa**. Resta FASE 7.4.3-4 (JWT secret rotation overlap window + privacy policy custom GDPR-compliant, 2-4h totali).
+
+### Prossima task
+
+**[7.4.3] JWT secret rotation overlap window** (1-2h). Pattern: `current_secret` + `previous_secret` overlap, transition period per zero-downtime rotation. Brief denso atteso.

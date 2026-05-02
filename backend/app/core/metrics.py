@@ -45,6 +45,13 @@ RATE_LIMIT_HITS_TOTAL = Counter(
     ["endpoint"],
 )
 
+REFRESH_TOKEN_REUSE_TOTAL = Counter(
+    "vifaras_refresh_token_reuse_total",
+    "Refresh token reuse detection events. Each event is a potential attack "
+    "signal — the whole user token chain was revoked. Per-user breakdown via "
+    "audit log query (action=refresh_token_reuse).",
+)
+
 MODERATION_REJECTIONS_TOTAL = Counter(
     "vifaras_moderation_rejections_total",
     "Total content-moderation rejections (HTTP 422 responses).",

@@ -124,12 +124,23 @@ async def test_garbage_token_returns_401(http_client) -> None:
 
 
 @pytest.mark.db
-async def test_refresh_token_used_as_access_returns_401(http_client) -> None:
-    """Cross-kind reuse must fail at the boundary (kind discriminator)."""
-    from app.core.security import create_refresh_token
+async def test_non_access_jwt_used_as_access_returns_401(http_client) -> None:
+    """Cross-kind reuse must fail at the boundary (kind discriminator).
 
-    refresh = create_refresh_token(user_id="u-xyz")
-    http_client.headers["Authorization"] = f"Bearer {refresh}"
+    Pre-[7.4.2] used `create_refresh_token` (refresh was a JWT). Post-[7.4.2]
+    refresh is opaque, so we hand-craft a JWT with `kind != 'access'` to
+    exercise the same boundary check.
+    """
+    import jwt as pyjwt
+
+    from app.core.config import settings
+
+    bad_kind_jwt = pyjwt.encode(
+        {"sub": "u-xyz", "kind": "refresh"},
+        settings.jwt_secret,
+        algorithm=settings.jwt_alg,
+    )
+    http_client.headers["Authorization"] = f"Bearer {bad_kind_jwt}"
     try:
         resp = await http_client.get("/api/_test/tier0")
         assert resp.status_code == 401

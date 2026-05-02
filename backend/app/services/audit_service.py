@@ -135,6 +135,10 @@ class SecurityActions:
     # Anomaly signal worth review (recurrent hits = a stuck agent or a
     # user with abnormal usage that may need outreach).
     USER_COST_CAP_REACHED: Final[str] = "user_cost_cap_reached"
+    # 7.4.2: refresh token reuse detection. A consumed (rotated) token was
+    # presented again — likely compromise (token leaked + replayed). The
+    # whole user token chain has been revoked; user must re-authenticate.
+    REFRESH_TOKEN_REUSE: Final[str] = "refresh_token_reuse"
 
 
 class AuthActions:

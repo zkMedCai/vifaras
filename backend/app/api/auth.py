@@ -24,8 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
+from app.core.metrics import REFRESH_TOKEN_REUSE_TOTAL
 from app.core.rate_limit import limiter
-from app.services import auth_service
+from app.services import audit_service, auth_service
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -148,6 +149,7 @@ class RefreshRequest(BaseModel):
 
 class RefreshResponse(BaseModel):
     access_token: str
+    refresh_token: str
     expires_in_seconds: int
     token_type: str = "bearer"
 
@@ -159,16 +161,36 @@ async def refresh(
     body: RefreshRequest,
     db: AsyncSession = Depends(get_db),
 ) -> RefreshResponse:
-    """Exchange a refresh token for a fresh access token.
+    """Rotate the refresh token + return a fresh access token.
 
-    The new access token reflects the user's CURRENT tier (read from DB),
-    not the tier embedded in the refresh JWT — so a user promoted via
-    Self verification mid-session gets the right token without re-login.
+    The presented refresh is consumed; the response carries a brand-new
+    refresh that the client MUST persist (the old one is now invalid). The
+    access token reflects the user's CURRENT tier from the DB — a user
+    promoted mid-session via Self gets the right tier without re-login.
     """
     try:
-        new_access, ttl = await auth_service.refresh_access_token(
+        new_access, new_refresh, ttl = await auth_service.refresh_access_token(
             db, refresh_token=body.refresh_token
         )
+    except auth_service.RefreshTokenReuse as exc:
+        # Compromise signal: stage audit + bump counter, then commit so the
+        # audit row and the chain invalidation (staged inside the service)
+        # land atomically.
+        actor_ip = request.client.host if request.client else None
+        await audit_service.log_security_event(
+            db,
+            action=audit_service.SecurityActions.REFRESH_TOKEN_REUSE,
+            user_id=exc.user_id,
+            actor_ip=actor_ip,
+            params={"revoked_count": exc.revoked_count},
+        )
+        REFRESH_TOKEN_REUSE_TOTAL.inc()
+        await db.commit()
+        raise _to_http(exc) from exc
     except auth_service.AuthError as exc:
         raise _to_http(exc) from exc
-    return RefreshResponse(access_token=new_access, expires_in_seconds=ttl)
+    return RefreshResponse(
+        access_token=new_access,
+        refresh_token=new_refresh,
+        expires_in_seconds=ttl,
+    )

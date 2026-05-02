@@ -751,3 +751,69 @@ class KMSAgentKey(Base):
         default=datetime.utcnow,
         server_default=func.now(),
     )
+
+
+# ============================================================================
+# AUTH TOKENS LAYER
+# ============================================================================
+
+
+class RefreshToken(Base):
+    """Server-side refresh token state ([7.4.2]).
+
+    Refresh tokens are opaque random strings (`secrets.token_urlsafe(32)`);
+    only their SHA-256 hex digest is stored, so a DB compromise does not yield
+    usable tokens. Each consume rotates: the row flips to `consumed`, a new
+    `active` row is inserted with `parent_id` pointing at the consumed one.
+
+    A reuse hit (a `consumed` row presented again) is treated as a compromise
+    signal — the V0 response is to revoke every active/consumed token for the
+    user. Chain-only invalidation via recursive CTE is deferred to V0.5+ when
+    multi-device sessions become real (entry in IDEAS_BACKLOG).
+    """
+    __tablename__ = "refresh_tokens"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # SHA-256 hex digest of the opaque token; 64 chars.
+    token_hash = Column(String(64), nullable=False, unique=True)
+    # Self-FK back to the row this token rotated from (None on the initial
+    # token issued at register/login).
+    parent_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("refresh_tokens.id"),
+        nullable=True,
+    )
+    # 'active' (usable) | 'consumed' (rotated, retained for reuse detection)
+    # | 'revoked' (explicitly invalidated, e.g. reuse hit on the chain).
+    status = Column(
+        String(20),
+        nullable=False,
+        default="active",
+        server_default=text("'active'"),
+    )
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        server_default=func.now(),
+    )
+    # Lifecycle endpoint timestamp: set when status flips to 'consumed' (rotation)
+    # OR 'revoked' (explicit revoke / reuse-cascade). One column for both since
+    # 'active → consumed → revoked' is monotonic — no terminal state can be
+    # re-entered.
+    consumed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        # Active sessions per user (V0.5+ "logout all devices" reads this).
+        Index(
+            "ix_refresh_tokens_user_active",
+            "user_id",
+            postgresql_where=text("status = 'active'"),
+        ),
+    )

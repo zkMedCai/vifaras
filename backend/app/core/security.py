@@ -1,11 +1,14 @@
 """JWT-backed tokens + tier-gating dependency for FastAPI.
 
-All tokens encode with the same secret/algorithm from settings but carry
+All JWTs here encode with the same secret/algorithm from settings but carry
 distinct `kind` claims and TTLs:
 
 - access     (15 min) — `{sub, tier, kind="access", iat, exp}`
-- refresh    (30 days) — `{sub, kind="refresh", jti, iat, exp}`
 - challenge  (5 min) — `{challenge, user_id, email, purpose, kind="challenge", iat, exp}`
+
+Refresh tokens are NOT JWT — since [7.4.2] they are opaque DB-backed strings
+issued and consumed via `app.services.refresh_token_service`. The opaque shape
+lets the server own the lifecycle (rotation, reuse detection, revoke).
 
 The challenge token is the stateless seam between WebAuthn begin/complete
 endpoints (and, in 2.5, the step-up signature flow under `kind="step_up"`).
@@ -21,7 +24,6 @@ which is a different failure class.
 from __future__ import annotations
 
 import base64
-import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
@@ -32,7 +34,6 @@ from fastapi import Header, HTTPException
 from app.core.config import settings
 
 _KIND_ACCESS = "access"
-_KIND_REFRESH = "refresh"
 _KIND_CHALLENGE = "challenge"
 
 CHALLENGE_TTL_SECONDS = 300
@@ -81,25 +82,6 @@ def create_access_token(*, user_id: str, tier: int) -> str:
 
 def decode_access_token(token: str) -> dict[str, Any]:
     return _decode(token, expected_kind=_KIND_ACCESS)
-
-
-def create_refresh_token(*, user_id: str) -> str:
-    now = _now()
-    return _encode(
-        {
-            "sub": user_id,
-            "kind": _KIND_REFRESH,
-            "jti": secrets.token_urlsafe(16),
-            "iat": int(now.timestamp()),
-            "exp": int(
-                (now + timedelta(days=settings.jwt_refresh_ttl_days)).timestamp()
-            ),
-        }
-    )
-
-
-def decode_refresh_token(token: str) -> dict[str, Any]:
-    return _decode(token, expected_kind=_KIND_REFRESH)
 
 
 # ---------------------------------------------------------------------------

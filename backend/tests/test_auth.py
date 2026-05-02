@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
-from app.core.security import decode_access_token, decode_refresh_token
+from app.core.security import decode_access_token
 from app.models.schema import User
 
 
@@ -97,11 +97,10 @@ async def test_register_tier_0_returns_jwt_and_persists_anonymous_user(
     assert access["tier"] == 0
     assert access["kind"] == "access"
 
-    # Refresh token decodes too
-    refresh = decode_refresh_token(body["refresh_token"])
-    assert refresh["sub"] == body["user_id"]
-    assert refresh["kind"] == "refresh"
-    assert refresh["jti"]
+    # Refresh token is opaque (DB-backed since [7.4.2]), not a JWT — assert
+    # only its on-the-wire shape: a non-empty URL-safe string.
+    assert isinstance(body["refresh_token"], str)
+    assert len(body["refresh_token"]) >= 32
 
 
 @pytest.mark.db
@@ -231,6 +230,10 @@ async def test_refresh_returns_new_access_token(
     rbody = refresh_resp.json()
     assert rbody["token_type"] == "bearer"
     assert rbody["expires_in_seconds"] == 15 * 60
+    # Refresh rotation: response carries a new refresh, distinct from the one
+    # the client just spent. Old token is now consumed; replay would be a
+    # reuse hit.
+    assert rbody["refresh_token"] != body["refresh_token"]
     decoded = decode_access_token(rbody["access_token"])
     assert decoded["sub"] == body["user_id"]
     assert decoded["tier"] == 0  # current tier

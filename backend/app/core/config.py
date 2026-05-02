@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-dev-and-always-rotate-in-prod"
     jwt_alg: str = "HS256"
     jwt_access_ttl_min: int = 15
-    jwt_refresh_ttl_days: int = 30
+    refresh_token_ttl_days: int = 30  # opaque, DB-backed since [7.4.2]
 
     webauthn_rp_id: str = "localhost"
     webauthn_rp_name: str = "Marketplace V0"

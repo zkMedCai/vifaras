@@ -402,12 +402,22 @@ def test_user_key_falls_back_to_ip_when_scheme_not_bearer():
 
 
 def test_user_key_falls_back_when_token_uses_wrong_kind():
-    """A refresh token (kind=refresh) decoded as access must fall back —
-    the `_decode` strict-kind check rejects it."""
-    from app.core.security import create_refresh_token
+    """A JWT with kind != 'access' must fall back — the `_decode` strict-kind check rejects it.
 
-    refresh = create_refresh_token(user_id=str(uuid.uuid4()))
+    Pre-[7.4.2] this used `create_refresh_token` (refresh was a JWT then);
+    post-[7.4.2] refresh is opaque DB-backed, so we hand-craft a JWT with a
+    non-access kind to exercise the same fallback branch.
+    """
+    import jwt as pyjwt
+
+    from app.core.config import settings
+
+    bad_kind_jwt = pyjwt.encode(
+        {"sub": str(uuid.uuid4()), "kind": "refresh"},
+        settings.jwt_secret,
+        algorithm=settings.jwt_alg,
+    )
     req = _request_with_headers(
-        [(b"authorization", f"Bearer {refresh}".encode())]
+        [(b"authorization", f"Bearer {bad_kind_jwt}".encode())]
     )
     assert user_key(req) == "203.0.113.42"

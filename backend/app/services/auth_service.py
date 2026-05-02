@@ -41,11 +41,11 @@ from app.core.security import (
     challenge_bytes_from_token_payload,
     create_access_token,
     create_challenge_token,
-    create_refresh_token,
     decode_challenge_token,
 )
 from app.models.schema import AuditLog, User
 from app.services import audit_service
+from app.services.refresh_token_service import issue_refresh_token
 
 
 # ^([a-z]+)\d+@ — captures the leading-letters prefix of a "name + digits"
@@ -99,6 +99,23 @@ class InvalidRefreshToken(AuthError):
 class UserNotActive(AuthError):
     code = "user_not_active"
     http_status = 403
+
+
+class RefreshTokenReuse(AuthError):
+    """Refresh token reuse detected — chain has been invalidated.
+
+    Carries `user_id` (chain owner) and `revoked_count` (tokens nuked) for the
+    API layer to record on the security audit row. Chain invalidation is
+    staged but NOT committed when this is raised — caller commits after
+    staging the audit row in the same transaction.
+    """
+    code = "refresh_token_reuse"
+    http_status = 401
+
+    def __init__(self, *, user_id: str, revoked_count: int) -> None:
+        super().__init__(f"refresh token reuse: user_id={user_id}")
+        self.user_id = user_id
+        self.revoked_count = revoked_count
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +284,8 @@ async def complete_registration(
     SIGNUP_COMPLETED_TOTAL.inc()
 
     access = create_access_token(user_id=user_id, tier=0)
-    refresh = create_refresh_token(user_id=user_id)
+    refresh, _ = await issue_refresh_token(db, user_id=user_id)
+    await db.commit()
     return user_id, access, refresh
 
 
@@ -408,7 +426,8 @@ async def complete_login(
     LOGIN_COMPLETED_TOTAL.inc()
 
     access = create_access_token(user_id=user.id, tier=user.tier)
-    refresh = create_refresh_token(user_id=user.id)
+    refresh, _ = await issue_refresh_token(db, user_id=user.id)
+    await db.commit()
     return user.id, access, refresh
 
 
@@ -419,34 +438,53 @@ async def complete_login(
 
 async def refresh_access_token(
     db: AsyncSession, *, refresh_token: str
-) -> tuple[str, int]:
-    """Exchange a refresh token for a fresh access token.
+) -> tuple[str, str, int]:
+    """Rotate refresh token + mint a fresh access token.
 
-    Returns `(new_access_token, ttl_seconds)`. The refresh token itself
-    is unchanged in V0 (rotation deferred to V1 — DESIGN_QUESTIONS DQ-25).
+    Returns `(new_access_token, new_refresh_token, access_ttl_seconds)`. The
+    presented refresh token is consumed and replaced — clients MUST persist
+    `new_refresh_token` and discard the previous one.
 
-    Crucially the new access token carries the *current* `user.tier` from
-    the DB, not the tier embedded in the refresh JWT. Otherwise a user
-    promoted to tier 1 mid-session via Self verification would keep being
-    issued tier-0 tokens until their refresh expires.
+    The access token carries the *current* `user.tier` from the DB so a user
+    promoted via Self verification mid-session gets the right tier without
+    re-login.
+
+    Maps `refresh_token_service` exceptions onto the `AuthError` hierarchy:
+      - `RefreshTokenAlreadyConsumed` → `RefreshTokenReuse` (compromise signal,
+        chain already revoked inside `consume_refresh_token`)
+      - `RefreshTokenNotFound | Expired | Revoked` → `InvalidRefreshToken`
+      - User row missing or `status != 'active'` → `UserNotActive` after the
+        whole token chain is revoked
     """
-    from app.core.security import decode_refresh_token
+    from app.services.refresh_token_service import (
+        RefreshTokenAlreadyConsumed,
+        RefreshTokenError,
+        _invalidate_user_tokens,
+        consume_refresh_token,
+    )
 
     try:
-        payload = decode_refresh_token(refresh_token)
-    except Exception as exc:
+        new_refresh, _new_id, user_id = await consume_refresh_token(db, refresh_token)
+    except RefreshTokenAlreadyConsumed as exc:
+        # Chain invalidation is staged on the session — caller (API layer)
+        # commits AFTER recording the security audit row in the same tx.
+        raise RefreshTokenReuse(
+            user_id=exc.user_id, revoked_count=exc.revoked_count
+        ) from exc
+    except RefreshTokenError as exc:
         raise InvalidRefreshToken(str(exc)) from exc
 
-    user_id: str | None = payload.get("sub")
-    if not user_id:
-        raise InvalidRefreshToken("missing sub claim")
-
-    user = await db.scalar(select(User).where(User.id == user_id))
-    if user is None:
-        raise InvalidRefreshToken("user no longer exists")
-    if user.status != "active":
-        raise UserNotActive(f"user.status={user.status!r}")
+    user = await db.get(User, user_id)
+    if user is None or user.status != "active":
+        # Token was valid but user can no longer use it. Revoke everything to
+        # prevent the just-issued new token from working either.
+        await _invalidate_user_tokens(db, user_id=user_id)
+        await db.commit()
+        raise UserNotActive(
+            f"user.status={user.status if user else 'missing'!r}"
+        )
 
     new_access = create_access_token(user_id=user.id, tier=user.tier)
     ttl_seconds = settings.jwt_access_ttl_min * 60
-    return new_access, ttl_seconds
+    await db.commit()
+    return new_access, new_refresh, ttl_seconds

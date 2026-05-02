@@ -6,6 +6,74 @@
 
 ---
 
+## Categoria: Auth tokens hardening (V0.5+)
+
+### Refresh token reuse detection: chain-only invalidation (V0.5+ multi-device)
+
+**Trigger**: V0.5+ alpha esterno con user multi-device reali.
+
+**Background**: V0 [7.4.2] simplification: reuse detection invalida ALL active/consumed tokens for user. False positive su multi-device legitimate (un compromise su mobile revoca anche desktop session).
+
+**Action V0.5+**:
+- PostgreSQL recursive CTE per walk `parent_id` chain a root + descendants
+- Invalidate solo tokens nella chain compromise, niente collateral damage su sessioni altre device
+- Test esplicito multi-device scenario (insert 2 chain root distinti per stesso user, verify reuse su una non tocca l'altra)
+
+**Effort**: 1-2 ore (CTE + test isolation per device).
+
+---
+
+### Concurrent refresh load test (V0.5+ pre-launch)
+
+**Trigger**: pre-launch alpha con load testing infrastructure.
+
+**Background**: V0 [7.4.2] usa `SELECT FOR UPDATE` row lock per atomicity rotation. Pattern PostgreSQL standard, empirically affidabile, ma test concurrent in pytest = friction sproporzionata (race reproduction non-deterministica per design).
+
+**Action V0.5+**:
+- Setup k6/locust scenario "user calls /api/auth/refresh con stesso token in parallel N times"
+- Verify: solo 1 success, N-1 fails con lock conflict (PG returns specific error code o serialization failure)
+- Verify: niente orphan token state in DB post-test
+- Verify: il vincitore ha rotation completa (old=consumed, new=active)
+
+**Effort**: 1-2 ore (harness setup + scenario + assertions).
+
+---
+
+### Settings field naming convention audit (V0.5+ pre-launch)
+
+**Trigger**: pre-launch alpha o emergence di un altro bug field naming inconsistency.
+
+**Background**: pydantic-settings convention `field_name` → env var `FIELD_NAME` (uppercase). Discrepancies introducono bug silenti — env var ignored, default value triggered, hard-fail al lifespan o silent misbehavior.
+
+Catched 2 volte in FASE 7.4:
+- `[7.4.1]`: `kms_master_key_b64` field cercava `KMS_MASTER_KEY_B64` ma docs/error message dicevano `KMS_MASTER_KEY`. Emerged solo durante boot verify [7.4.1.3], hotfix in `[7.4.1.fix]`.
+- `[7.4.2]`: `jwt_refresh_ttl_days` setting nome legacy post-format change (refresh non più JWT). Rinominato durante refactor.
+
+**Action V0.5+**:
+- Audit `core/config.py` per field naming convention compliance + env var docs alignment
+- Pre-commit hook `python -c "from app.core.config import Settings; Settings()"` per intercettare regressioni che breakano boot
+- Documentation block in config.py docstring sul mapping convention
+
+**Effort**: 30 min audit + 30 min hook setup.
+
+---
+
+### Conftest settings caching: testcontainer effective vs LOCAL DB shadow (V0.5+ refactor)
+
+**Trigger**: scoperto durante diagnosi `[7.4.1.fix]`. Non bloccante per V0 ma anti-pattern test isolation.
+
+**Background**: `_pg_container` fixture setta `POSTGRES_*` env vars MA `app.core.config.settings` è già instanziato durante test collection (test files importano `app.services.*` → chain a `app.core.config`). Risultato: `alembic upgrade head` durante `_pg_container` runa contro DB **locale** (settings cached con localhost values), non testcontainer effective. Tests funzionano per via di transactional rollback su outer transaction, ma è anti-pattern (test pollute local DB).
+
+**Action V0.5+**:
+- Set `POSTGRES_*` env vars BEFORE conftest imports any `app.*` module
+- Alternative: `pytest_plugins` mechanism per controllo init order
+- Verify post-refactor che testcontainer è effective (e.g. assertion che inserted row visibile in testcontainer non in local DB)
+- Test count invariate
+
+**Effort**: 1-2 ore (refactor conftest + verify isolation).
+
+---
+
 ## Categoria: KMS hardening (V0.5+)
 
 ### KMS provider AWS / Vault / GCP swap
@@ -119,12 +187,29 @@
 
 ---
 
+## Categoria: Frontend coordination
+
+### Refresh token rotation update (V0.5+ post-[7.4.2] backend)
+
+**Trigger**: backend `[7.4.2]` pushato (commit on main). Prossimo lavoro frontend FASE 10.1.x.
+
+**Background**: V0 frontend refresh flow legge solo `access_token` da `/api/auth/refresh` response. Post-[7.4.2], endpoint ritorna `{access_token, refresh_token, expires_in_seconds, token_type}` — il refresh è ruotato a ogni use. Se il frontend continua a riusare il vecchio refresh token, il secondo refresh hit triggererà reuse-detection → chain revoked → user forced to re-login.
+
+**Action**:
+- Update `RefreshResponse` TypeScript type in frontend a `{access_token, refresh_token, expires_in_seconds, token_type}`
+- Update auth store action: persiste new `refresh_token` post-rotation (sostituire stored value, non riusare il vecchio)
+- Verify flow E2E: login → refresh → check stored refresh ≠ initial → next refresh use new (NON il vecchio, che ora è 'consumed')
+- Bonus: handle 401 con `code: refresh_token_reuse` → forced logout UX (chain revoked, sessione invalidata)
+
+**Effort**: 30 min (1 type + 1 store action + 1 test E2E + 1 error handler).
+
+---
+
 ## Categoria: Sicurezza / Auth
 
-### Refresh token rotation (V1+)
-- Pattern security best practice: nuovo refresh ad ogni use, blocklist su reuse
-- Riferimento: DQ-25
-- Trigger threshold: ~500 utenti registrati
+### ~~Refresh token rotation (V1+)~~ — DONE in [7.4.2]
+- ✅ Implementato in `[7.4.2]`: opaque random token + DB-backed `refresh_tokens` table + rotation on consume + reuse detection con chain invalidation + audit + Prometheus counter.
+- Risolto DQ-25.
 
 ### Email DB-level partial unique index (7.x)
 - Convertire email uniqueness da app-level a DB-level
