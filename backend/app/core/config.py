@@ -105,11 +105,19 @@ class Settings(BaseSettings):
     # Stale-intent threshold: agents idle longer than this with active
     # intents get a periodic refresh tick (low-priority signal).
     agent_scheduler_stale_hours: int = 6
-    # Daily kill-switch: when today's `daily_cost_tracking.total_cost_usd`
-    # crosses this, the scheduler stops dispatching for the rest of the
-    # UTC day. V0 conservative default; bump in production once cost
-    # patterns stabilise.
+    # Daily kill-switch (HARD CAP, global): when today's cumulative spend
+    # across all users >= this value, the scheduler stops dispatching for
+    # the rest of the UTC day. Protects against runaway/infinite-loop
+    # bugs that would burn through the Anthropic budget. Hit = system-wide
+    # outage until UTC midnight reset. V0 conservative default; bump in
+    # production once cost patterns stabilise.
     max_daily_llm_cost_usd: float = 50.0
+    # Per-user soft cap: when an individual user's spend today >= this
+    # value, the scheduler skips that user's tick. Other users continue
+    # normally. Protects against single-user blow-up scenarios (e.g. an
+    # agent stuck in a tool-use loop on one user's intent). Reset at UTC
+    # midnight (the daily_cost_tracking row keys on UTC date).
+    daily_user_cost_cap_usd: float = 0.50
 
     # CORS (7.0): comma-separated origin list (env var
     # `CORS_ALLOWED_ORIGINS=https://a.com,https://b.com`). Pydantic v2

@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.agents.orchestrator import _upsert_daily_cost
+from app.services.cost_tracking_service import upsert_daily_cost
 from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.models.schema import Agent
@@ -250,7 +250,14 @@ async def test_api_health_returns_structured_payload(http_client):
 async def test_api_health_today_cost_reflects_upserts(
     async_db_session, http_client
 ):
-    await _upsert_daily_cost(async_db_session, cost_usd=0.42)
+    # Health snapshot reads SUM cross-user; one user_id is enough to
+    # exercise the path post-7.3.2 (composite PK).
+    user_id, _, _ = await setup_active_mandate_async(
+        async_db_session, email=f"hc-cost-{uuid.uuid4().hex[:6]}@x.com"
+    )
+    await upsert_daily_cost(
+        async_db_session, user_id=user_id, cost_usd=0.42
+    )
     await async_db_session.commit()
 
     r = await http_client.get("/api/health")

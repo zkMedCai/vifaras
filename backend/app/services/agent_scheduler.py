@@ -45,9 +45,9 @@ from app.core.config import settings
 from app.core.db import AsyncSessionLocal
 from app.core.logging import log
 from app.core.rate_limiter import TickRateLimiter
+from app.services import audit_service, cost_tracking_service
 from app.models.schema import (
     Agent,
-    DailyCostTracking,
     Deal,
     Intent,
     Mandate,
@@ -323,11 +323,17 @@ def compute_priority_score(
 
 
 async def get_today_cost_usd(db: AsyncSession) -> float:
-    """Return today's cumulative LLM spend, or 0.0 if no row yet."""
-    row = await db.get(DailyCostTracking, _today_utc())
-    if row is None:
-        return 0.0
-    return float(row.total_cost_usd)
+    """Return today's cumulative LLM spend (cross-user sum).
+
+    Thin alias over `cost_tracking_service.get_today_cost_usd`. The
+    function lives here for backward compatibility with [6.3.c] callers
+    (`_dev_endpoints`, internal kill-switch). Implementation moved out
+    in [7.3.2] when the table grew a `user_id` column and a single-row
+    read by date no longer holds the global aggregate.
+    """
+    from app.services import cost_tracking_service
+
+    return await cost_tracking_service.get_today_cost_usd(db)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +392,7 @@ async def discover_and_dispatch_ticks(
     from app.core.metrics import (
         SCHEDULER_LAST_TICK_TIMESTAMP,
         SCHEDULER_TICK_TOTAL,
+        USER_COST_CAP_HITS_TOTAL,
     )
 
     orch = orchestrator or _get_default_orchestrator()
@@ -395,6 +402,7 @@ async def discover_and_dispatch_ticks(
         "discovered": 0,
         "dispatched": 0,
         "rate_limited": 0,
+        "cost_capped": 0,
         "skipped_daily_cap": False,
         "today_cost_usd": 0.0,
     }
@@ -415,37 +423,73 @@ async def discover_and_dispatch_ticks(
                 return summary
 
             candidates = await discover_tick_candidates(db)
+            summary["discovered"] = len(candidates)
+            if not candidates:
+                log.info("scheduler.no_candidates")
+                SCHEDULER_TICK_TOTAL.labels(status="success").inc()
+                SCHEDULER_LAST_TICK_TIMESTAMP.set(time.time())
+                return summary
 
-        summary["discovered"] = len(candidates)
-        if not candidates:
-            log.info("scheduler.no_candidates")
-            SCHEDULER_TICK_TOTAL.labels(status="success").inc()
-            SCHEDULER_LAST_TICK_TIMESTAMP.set(time.time())
-            return summary
+            log.info(
+                "scheduler.discovery_complete",
+                count=len(candidates),
+                top_priorities=[c.priority_score for c in candidates[:5]],
+            )
 
-        log.info(
-            "scheduler.discovery_complete",
-            count=len(candidates),
-            top_priorities=[c.priority_score for c in candidates[:5]],
-        )
-
-        for candidate in candidates:
-            acquired = await rl.acquire()
-            if not acquired:
-                summary["rate_limited"] = len(candidates) - summary["dispatched"]
-                log.warning(
-                    "scheduler.rate_limit_hit",
-                    remaining=summary["rate_limited"],
+            # Soft cap check + dispatch happen inside the same session so
+            # the per-candidate `get_user_cost_today` query and the audit
+            # row on cap-hit share one connection. The dispatched ticks
+            # themselves spawn their own sessions (orchestrator opens
+            # `AsyncSessionLocal()` per tick), so this session lifetime
+            # only covers the discovery/check loop.
+            for candidate in candidates:
+                user_cost = await cost_tracking_service.get_user_cost_today(
+                    db, user_id=candidate.user_id
                 )
-                break
+                if user_cost >= settings.daily_user_cost_cap_usd:
+                    log.info(
+                        "scheduler.user_cost_cap_reached",
+                        user_id=candidate.user_id,
+                        agent_id=candidate.agent_id,
+                        today_cost_usd=user_cost,
+                        cap_usd=settings.daily_user_cost_cap_usd,
+                    )
+                    await audit_service.log_security_event(
+                        db,
+                        action=audit_service.SecurityActions.USER_COST_CAP_REACHED,
+                        user_id=candidate.user_id,
+                        params={
+                            "agent_id": candidate.agent_id,
+                            "today_cost_usd": round(user_cost, 6),
+                            "cap_usd": settings.daily_user_cost_cap_usd,
+                        },
+                    )
+                    USER_COST_CAP_HITS_TOTAL.inc()
+                    summary["cost_capped"] += 1
+                    continue
 
-            coroutine = _run_tick_safely(orch, candidate.agent_id, rl)
-            if spawn is None:
-                asyncio.create_task(coroutine)
-            else:
-                await spawn(coroutine)
+                acquired = await rl.acquire()
+                if not acquired:
+                    summary["rate_limited"] = (
+                        len(candidates)
+                        - summary["dispatched"]
+                        - summary["cost_capped"]
+                    )
+                    log.warning(
+                        "scheduler.rate_limit_hit",
+                        remaining=summary["rate_limited"],
+                    )
+                    break
 
-            summary["dispatched"] += 1
+                coroutine = _run_tick_safely(orch, candidate.agent_id, rl)
+                if spawn is None:
+                    asyncio.create_task(coroutine)
+                else:
+                    await spawn(coroutine)
+
+                summary["dispatched"] += 1
+
+            await db.commit()
 
         SCHEDULER_TICK_TOTAL.labels(status="success").inc()
         SCHEDULER_LAST_TICK_TIMESTAMP.set(time.time())

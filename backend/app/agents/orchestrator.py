@@ -47,15 +47,13 @@ from anthropic import AsyncAnthropic
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session as SyncSession
 
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-
 from app.agents.tool_layer import AGENT_TOOLS, AsyncToolHandler
 from app.core.db import AsyncSessionLocal, SyncSessionLocal
 from app.core.logging import log
 from app.core.telemetry import get_tracer
-from app.models.schema import Agent, DailyCostTracking
+from app.models.schema import Agent
 from app.models.views import AgentFullState
-from app.services import audit_service
+from app.services import anthropic_pricing, audit_service, cost_tracking_service
 from app.services.agent_state_service import AgentNotFound, get_full_state
 from app.services.audit_service import AgentActions
 from app.services.mandate_verifier import MandateVerifier
@@ -82,11 +80,10 @@ CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 MAX_TURNS_PER_TICK: int = 10
 MAX_TOKENS_PER_RESPONSE: int = 4096
 
-# Sonnet 4.5 list price as of 2026-04. Used only for an in-tick cost
-# estimate stored on `agents.last_tick_summary`; real billing comes from
-# the Anthropic dashboard. Prompt-cache discounts NOT modeled (V0).
-_INPUT_COST_PER_MTOK: float = 3.0
-_OUTPUT_COST_PER_MTOK: float = 15.0
+# Per-call pricing now lives in `app.services.anthropic_pricing`.
+# Cost estimate is for the in-process cap accumulator + audit summary;
+# real billing comes from the Anthropic dashboard. Prompt-cache
+# discounts are NOT modeled in V0.
 
 PROMPT_VERSION: str = "1.0"
 
@@ -274,7 +271,7 @@ class AgentOrchestrator:
         while turns < MAX_TURNS_PER_TICK:
             turns += 1
 
-            from app.core.metrics import AGENT_API_CALLS_TOTAL
+            from app.core.metrics import AGENT_API_CALLS_TOTAL, COST_USD_TOTAL
             try:
                 response = await self.client.messages.create(
                     model=CLAUDE_MODEL,
@@ -305,7 +302,18 @@ class AgentOrchestrator:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-            cost_acc += self._estimate_cost(response.usage)
+            turn_cost = self._estimate_cost(response.usage)
+            cost_acc += turn_cost
+            # Per-turn increment so the counter reflects actual API spend
+            # in real time (not just at tick close). `response.model` is
+            # the canonical model the API actually ran (Anthropic may
+            # round to a dated alias); fall back to the configured model
+            # only when the SDK doesn't surface it (test fakes typically
+            # don't).
+            COST_USD_TOTAL.labels(
+                user_id=state.user_id,
+                model=getattr(response, "model", None) or CLAUDE_MODEL,
+            ).inc(turn_cost)
             last_stop_reason = response.stop_reason
 
             # Capture any text the model emitted this turn — keep the
@@ -485,11 +493,10 @@ You'll receive your full current state as the first user message. Plan first, th
     @staticmethod
     def _estimate_cost(usage: Any) -> float:
         """USD estimate from Anthropic usage block. Tolerates missing fields."""
-        in_toks = getattr(usage, "input_tokens", 0) or 0
-        out_toks = getattr(usage, "output_tokens", 0) or 0
-        return (
-            (in_toks / 1_000_000) * _INPUT_COST_PER_MTOK
-            + (out_toks / 1_000_000) * _OUTPUT_COST_PER_MTOK
+        return anthropic_pricing.calculate_cost_usd(
+            CLAUDE_MODEL,
+            input_tokens=getattr(usage, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage, "output_tokens", 0) or 0,
         )
 
     # ------------------------------------------------------------------
@@ -541,7 +548,11 @@ You'll receive your full current state as the first user message. Plan first, th
             action=AgentActions.TICK_COMPLETED,
             params=self._build_summary(result),
         )
-        await _upsert_daily_cost(db, cost_usd=result.estimated_cost_usd)
+        await cost_tracking_service.upsert_daily_cost(
+            db,
+            user_id=state.user_id,
+            cost_usd=result.estimated_cost_usd,
+        )
         await db.commit()
 
     async def _record_tick_failure(
@@ -567,7 +578,11 @@ You'll receive your full current state as the first user message. Plan first, th
             error_code=result.reason,
         )
         if result.estimated_cost_usd > 0:
-            await _upsert_daily_cost(db, cost_usd=result.estimated_cost_usd)
+            await cost_tracking_service.upsert_daily_cost(
+                db,
+                user_id=state.user_id,
+                cost_usd=result.estimated_cost_usd,
+            )
         await db.commit()
 
     @staticmethod
@@ -583,43 +598,3 @@ You'll receive your full current state as the first user message. Plan first, th
         }
 
 
-# ---------------------------------------------------------------------------
-# Cost persistence (shared with the scheduler's daily-cap read)
-# ---------------------------------------------------------------------------
-
-
-async def _upsert_daily_cost(db: AsyncSession, *, cost_usd: float) -> None:
-    """Add `cost_usd` + 1 tick to today's `daily_cost_tracking` row.
-
-    Single-statement UPSERT — `INSERT ... ON CONFLICT (date) DO UPDATE`.
-    Atomic at the row level even under concurrent ticks. The agent
-    scheduler reads `total_cost_usd` for today before each discovery
-    cycle to decide whether to keep dispatching.
-
-    Best-effort: a failed write logs a warning and swallows. The audit
-    row already captured the cost in its params; the daily aggregate
-    drifting by a few cents is preferable to losing the tick outcome.
-    """
-    today = datetime.now(timezone.utc).date()
-    try:
-        stmt = pg_insert(DailyCostTracking).values(
-            date=today,
-            total_cost_usd=cost_usd,
-            tick_count=1,
-            updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
-        )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["date"],
-            set_={
-                "total_cost_usd": DailyCostTracking.total_cost_usd + cost_usd,
-                "tick_count": DailyCostTracking.tick_count + 1,
-                "updated_at": stmt.excluded.updated_at,
-            },
-        )
-        await db.execute(stmt)
-    except Exception as exc:
-        log.warning(
-            "orchestrator.daily_cost_upsert_failed",
-            error=type(exc).__name__,
-            message=str(exc),
-        )

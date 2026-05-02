@@ -106,3 +106,36 @@ SCHEDULER_LAST_TICK_TIMESTAMP = Gauge(
     "vifaras_scheduler_last_tick_timestamp",
     "Unix timestamp of the last successful scheduler discovery cycle.",
 )
+
+# ---------------------------------------------------------------------------
+# Cost monitoring (7.3.4)
+#
+# Caveat label cardinality: `user_id` as a label is high-cardinality
+# (one entry per user × one per model). Acceptable at V0 alpha (<100
+# users) but problematic > 10K users — see IDEAS_BACKLOG entry
+# "Prometheus user_id label cardinality (V0.5+ pre-launch)".
+#
+# Caveat gauge in-memory: COST_USER_DAILY_USD is process-local and
+# does NOT persist across restart. Source of truth remains the
+# `daily_cost_tracking` table; the gauge is observability only. On
+# restart the gauge resets to 0 until the next upsert refreshes it.
+# ---------------------------------------------------------------------------
+
+COST_USD_TOTAL = Counter(
+    "vifaras_cost_usd_total",
+    "Total Anthropic API cost in USD, per user × model. Cumulative since "
+    "process start (Prometheus counter semantics).",
+    ["user_id", "model"],
+)
+
+COST_USER_DAILY_USD = Gauge(
+    "vifaras_cost_user_daily_usd",
+    "Per-user cost USD for the current UTC day. Resets at midnight UTC "
+    "(implicit: the daily_cost_tracking row keys on UTC date).",
+    ["user_id"],
+)
+
+USER_COST_CAP_HITS_TOTAL = Counter(
+    "vifaras_user_cost_cap_hits_total",
+    "Total times a user tick was skipped due to the daily soft cap.",
+)

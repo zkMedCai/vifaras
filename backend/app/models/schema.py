@@ -594,18 +594,30 @@ class AuditLog(Base):
 
 
 class DailyCostTracking(Base):
-    """One row per UTC date holding cumulative LLM spend (brief task 6.3.c).
+    """Per-user daily LLM cost (brief task 6.3.c, expanded in 7.3.2).
 
-    UPSERTed by the orchestrator after each tick (`INSERT ... ON CONFLICT
-    (date) DO UPDATE`). Read by the agent scheduler before dispatching:
-    if today's `total_cost_usd >= settings.max_daily_llm_cost_usd`, the
-    discovery cycle skips and waits for next day.
+    Composite PK `(date, user_id)`. UPSERTed by the orchestrator after
+    each tick (`INSERT ... ON CONFLICT (date, user_id) DO UPDATE`).
 
-    Storage: 365 rows/year. Negligible.
+    Two cap layers read from this table:
+      - **Hard cap (global)**: scheduler sums `total_cost_usd` across
+        all users for today; if `>= settings.max_daily_llm_cost_usd`
+        the discovery cycle skips dispatching for the rest of the UTC
+        day. Kill-switch protecting against runaway/infinite-loop bugs.
+      - **Soft cap (per-user)**: scheduler reads single-row
+        `total_cost_usd` for `(today, user_id)` before each candidate
+        dispatch; if `>= settings.daily_user_cost_cap_usd` that user's
+        tick is skipped. Other users continue normally. Protection
+        against single-user blow-up scenarios.
+
+    Storage: O(distinct users active per day). Negligible at V0 alpha
+    (~10 users) and remains tractable through V0.5+ (~10K users → 3.6M
+    rows/year, still small).
     """
     __tablename__ = "daily_cost_tracking"
 
     date = Column(Date, primary_key=True)
+    user_id = Column(UUID(as_uuid=False), primary_key=True)
     total_cost_usd = Column(Numeric(12, 6), nullable=False, default=0)
     tick_count = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

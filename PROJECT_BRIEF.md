@@ -321,7 +321,7 @@ Razionale: cambiare schema in produzione è doloroso, anticipare TRADE costa 30 
 - ✅ 7.0.1 WebAuthn `webauthn_origin` default localhost:8000 → :3000 (hotfix da integrazione frontend e2e)
 - ✅ 7.1 Rate limiting deep (per-user caps) + content moderation + abuse detection logging. Redis storage e X-Forwarded-For trust deferred (single-server V0, flagged in IDEAS_BACKLOG).
 - ✅ 7.2 Observability (Prometheus + 11 custom metrics, OpenTelemetry SDK + manual spans agent, structlog trace_id correlation, k8s liveness/readiness probes)
-- 🔲 7.3 Cost monitoring (per-agent / per-user dashboard, soft cap notifications)
+- ✅ 7.3 Cost monitoring + per-user soft cap (composite PK `daily_cost_tracking`, `anthropic_pricing` service, soft cap $0.50/day, 3 Prometheus metrics)
 - 🔲 7.4 Pre-launch checklist (refresh token rotation, JWT secret rotation, email DB-level partial unique, KMS reale)
 
 ### 🔲 FASE 8 — TRADE bilaterale (V1)

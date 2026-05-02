@@ -48,7 +48,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.orchestrator import TickResult, _upsert_daily_cost
+from app.agents.orchestrator import TickResult
+from app.services.cost_tracking_service import upsert_daily_cost
 from app.core.config import settings
 from app.core.rate_limiter import TickRateLimiter
 from app.models.schema import (
@@ -603,13 +604,14 @@ async def test_dispatch_rate_limit_stops_after_cap(
 async def test_dispatch_short_circuits_on_daily_cap(
     async_db_session, patch_async_session, monkeypatch
 ):
-    # Seed cost above cap.
+    # Seed cost above cap. Any user_id works — global cap is SUM cross-user.
     monkeypatch.setattr(settings, "max_daily_llm_cost_usd", 1.0)
-    await _upsert_daily_cost(async_db_session, cost_usd=2.0)
-    await async_db_session.commit()
-
     a_uid, _, _ = await _seed_agent(async_db_session)
     b_uid, _, _ = await _seed_agent(async_db_session)
+    await upsert_daily_cost(
+        async_db_session, user_id=a_uid, cost_usd=2.0
+    )
+    await async_db_session.commit()
     await _seed_negotiation(
         async_db_session, buyer_user_id=a_uid, seller_user_id=b_uid
     )
@@ -632,12 +634,21 @@ async def test_dispatch_short_circuits_on_daily_cap(
 
 @pytest.mark.db
 async def test_upsert_daily_cost_increments_existing_row(async_db_session):
-    await _upsert_daily_cost(async_db_session, cost_usd=0.10)
-    await _upsert_daily_cost(async_db_session, cost_usd=0.05)
+    user_id, _, _ = await _seed_agent(async_db_session)
+    await upsert_daily_cost(
+        async_db_session, user_id=user_id, cost_usd=0.10
+    )
+    await upsert_daily_cost(
+        async_db_session, user_id=user_id, cost_usd=0.05
+    )
     await async_db_session.commit()
 
     rows = (
-        await async_db_session.execute(select(DailyCostTracking))
+        await async_db_session.execute(
+            select(DailyCostTracking).where(
+                DailyCostTracking.user_id == user_id
+            )
+        )
     ).scalars().all()
     assert len(rows) == 1
     assert float(rows[0].total_cost_usd) == pytest.approx(0.15, abs=1e-9)

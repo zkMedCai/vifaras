@@ -131,6 +131,10 @@ class SecurityActions:
     # Constant only at 7.1 — the failure-aggregation hook is V0.5+
     # (no real attacker pattern observed yet to calibrate threshold).
     BURST_LOGIN_ATTEMPTS: Final[str] = "burst_login_attempts"
+    # 7.3.3: per-user daily cost cap reached → scheduler skipped a tick.
+    # Anomaly signal worth review (recurrent hits = a stuck agent or a
+    # user with abnormal usage that may need outreach).
+    USER_COST_CAP_REACHED: Final[str] = "user_cost_cap_reached"
 
 
 class AuthActions:

@@ -1777,3 +1777,99 @@ Backend production-ready su 4 dimensioni di osservabilità:
 ### Prossima task
 
 **FASE 7.3 — Cost monitoring + per-user soft cap** (4-6h). Brief denso atteso. Backend pausa fino ad allora.
+
+---
+
+## [7.3] cost monitoring + per-user soft cap — 2026-05-02
+
+### Cosa è stato fatto
+
+Cost tracking robusto + soft cap protezione single-user blow-up. Scenario A confermato in discovery (cost tracking globale già esistente da [6.3.c], mancava per-user dimension). 3 sub-task atomiche, commit complessivo a fine FASE.
+
+#### [7.3.2] Cost tracking refinement (per-user dimension)
+- Migration `b7c1e2f3a4d5_daily_cost_per_user.py`: drop+recreate `daily_cost_tracking` con composite PK `(date, user_id)` + index inverso `ix_daily_cost_user_date (user_id, date)`. Manual write (no autogenerate) per evitare schema drift spurious diff — pattern stabilito da [7.1.5]. Downgrade lossy documentato (V0 dev mindset).
+- `app/services/anthropic_pricing.py` (nuovo): rate table `_USD_PER_MTOK` per Sonnet 4.5 ($3/$15) + Opus 4.7 ($15/$75) + Haiku 4.5 ($0.80/$4.00) — V0.5+ deferred ma listed per fallback path testing. `calculate_cost_usd(model, input, output)` puro, structured-log fallback su unknown model (non raise: cap accumulator must never crash the tick). `known_models()` esposto per test.
+- `app/services/cost_tracking_service.py` (nuovo, 3 helper):
+  - `upsert_daily_cost(db, *, user_id, cost_usd)` — atomic UPSERT `(date, user_id)`, swallow on fail (audit row already captures cost in params; drift di pochi cent < perdita tick outcome).
+  - `get_user_cost_today(db, *, user_id)` — single-row read, soft cap path. Microsecond latency con composite PK index.
+  - `get_today_cost_usd(db)` — SUM cross-user per UTC date, hard cap path. Preserva semantica scheduler kill switch da [6.3.c].
+- `app/core/datetime_helpers.py`: nuovo `utc_today()` helper esplicito. Memo nella docstring richiama bug TZ-naive di [7.2.5]. Nuovo codice [7.3] usa esclusivamente `utc_today()`; 2 callsite buggy esistenti (`mandate_verifier.py:343`, `health.py:156` pre-fix) restano per TZ audit V0.5+ — `health.py` è stato comunque toccato in [7.3.2] perché composite PK rompeva `db.get(DailyCostTracking, date.today())`.
+- `app/agents/orchestrator.py`: rimossi constants hardcoded `_INPUT_COST_PER_MTOK`/`_OUTPUT_COST_PER_MTOK` (extracted to pricing service); `_estimate_cost` delega a `anthropic_pricing.calculate_cost_usd`; rimosso vecchio `_upsert_daily_cost` module-level (~40 righe); `_record_tick_outcome` + `_record_tick_failure` chiamano `cost_tracking_service.upsert_daily_cost(user_id=state.user_id, cost_usd=...)`.
+- `app/api/health.py`: rimosso `db.get(DailyCostTracking, date.today())` (rotto post-composite-PK + bug TZ-naive); usa `cost_tracking_service.get_today_cost_usd(db)`. Drop import di `date` da datetime.
+- `app/services/agent_scheduler.py`: `get_today_cost_usd(db)` thin alias che delega a `cost_tracking_service.get_today_cost_usd` — backward-compat preservata per 2 callsite esterni (`_dev_endpoints.py:96`, internal kill-switch). Rimosso `DailyCostTracking` import (non più usato).
+- 3 test esistenti aggiornati (`test_scheduler.py` 2 + `test_pre_frontend.py` 1) per nuova signature `upsert_daily_cost(user_id=..., cost_usd=...)`.
+
+#### [7.3.3] Per-user soft cap enforcement
+- Setting `daily_user_cost_cap_usd: float = 0.50` in `config.py` con docstring esplicita hard vs soft semantics:
+  - **Hard cap** (`max_daily_llm_cost_usd=$50`): kill switch globale. Hit = sistema-wide outage fino UTC midnight reset. Protezione runaway/infinite-loop bug.
+  - **Soft cap** (`daily_user_cost_cap_usd=$0.50`): skip-tick per-user. Altri user continuano. Protezione single-user blow-up.
+- `SecurityActions.USER_COST_CAP_REACHED` constant in `audit_service.py`. Comment richiama che recurrent hits = stuck agent o user con usage abnormale (signal worth review).
+- `agent_scheduler.discover_and_dispatch_ticks` modifiche:
+  - Loop dispatch esteso DENTRO la session principale (1 connection vs N — efficiency win + no coordination cross-session).
+  - Pre-acquire del rate limiter: `get_user_cost_today(user_id)` check, se `>= cap` → log + audit emit + skip continue.
+  - Threshold inclusive (`>=`): test esplicito `test_user_cost_at_exact_cap_is_skipped` lock il behavior. Coerente con pattern [7.1.5] sequential email.
+  - Audit emit BEFORE rate limit acquire (cheap before expensive, fail-fast, niente release necessario).
+  - Continue invece di break: cap reached per A non significa stop scheduler — B può comunque essere dispatched. Diverso dal global kill switch path (line 411 `return summary`).
+  - `summary["cost_capped"]` counter parallel a `dispatched`/`rate_limited`. `rate_limited` calcolo corretto: `len(candidates) - dispatched - cost_capped` (non doppio-conta cap-skipped).
+  - `await db.commit()` esplicito a fine loop: `log_security_event` fa flush ma non commit (caller controla boundary). Senza commit le audit row sarebbero perse alla chiusura sessione.
+- 5 test in `test_user_cost_cap.py`: skip-cap-reached, dispatch-below, audit-emitted, per-user-isolation, exact-cap-inclusive.
+
+#### [7.3.4] Prometheus cost metrics
+- 3 nuove metrics in `app/core/metrics.py` con docstring esplicito sui caveat (cardinality user_id alta + gauge in-memory non-persistent):
+  - `vifaras_cost_usd_total{user_id, model}` Counter — per-turn increment post-Anthropic call.
+  - `vifaras_cost_user_daily_usd{user_id}` Gauge — refresh post-upsert con SELECT (DB source of truth).
+  - `vifaras_user_cost_cap_hits_total` Counter — global aggregate, per-user breakdown via audit log.
+- Hook A (orchestrator): `turn_cost = self._estimate_cost(response.usage)`; `COST_USD_TOTAL.labels(user_id=state.user_id, model=getattr(response, "model", None) or CLAUDE_MODEL).inc(turn_cost)`. Per-turn (non per-tick): cattura accumulo incrementale durante tick lunghi (10 turn). Coerente con `AGENT_API_CALLS_TOTAL` already per-call.
+- Hook B (cost_tracking_service.upsert_daily_cost): `upserted` flag separa try-block UPSERT vs gauge refresh. Post-UPSERT esegue `get_user_cost_today` SELECT + `COST_USER_DAILY_USD.labels(user_id).set(new_total)`. Defensive: failure del gauge update logged via `cost_tracking.gauge_refresh_failed`, swallow + non-propaga (gauge è observability, not correctness; "drift gauge" ≠ "drift cap accumulator").
+- Hook C (agent_scheduler cap path): import `USER_COST_CAP_HITS_TOTAL`, `.inc()` subito dopo audit emit. No labels — per-user breakdown via audit log query.
+- 2 test in `test_cost_metrics.py` (hook A: orchestrator counter delta == $0.006 expected; hook B: 2 upsert successivi → gauge cumulativo 0.0 → 0.10 → 0.15) + 1 test esteso in `test_user_cost_cap.py` (hook C: counter delta == cost_capped count).
+
+### Decisioni V0 documentate
+
+- **Soft cap default $0.50/day per user**. V0 alpha tester (founder + amici) producono ~50-100 tick/day max realistico; $0.50 è cap protettivo ma non blocking per usage normale. V0.5+ alpha esterno valuteremo tier-based ($0.10 free, $1.00 paid).
+- **Threshold inclusive `>=`** coerente con pattern [7.1.5]. Più aggressivo = più safety; lock con test esplicito boundary.
+- **Pricing constants extraction in modulo dedicato**: test isolation (puro), future-proof (V0.5+ multi-model = aggiungi row al dict, niente refactor orchestrator), Single Responsibility Principle. Costo zero V0.
+- **Audit trimestrale founder responsibility** per pricing. Comment "Last verified" pattern → da considerare in V0.5+ dynamic fetch entry.
+- **Per-turn increment metric** invece di per-tick. Real-time accuracy durante tick lunghi.
+- **Gauge `set()` con SELECT extra** invece di `inc()`. Accuracy cross-restart e cross-replica > performance cost (O(1) PK lookup).
+- **Admin endpoint deferred V0.5+**: admin pattern non esiste, scope creep architetturale. Cost data accessibile via `_dev_endpoints.py` esistente + Prometheus metrics + `/api/health`.
+- **Migration drop+recreate** (Opzione α): V0 dev environment, niente real user data da preservare. Pulizia > complessità backfill sentinel.
+- **`agent_scheduler.get_today_cost_usd()` thin alias preservato**: backward-compat per 2 callsite esterni. Pattern surgical, non greedy refactor.
+- **`utc_today()` non rolled out cross-codebase**. 2 callsite buggy esistenti (`mandate_verifier.py:343`) restano per TZ audit V0.5+ (entry IDEAS_BACKLOG da [7.2.5]). Niente bandaid drift.
+
+### Schema drift status
+
+Migration `b7c1e2f3a4d5` manualmente filtrata per applicare solo target diff (drop+recreate `daily_cost_tracking`). HNSW index su intents, partial indexes su matches, DESC ordering su notifications, server_defaults vari, `deal_messages.sent_at` NOT NULL discrepancy **preservati intatti**. Schema reconciliation pass resta blocker per future migration non-banali — trigger naturale: prima task di [7.4] con KMS keys table.
+
+### Test scritti / coverage
+
+Pre-7.3: 456 test. Post-7.3: **464 test** (delta +8).
+
+| Sub-task | Tests | File |
+|----------|-------|------|
+| [7.3.3] Soft cap enforcement | 5 | `test_user_cost_cap.py` |
+| [7.3.4] Cost metrics (hook A+B) | 2 | `test_cost_metrics.py` |
+| [7.3.4] Cost metrics (hook C) | 1 | `test_user_cost_cap.py` (extension) |
+| **Total delta** | **+8** | |
+
+`pytest backend/tests/` → 464 passed in ~17s.
+
+### Blocker / dubbi
+
+- **Pricing values $3/$15 confermati da discovery** (orchestrator hardcoded coerente). Non fact-checked via web — pattern V0 lock, audit trimestrale founder responsibility. V0.5+ dynamic fetch in IDEAS_BACKLOG.
+- **`get_today_cost_usd` ora fa SUM** invece di single-row read. Latenza O(rows_today) vs O(1). Per V0 (10 user × 1 row/day) trascurabile; V0.5+ multi-replica con > 1000 daily user, optimization in IDEAS_BACKLOG.
+- **`COST_USER_DAILY_USD` gauge in-memory non persiste cross-restart**. Source of truth resta DB; gauge reset a 0 fino al prossimo upsert post-restart. Documentato in metric docstring; niente migration logic per gauge restore al boot.
+- **Schema reconciliation blocker** per [7.4] KMS keys table migration. Pattern di filtering manuale per ora preservato.
+
+### Cosa significa "FASE 7.3 completa"
+
+Cost protection infrastructure end-to-end:
+- **Per-user accumulation** ([7.3.2]): composite PK `(date, user_id)` + dedicato pricing service + isolated cost_tracking helpers.
+- **Soft cap enforcement** ([7.3.3]): scheduler skip per-user su `>=` cap, hard cap globale preservato indipendente, audit trail per recurrent-hit detection.
+- **Observability** ([7.3.4]): 3 Prometheus metrics — counter cumulativo per-user×model, gauge daily refresh, counter aggregato cap-hit.
+
+464 test verdi. **FASE 7.3 chiusa**. Resta FASE 7.4 (KMS reale, refresh rotation, JWT rotation, privacy policy, 8-12h). Schema reconciliation pass entrerà in scope durante setup migration KMS.
+
+### Prossima task
+
+**FASE 7.4 — Pre-launch checklist** (8-12h). Brief denso atteso. Schema reconciliation pass è prerequisite per future migration; valuteremo ordering nel brief.

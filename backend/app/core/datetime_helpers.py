@@ -9,7 +9,7 @@ interpret tz-aware vs naive — they assume the caller normalized.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Final
 
 
@@ -19,6 +19,20 @@ _SECONDS_PER_MINUTE: Final[int] = 60
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def utc_today() -> date:
+    """Current UTC date — explicit, avoids local-TZ ambiguity.
+
+    `date.today()` returns the local-TZ date, which on a non-UTC host
+    rolls at local midnight rather than UTC midnight. Cost-tracking
+    and cap-reset windows are anchored to UTC, so any "today" lookup
+    that gates spend MUST go through this helper.
+
+    Pattern lock: see [7.2.5] postmortem on naive datetime
+    `.timestamp()` for the symmetric bug on the time side.
+    """
+    return datetime.now(timezone.utc).date()
 
 
 def days_until(target: datetime, *, now: datetime | None = None) -> int:

@@ -349,6 +349,72 @@ Vedi `TRADE_WINDOW_FLOW.md` per dettaglio completo.
 - **Default V0.5+**: Option C (port separation). Standard k8s/Fly.io pattern.
 - **Effort**: 1-2 ore.
 
+### Prometheus user_id label cardinality
+- **Trigger**: utenti > 1000.
+- **Background**: V0 [7.3.4] metrics `vifaras_cost_usd_total{user_id, model}` e `vifaras_cost_user_daily_usd{user_id}` hanno `user_id` come label. Storage Prometheus = O(unique_user_ids), problematic >10K user.
+- **Action V0.5+**:
+  - Aggregate metric senza `user_id` label (cross-user total)
+  - Per-user data via DB query separato (admin endpoint)
+  - Top-N user reporting via Prometheus histogram bucket
+- **Alternative**: separate "system metrics" (low-cardinality) vs "business metrics" (high-cardinality, opt-in scrape).
+- **Effort**: 1-2 ore.
+
+### get_today_cost_usd query optimization (V0.5+ scaling)
+- **Trigger**: > 1000 daily user OR observed latency > 50ms su scheduler kill-switch check.
+- **Background**: V0 [7.3.2] usa `SUM(total_cost_usd) WHERE date = today`. O(N rows). Index `(user_id, date)` accelera per-user but non aggregate query.
+- **Action V0.5+**:
+  - Cached aggregate table `daily_cost_global (date PK, total_usd)` updated on each upsert
+  - OR materialized view refresh on insert
+  - OR Prometheus gauge-based check (no DB hit, but less reliable cross-replica)
+- **Effort**: 1-2 ore (depends on path chosen).
+
+### Dynamic Anthropic pricing fetch
+- **Trigger**: V0.5+ multi-model usage o pricing change Anthropic non catturato in audit trimestrale.
+- **Background**: V0 [7.3.2] pricing hardcoded in `app/services/anthropic_pricing.py`. Audit trimestrale founder responsibility, drift potenziale tra audit cycles.
+- **Action V0.5+**:
+  - ENV var override: `ANTHROPIC_PRICING_OVERRIDE_JSON` permetti config-driven update senza code change
+  - OR fetch periodico da `docs.anthropic.com` pricing endpoint (se exists API)
+  - Caching 24h, fallback hardcoded se fetch fallisce
+- **Effort**: 1-2 ore.
+
+### Hard cap kill switch refinement
+- **Trigger**: pre-launch alpha esterno o post-incident review.
+- **Background**: V0 [7.3.3] hard cap globale (`max_daily_llm_cost_usd=$50`) è simple `>= cap: return`. Niente alerting, niente graceful degradation.
+- **Action V0.5+**:
+  - Webhook/email alert quando cap raggiunto al 80%
+  - Graceful degradation: pause new tick dispatch, complete in-flight ticks
+  - Auto-reset notification al UTC midnight rollover
+  - Post-incident dashboard per investigation
+- **Effort**: 2-3 ore.
+
+### Admin endpoint pattern
+- **Trigger**: V0.5+ alpha esterno quando emergerà necessità di:
+  - Review per-user cost data
+  - Manage tier upgrade requests
+  - Trigger manual scheduler operations
+  - View audit log entries
+- **Action V0.5+**:
+  - Define admin tier (probabilmente `tier=99` hardcoded, o ENV var `ADMIN_USER_IDS`)
+  - Create `app/api/admin.py` router con `dependencies=[Depends(require_tier(99))]`
+  - Endpoints: `/api/admin/costs/today`, `/api/admin/users/{id}`, `/api/admin/audit/recent`
+  - Auth path: same JWT, additional tier check
+- **Effort**: 2-3 ore (admin pattern + 3-5 endpoint + test).
+
+---
+
+## Categoria: Pricing / Billing (V1+)
+
+### Stripe / billing integration (post-alpha monetization)
+- **Trigger**: post-alpha se cost cap hits frequenti = signal di willingness to pay.
+- **Background**: V0 [7.3.3] niente fatturazione, soft cap è hard skip a `$0.50/day`. Per V1 pricing tier: free $0.10/day, paid $1.00/day, premium $5.00/day.
+- **Action V1+**:
+  - Stripe customer creation post-signup
+  - Subscription plan enforcement (tied to existing `users.tier`)
+  - Usage-based billing oltre cap (e.g., $0.10 / 1K tokens overage)
+  - Webhook handler per subscription lifecycle (`subscription.created`, `invoice.paid`, etc.)
+  - Frontend pricing page + checkout flow
+- **Effort**: 1-2 settimane (plan + integration + frontend pricing page + test).
+
 ---
 
 ## Categoria: Frontend
@@ -370,6 +436,15 @@ Vedi `TRADE_WINDOW_FLOW.md` per dettaglio completo.
 ### QR code handoff web → mobile (V0.5)
 - Per Tier 1 NFC: utente browse da web, scansiona QR, completa NFC su mobile
 - Auto-resume sessione web post-verifica
+
+### Per-user costs UI (V0.5+ post-launch alpha)
+- **Trigger**: alpha esterno quando user vuole self-service visibility su spend.
+- **Background**: V0 [7.3.x] cost data accessibile via dev endpoint (`enable_dev_endpoints` gated) + Prometheus only. Frontend non ha visibility user-side.
+- **Action V0.5+**:
+  - Backend: `/api/users/me/costs/today` endpoint (auth required, JWT user_id key). Reads `cost_tracking_service.get_user_cost_today`.
+  - Frontend: dashboard widget "Today's usage: $0.X / $0.50 cap"
+  - Notifica visiva quando user raggiunge 80% cap (warning state)
+- **Effort**: 2-3 ore (backend + frontend + test).
 
 ### OpenAPI deep documentation pass (FASE 7.4, pre-launch)
 - 7.0 ha fatto pass minimale: 4 critical POST endpoint hanno `summary` + `description`. Restano ~75 endpoint (matches, negotiations, deals, notifications, step_up, mandate revocation, dev, test) senza description completa.

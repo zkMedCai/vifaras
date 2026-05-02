@@ -28,7 +28,7 @@ the probes or starves the UI.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -40,8 +40,8 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.metrics import SCHEDULER_LAST_TICK_TIMESTAMP
 from app.core.rate_limit import limiter
-from app.models.schema import Agent, DailyCostTracking
-from app.services import agent_scheduler
+from app.models.schema import Agent
+from app.services import agent_scheduler, cost_tracking_service
 
 
 router = APIRouter(tags=["health"])
@@ -153,9 +153,8 @@ async def api_health(
                     Agent.last_tick_at.is_not(None)
                 )
             )
-            row = await db.get(DailyCostTracking, date.today())
-            if row is not None:
-                today_cost = float(row.total_cost_usd)
+            # Global today cost = SUM cross-user (per-user rows since 7.3.2).
+            today_cost = await cost_tracking_service.get_today_cost_usd(db)
         except Exception as exc:  # pragma: no cover — DB went down mid-request
             db_status = f"unhealthy: {type(exc).__name__}"
             db_reachable = False
