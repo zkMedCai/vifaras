@@ -576,6 +576,10 @@ async def submit_signature(
 
     await db.commit()
 
+    if deal_confirmed:
+        from app.core.metrics import DEALS_SIGNED_TOTAL
+        DEALS_SIGNED_TOTAL.inc()
+
     # 6.1 — fire-and-forget UX notifications. Two cases:
     #   - first signature: notify counterparty "the other party signed"
     #   - both signed (deal_confirmed=True): notify BOTH parties
@@ -671,6 +675,9 @@ async def submit_cancel(
     )
 
     await db.commit()
+
+    from app.core.metrics import DEALS_CANCELED_TOTAL
+    DEALS_CANCELED_TOTAL.inc()
 
     # 6.1 — fire-and-forget UX notification to the OTHER party. The
     # canceller already knows what they did; the counterparty needs to be

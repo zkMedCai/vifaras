@@ -30,6 +30,7 @@ V0 deliberate simplifications (documented for V1+ revisits):
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -345,26 +346,28 @@ async def _run_tick_safely(
     not die from a single buggy tick; the next discovery will look at
     the audit trail and decide what to do.
     """
-    try:
-        result = await orchestrator.run_tick(agent_id)
-        log.info(
-            "scheduler.tick_completed",
-            agent_id=agent_id,
-            success=result.success,
-            reason=result.reason,
-            turns=result.turns_used,
-            tool_calls=result.tool_calls_count,
-            cost_usd=round(result.estimated_cost_usd, 6),
-        )
-    except Exception as exc:
-        log.exception(
-            "scheduler.tick_unexpected_error",
-            agent_id=agent_id,
-            error=type(exc).__name__,
-            message=str(exc),
-        )
-    finally:
-        rate_limiter.release()
+    from app.core.metrics import AGENT_TICK_DURATION_SECONDS
+    with AGENT_TICK_DURATION_SECONDS.time():
+        try:
+            result = await orchestrator.run_tick(agent_id)
+            log.info(
+                "scheduler.tick_completed",
+                agent_id=agent_id,
+                success=result.success,
+                reason=result.reason,
+                turns=result.turns_used,
+                tool_calls=result.tool_calls_count,
+                cost_usd=round(result.estimated_cost_usd, 6),
+            )
+        except Exception as exc:
+            log.exception(
+                "scheduler.tick_unexpected_error",
+                agent_id=agent_id,
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+        finally:
+            rate_limiter.release()
 
 
 async def discover_and_dispatch_ticks(
@@ -380,6 +383,11 @@ async def discover_and_dispatch_ticks(
     None, in which case ticks run via `asyncio.create_task` and the
     discovery returns immediately while ticks proceed in background.
     """
+    from app.core.metrics import (
+        SCHEDULER_LAST_TICK_TIMESTAMP,
+        SCHEDULER_TICK_TOTAL,
+    )
+
     orch = orchestrator or _get_default_orchestrator()
     rl = rate_limiter or _get_default_rate_limiter()
 
@@ -391,50 +399,60 @@ async def discover_and_dispatch_ticks(
         "today_cost_usd": 0.0,
     }
 
-    async with AsyncSessionLocal() as db:
-        cost_today = await get_today_cost_usd(db)
-        summary["today_cost_usd"] = cost_today
-        if cost_today >= settings.max_daily_llm_cost_usd:
-            log.warning(
-                "scheduler.daily_cap_reached",
-                cost_usd=cost_today,
-                cap=settings.max_daily_llm_cost_usd,
-            )
-            summary["skipped_daily_cap"] = True
+    try:
+        async with AsyncSessionLocal() as db:
+            cost_today = await get_today_cost_usd(db)
+            summary["today_cost_usd"] = cost_today
+            if cost_today >= settings.max_daily_llm_cost_usd:
+                log.warning(
+                    "scheduler.daily_cap_reached",
+                    cost_usd=cost_today,
+                    cap=settings.max_daily_llm_cost_usd,
+                )
+                summary["skipped_daily_cap"] = True
+                SCHEDULER_TICK_TOTAL.labels(status="success").inc()
+                SCHEDULER_LAST_TICK_TIMESTAMP.set(time.time())
+                return summary
+
+            candidates = await discover_tick_candidates(db)
+
+        summary["discovered"] = len(candidates)
+        if not candidates:
+            log.info("scheduler.no_candidates")
+            SCHEDULER_TICK_TOTAL.labels(status="success").inc()
+            SCHEDULER_LAST_TICK_TIMESTAMP.set(time.time())
             return summary
 
-        candidates = await discover_tick_candidates(db)
+        log.info(
+            "scheduler.discovery_complete",
+            count=len(candidates),
+            top_priorities=[c.priority_score for c in candidates[:5]],
+        )
 
-    summary["discovered"] = len(candidates)
-    if not candidates:
-        log.info("scheduler.no_candidates")
+        for candidate in candidates:
+            acquired = await rl.acquire()
+            if not acquired:
+                summary["rate_limited"] = len(candidates) - summary["dispatched"]
+                log.warning(
+                    "scheduler.rate_limit_hit",
+                    remaining=summary["rate_limited"],
+                )
+                break
+
+            coroutine = _run_tick_safely(orch, candidate.agent_id, rl)
+            if spawn is None:
+                asyncio.create_task(coroutine)
+            else:
+                await spawn(coroutine)
+
+            summary["dispatched"] += 1
+
+        SCHEDULER_TICK_TOTAL.labels(status="success").inc()
+        SCHEDULER_LAST_TICK_TIMESTAMP.set(time.time())
         return summary
-
-    log.info(
-        "scheduler.discovery_complete",
-        count=len(candidates),
-        top_priorities=[c.priority_score for c in candidates[:5]],
-    )
-
-    for candidate in candidates:
-        acquired = await rl.acquire()
-        if not acquired:
-            summary["rate_limited"] = len(candidates) - summary["dispatched"]
-            log.warning(
-                "scheduler.rate_limit_hit",
-                remaining=summary["rate_limited"],
-            )
-            break
-
-        coroutine = _run_tick_safely(orch, candidate.agent_id, rl)
-        if spawn is None:
-            asyncio.create_task(coroutine)
-        else:
-            await spawn(coroutine)
-
-        summary["dispatched"] += 1
-
-    return summary
+    except Exception:
+        SCHEDULER_TICK_TOTAL.labels(status="error").inc()
+        raise
 
 
 # ---------------------------------------------------------------------------

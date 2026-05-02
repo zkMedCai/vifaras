@@ -314,6 +314,43 @@ Vedi `TRADE_WINDOW_FLOW.md` per dettaglio completo.
 
 ---
 
+## Categoria: Observability / Probes (V0.5+)
+
+### Scheduler-level span detach context
+- **Trigger**: deploy V0.5+ con OTLP backend reale (Jaeger/Tempo) + need per visualization scheduler→tick relationship.
+- **Background**: V0 [7.2.3] ha `agent.tick` come root-span per ogni dispatched tick. `agent_scheduler.discover_and_dispatch_ticks` crea ticks via `asyncio.create_task` fire-and-forget — uno span scheduler-level si chiuderebbe prima dei child tick spans, producendo orphan visualization in tracing UI.
+- **Action**: usa OTel `context.attach()` + `detach()` pattern per propagare context al child task asincrono, mantenendo parent-child relationship valida cross-async. Test esplicito che valida nesting span structure.
+- **Effort**: 1-2 ore.
+
+### TZ-naive datetime audit
+- **Trigger**: pre-launch alpha o pre-deploy multi-region.
+- **Background**: durante [7.2.5] discovery scoperto bug `datetime.utcnow().timestamp()` su sistema non-UTC. Naive datetime + `.timestamp()` interpretation è local-TZ-dependent, source di bug latenti. WSL2 UTC+2 ha catturato il caso; deploy su host UTC sarebbe passato silenzioso.
+- **Action**: audit codebase per pattern `datetime.utcnow().timestamp()` o `datetime.now().timestamp()` senza tzinfo. Sostituisci con `time.time()` (Unix epoch) o `datetime.now(timezone.utc).timestamp()` (explicit UTC).
+  ```bash
+  grep -rn "utcnow().timestamp()\|now().timestamp()" backend/app/ --include="*.py"
+  ```
+- **Effort**: 30 min audit + 15 min test esplicito su sistema TZ ≠ UTC.
+
+### Multi-replica scheduler heartbeat
+- **Trigger**: deploy multi-replica backend (V0.5+ horizontal scaling).
+- **Background**: V0 readiness check legge `SCHEDULER_LAST_TICK_TIMESTAMP` Prometheus gauge in-memory. Single-process funziona, multi-replica non condivide stato gauge tra istanze.
+- **Action**:
+  - Persist scheduler last tick a DB column (`system_state` table) o Redis key.
+  - Update `_read_scheduler_last_tick_epoch()` helper in `app/api/health.py` a leggere DB/Redis invece di gauge.
+  - Boundary già isolato in [7.2.5]: rewrite solo del helper, niente touch a `readiness()`.
+- **Effort**: 1-2 ore (migration + helper rewrite + test).
+
+### /metrics endpoint protection
+- **Trigger**: pre-launch alpha esterno (deploy pubblico).
+- **Background**: V0 `/metrics` è unauthenticated (dev/internal scrape). Pre-launch decidi:
+  - Option A: protect via JWT (richiede Prometheus scraper auth)
+  - Option B: protect via IP allowlist (Prometheus on private VPC)
+  - Option C: separate internal port (8001) con `/metrics`, pubblico solo 8000 con `/api/*` + `/health`
+- **Default V0.5+**: Option C (port separation). Standard k8s/Fly.io pattern.
+- **Effort**: 1-2 ore.
+
+---
+
 ## Categoria: Frontend
 
 ### Web app Next.js V0 (FASE 10)

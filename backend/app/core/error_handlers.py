@@ -34,6 +34,13 @@ async def moderation_error_handler(
     7.1.5 adds an audit-log emit (fire-and-forget on failure) so abuse
     review has a record of every rejection.
     """
+    # Metrics hook — record per (field, code) for Grafana panels.
+    try:
+        from app.core.metrics import MODERATION_REJECTIONS_TOTAL
+        MODERATION_REJECTIONS_TOTAL.labels(field=exc.field, code=exc.code).inc()
+    except Exception:
+        pass
+
     # Audit hook — never break the response on audit failure.
     try:
         from app.core.db import AsyncSessionLocal

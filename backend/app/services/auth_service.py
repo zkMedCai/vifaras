@@ -263,6 +263,9 @@ async def complete_registration(
             db, user_id=user_id, email=email, actor_ip=actor_ip
         )
 
+    from app.core.metrics import SIGNUP_COMPLETED_TOTAL
+    SIGNUP_COMPLETED_TOTAL.inc()
+
     access = create_access_token(user_id=user_id, tier=0)
     refresh = create_refresh_token(user_id=user_id)
     return user_id, access, refresh
@@ -400,6 +403,9 @@ async def complete_login(
     user.passkey_sign_count = verified.new_sign_count
     user.last_active_at = datetime.utcnow()
     await db.commit()
+
+    from app.core.metrics import LOGIN_COMPLETED_TOTAL
+    LOGIN_COMPLETED_TOTAL.inc()
 
     access = create_access_token(user_id=user.id, tier=user.tier)
     refresh = create_refresh_token(user_id=user.id)

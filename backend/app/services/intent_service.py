@@ -535,6 +535,11 @@ async def create_intent(
     await db.commit()
     await db.refresh(intent)
 
+    from app.core.metrics import INTENTS_CREATED_TOTAL
+    INTENTS_CREATED_TOTAL.labels(
+        category=input.category, side=input.side
+    ).inc()
+
     # Trigger match discovery for the freshly-created intent. Failures
     # here are non-fatal: the intent is already durable, the matcher
     # will retry it on the next scheduler tick (4.3 match_scheduler).

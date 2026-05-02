@@ -141,6 +141,18 @@ class Settings(BaseSettings):
     abuse_sequential_email_threshold: int = 3
     abuse_sequential_email_window_hours: int = 24
 
+    # OpenTelemetry tracing (7.2.3). Off by default — auto-instrumentation
+    # of FastAPI/SQLAlchemy/HTTPX plus manual spans on agent ticks. When
+    # disabled, the global tracer remains the SDK NoOp and manual span
+    # context managers run essentially free.
+    #   - exporter "console": SimpleSpanProcessor + ConsoleSpanExporter.
+    #     Synchronous, verbose JSON to stdout. Dev / one-shot inspection.
+    #   - exporter "otlp": BatchSpanProcessor + OTLP gRPC exporter to a
+    #     local collector (Tempo / Jaeger / Datadog agent). Production.
+    telemetry_enabled: bool = False
+    telemetry_exporter: str = "console"
+    telemetry_otlp_endpoint: str = "http://localhost:4317"
+
     @cached_property
     def database_url_async(self) -> str:
         return (

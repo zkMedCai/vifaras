@@ -1,41 +1,62 @@
-"""Public health endpoint (brief task 7.0.4).
+"""Public health endpoint (brief task 7.0.4 + 7.2.5).
 
-Two endpoints split by audience:
+Endpoints split by audience and probe semantics:
 
-  - `GET /health` (legacy, kept for k8s/Fly.io liveness probes):
-    minimal `{status, db}` shape, no auth, no extra DB reads beyond
-    `SELECT 1`. Defined in `main.py`.
+  - `GET /health` (legacy root, k8s/Fly.io probes — defined in main.py):
+    minimal `{status, db}` shape, no extra DB reads beyond `SELECT 1`.
 
-  - `GET /api/health` (this module): rich, structured, tailored for
-    the frontend status banner ("backend offline" / "degraded" /
-    "healthy"). Returns DB, scheduler, last-tick, today-cost, daily
-    cap remaining. Public (no auth) but rate-limited at
-    `settings.rate_limit_health` (60/min by default) so spam can't
-    poll the cost / scheduler internals to fingerprint usage.
+  - `GET /api/health` (rich snapshot for the frontend status banner):
+    DB, scheduler, last-tick, today-cost, daily cap remaining. Public
+    (no auth) but rate-limited at `settings.rate_limit_health` so spam
+    can't fingerprint cost/scheduler internals.
 
-Why two endpoints: liveness probes want a 5-line check that always
-returns 200 unless the DB is actually down. The frontend wants a
-multi-field snapshot. Conflating them either bloats the probe or
-starves the UI.
+  - `GET /api/health/live` (Kubernetes liveness probe, 7.2.5): always
+    200 if the Python process responds. No downstream checks. Failing
+    liveness should trigger pod restart.
+
+  - `GET /api/health/ready` (Kubernetes readiness probe, 7.2.5):
+    `200` if DB reachable AND scheduler heartbeat fresh, else `503`.
+    Failing readiness gates traffic away from this replica without
+    restarting it. Distinct from liveness: a stale scheduler doesn't
+    mean the process is wedged, it means we shouldn't take new work.
+
+Why four endpoints: liveness probes want a 5-line check that always
+returns 200 unless the process is wedged; readiness wants a fast
+downstream gate; the frontend wants a multi-field snapshot; legacy
+probes need backward-compatible /health. Conflating them either bloats
+the probes or starves the UI.
 """
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
+from app.core.metrics import SCHEDULER_LAST_TICK_TIMESTAMP
 from app.core.rate_limit import limiter
 from app.models.schema import Agent, DailyCostTracking
 from app.services import agent_scheduler
 
 
 router = APIRouter(tags=["health"])
+
+
+def _read_scheduler_last_tick_epoch() -> float:
+    """Snapshot the in-memory `SCHEDULER_LAST_TICK_TIMESTAMP` gauge.
+
+    Returns 0.0 if the gauge was never set (process just started, or
+    the scheduler is disabled and has never run a discovery cycle).
+    The Prometheus client gauge's `_value.get()` is the canonical
+    in-process accessor — there is no public API for reading a gauge
+    that doesn't go through the registry collector.
+    """
+    return SCHEDULER_LAST_TICK_TIMESTAMP._value.get()
 
 
 class HealthChecks(BaseModel):
@@ -161,4 +182,101 @@ async def api_health(
             today_cost_usd=round(today_cost, 6),
             daily_cap_remaining_usd=round(cap_remaining, 6),
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kubernetes-style probes (7.2.5)
+# ---------------------------------------------------------------------------
+
+
+class LivenessResponse(BaseModel):
+    status: Literal["alive"]
+
+
+class ReadinessChecks(BaseModel):
+    database: str = Field(..., description="`healthy` or `unhealthy: <reason>`")
+    scheduler: str = Field(
+        ...,
+        description=(
+            "`healthy` (recent tick) | `disabled` (scheduler off in env) | "
+            "`no_data` (enabled but no successful tick yet) | `stale: ...s ago`"
+        ),
+    )
+
+
+class ReadinessResponse(BaseModel):
+    status: Literal["ready", "not_ready"]
+    checks: ReadinessChecks
+
+
+@router.get(
+    "/api/health/live",
+    response_model=LivenessResponse,
+    summary="Liveness probe (process responsive)",
+    description=(
+        "Trivial liveness probe — returns 200 if the Python process is "
+        "responsive. No downstream dependency checks. Failing liveness "
+        "should trigger a pod restart."
+    ),
+)
+async def liveness() -> LivenessResponse:
+    return LivenessResponse(status="alive")
+
+
+@router.get(
+    "/api/health/ready",
+    response_model=ReadinessResponse,
+    summary="Readiness probe (downstream healthy)",
+    description=(
+        "Readiness probe — 200 if DB reachable AND scheduler heartbeat is "
+        "fresh (or scheduler is disabled by config), else 503. Use this "
+        "for k8s readinessProbe / load-balancer health checks."
+    ),
+    responses={
+        200: {"description": "Backend ready to serve requests"},
+        503: {"description": "Backend not ready (DB or scheduler degraded)"},
+    },
+)
+async def readiness(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> ReadinessResponse:
+    db_status = "healthy"
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        db_status = f"unhealthy: {type(exc).__name__}"
+
+    if not settings.enable_agent_scheduler:
+        scheduler_status = "disabled"
+    else:
+        last_tick_epoch = _read_scheduler_last_tick_epoch()
+        if last_tick_epoch <= 0.0:
+            # Scheduler enabled but never produced a successful cycle yet.
+            # On a fresh boot this is normal; surface it as `no_data` so
+            # readiness doesn't flap during the first interval.
+            scheduler_status = "no_data"
+        else:
+            # Compare against `time.time()` directly. The gauge is set with
+            # `time.time()` (epoch UTC) in agent_scheduler.py; using
+            # `datetime.utcnow().timestamp()` would silently apply the local
+            # timezone offset on naive datetimes and produce wrong deltas
+            # on any non-UTC host.
+            import time as _time
+
+            seconds_since = _time.time() - last_tick_epoch
+            threshold = settings.agent_scheduler_interval_seconds * 2
+            if seconds_since > threshold:
+                scheduler_status = f"stale: last tick {int(seconds_since)}s ago"
+            else:
+                scheduler_status = "healthy"
+
+    is_ready = db_status == "healthy" and not scheduler_status.startswith("stale")
+    if not is_ready:
+        response.status_code = 503
+
+    return ReadinessResponse(
+        status="ready" if is_ready else "not_ready",
+        checks=ReadinessChecks(database=db_status, scheduler=scheduler_status),
     )

@@ -1673,3 +1673,107 @@ Backend production-ready su 4 dimensioni di hardening:
 ### Prossima task
 
 **FASE 7.2 — Observability** (Prometheus + OpenTelemetry, 6-10h). Brief denso atteso quando founder dà via libera. Backend pausa fino ad allora.
+
+---
+
+## [7.2] observability: prometheus + opentelemetry + structlog correlation + k8s probes — 2026-05-02
+
+### Cosa è stato fatto
+
+Stack observability foundation chiuso end-to-end in 5 sub-task atomiche, commit complessivo a fine FASE per coerenza con [7.1] / [7.0] (single concept = single commit, archeology grep-friendly: `git log --oneline | grep '\[7\.'`).
+
+#### [7.2.1-2] Prometheus instrumentator + 11 custom metrics
+- `prometheus-fastapi-instrumentator` setup in `main.py` con `excluded_handlers=["/metrics"]` (self-instrumentation anti-pattern bloccato + test esplicito `test_metrics_endpoint_excluded_from_self_instrumentation` lock disciplinare).
+- 11 custom metrics in `app/core/metrics.py` con naming `vifaras_<domain>_<entity>_<action>_<unit>` (prefix anti-collisione con auto-instrumented + Prometheus defaults):
+  - **Auth**: `vifaras_signup_completed_total`, `vifaras_login_completed_total`
+  - **Security**: `vifaras_rate_limit_hits_total{endpoint}`, `vifaras_moderation_rejections_total{field, code}`
+  - **Business**: `vifaras_intents_created_total{category, side}`, `vifaras_matches_discovered_total`, `vifaras_deals_signed_total`, `vifaras_deals_canceled_total`
+  - **Agent runtime**: `vifaras_agent_tick_duration_seconds` (histogram, buckets 0.1-60s), `vifaras_agent_api_calls_total{status}`
+  - **Scheduler**: `vifaras_scheduler_tick_total{status}`, `vifaras_scheduler_last_tick_timestamp` (gauge)
+- Hook implementati: signup/login complete in `auth_service.py`, rate-limit/moderation handlers in `rate_limit.py`/`error_handlers.py`, intent create in `intent_service.py`, match discovery in `match_service.py`, deal sign/cancel in `deal_service.py`, agent API in `orchestrator.py`, scheduler discovery in `agent_scheduler.py`.
+- AGENT_TICK_DURATION_SECONDS + SCHEDULER_LAST_TICK_TIMESTAMP definiti ma test deferred a [7.2.3] (test esplicito di duration histogram + scheduler timestamp gauge richiede mock di tempo o injection — più semplice testarli quando arrivano manual spans setup con fixture comune).
+- 8 test in `test_metrics.py` (Prometheus exposition format, /metrics 200 unauth, self-exclude, signup/login increments, rate-limit/moderation/intent labelled increments).
+- **Bug intercettato**: test moderation con label sbagliata. Pattern Prometheus counter labels: in isolation tutti zero, ma in test suite condivisa lo stato accumula. Test devono asserire **delta su stessa label set**, non valori assoluti. Pattern preservato. Code value in moderation è `too_long` (snake_case verbatim dal `ModerationError.code`) — coerente con typed service errors, future label query Prometheus userà quei valori esatti.
+
+#### [7.2.3] OpenTelemetry SDK + manual spans
+- `opentelemetry-sdk` + 4 instrumentor (`fastapi`, `sqlalchemy`, `httpx`, `exporter-otlp`) aggiunti via `uv add`. Resolved 101 packages clean in 501ms. Anthropic 0.97 usa httpx puro (JSON over wire) — zero collisione protobuf/grpcio.
+- `app/core/telemetry.py` (nuovo, 161 righe): `setup_telemetry(app)` + `shutdown_telemetry()` + `get_tracer(name)`. Idempotent guard `_initialized`. Console exporter sync (`SimpleSpanProcessor`) per dev; OTLP gRPC con `BatchSpanProcessor` per prod (lazy import — niente grpcio se exporter=console).
+- 3 settings in `config.py`: `telemetry_enabled=False`, `telemetry_exporter="console"`, `telemetry_otlp_endpoint="http://localhost:4317"`.
+- Auto-instrumentation: FastAPI (con `excluded_urls="/metrics,/health"` — coerente con [7.2.2] discipline), SQLAlchemy (chiamato 2× per async + sync engine: il sync_engine usato da `mandate_verifier.py` è separato dall'`AsyncEngine.sync_engine` accessor), HTTPXClient (cattura Anthropic + Self verifier outbound).
+- Manual spans in `orchestrator.py`:
+  - `agent.tick` top-level wrap di `run_tick`. Attributes: `agent.id`, `user.id`, `mandate.id`, `agent.tick.success`, `agent.tick.reason`, `agent.tick.turns_used`, `agent.tick.tool_calls_count`, `agent.tick.estimated_cost_usd`. Estratto `_run_tick_inner` per pulizia attribute-set in fascia outer.
+  - Tool sub-spans con mappa `_TOOL_SPAN_NAMES` (semantica brief 7.2.3): `agent.matching` ← `search_matches`, `agent.negotiation` ← send/counter/reject offer, `agent.signing` ← `accept_offer`, `agent.tool` fallback per `create_intent`/`read_inbox`/`check_state`/`ask_user`. Attributes: `tool.name`, `tool.status`, `matches.count` (solo per `agent.matching` quando `status=="ok"`).
+- 8 test in `test_telemetry.py` (disabled-returns-False, enabled-idempotent, top-level-span, identity-attrs, outcome-attrs, agent.matching-span, matches.count-attr, agent.negotiation-span).
+
+#### [7.2.4] structlog trace_id correlation
+- `add_trace_context(_logger, _method, event_dict)` processor in `core/logging.py`. Defensive: `span is None or not span.is_recording()` → no-op; `not ctx.is_valid` → no-op; altrimenti inietta `trace_id` (32-char hex) + `span_id` (16-char hex) — canonical OTel format per Jaeger/Tempo/Loki cross-tool correlation.
+- Inserito al posto **6 di 8** nel processor chain (tra `dict_tracebacks` e `EventRenamer`). Order matters: tutti i raw enricher girano prima → pieno event_dict disponibile; renderers serializzano dopo → trace IDs finiscono in JSON output.
+- 5 test direct-call pattern (pure processor function, no structlog reconfigure): noop-no-span, inject-on-span, ids-match-context, nested-spans-trace-shared-span-distinct, preserve-existing-keys.
+- Smoke test (`TELEMETRY_ENABLED=true` + nested `agent.tick > agent.matching` spans): stesso `trace_id` cross-span, `span_id` distinto per child, no inject fuori dagli span. Future Loki/Tempo deploy può fare `{trace_id="abc..."}` query immediata senza ulteriori modifiche backend.
+
+#### [7.2.5] Kubernetes-ready health probes
+- `/api/health/live` (trivial 200 always, response `{status: "alive"}`). Liveness probe: failing → pod restart.
+- `/api/health/ready` (DB SELECT 1 + scheduler heartbeat, 200/503). Readiness probe: failing → traffic gated away senza restart.
+- Scheduler heartbeat sorgente: `SCHEDULER_LAST_TICK_TIMESTAMP` Prometheus gauge (in-memory, `time.time()` epoch). Helper `_read_scheduler_last_tick_epoch()` isolato per anticipare V0.5+ multi-replica migration (vedi IDEAS_BACKLOG).
+- Stati scheduler distinti:
+  - `disabled` → 200 (V0 default `enable_agent_scheduler=False`)
+  - `no_data` → 200 (enabled ma fresh boot, gauge ancora a 0; rolling update grace period)
+  - `healthy` → 200 (`time.time() - last_tick_epoch ≤ 2× interval_seconds`, default 120s)
+  - `stale: last tick Ns ago` → 503 (oltre threshold)
+- 6 test in `test_health_probes.py` (live, disabled, recent, stale-503, no-data, db-down-503).
+
+### Bug intercettato e fissato
+
+**`datetime.utcnow().timestamp()` ≠ `time.time()` su sistema non-UTC**. Prima implementazione di readiness usava `datetime.utcnow().timestamp() - last_tick_epoch`. `datetime.utcnow()` ritorna **naive datetime** (no tzinfo); `.timestamp()` su naive datetime assume **local TZ del sistema**, non UTC. Su WSL2 UTC+2 (questo box), shift di 7200s. Il test `test_readiness_503_when_scheduler_stale` (deliberatamente nel brief) ha catturato il bug: `time.time()-300` (5 min ago) calcolava `seconds_since` ≈ -6900, quindi "healthy" invece di "stale". Fix: `time.time() - last_tick_epoch` direct, coerente con la sorgente. Comment esplicito nel codice. **Bug latente** che sarebbe emerso solo su deploy con local TZ ≠ UTC — alcuni cloud provider lasciano host TZ a UTC, altri no.
+
+### Decisioni V0 documentate (non esplicite nei brief)
+
+- **Telemetry default disabled** (`telemetry_enabled=False`). Setup_telemetry no-op + global tracer NoOp + manual span context manager → zero overhead in test/CLI/dev senza opt-in. `TELEMETRY_ENABLED=true` flip via env per dev verification.
+- **Console exporter V0, OTLP V0.5+ deploy**. Console = `SimpleSpanProcessor` sync, verbose JSON multi-line per dev/inspection. OTLP gRPC = `BatchSpanProcessor` async, lazy import (grpcio non caricato se console).
+- **Manual spans tool-level (non turn-level)**. HTTPX auto-instrumentor cattura già `client.messages.create()`. Wrapping turn aggiungerebbe layer ridondante per zero signal. Pattern: span manuale = "logical action", span auto = "I/O event". Layer separati, niente ridondanza.
+- **Scheduler-level span deferred**. `agent_scheduler.discover_and_dispatch_ticks` spawna ticks via `asyncio.create_task` fire-and-forget — uno span discovery padre si chiuderebbe prima dei child agent.tick spans, producendo orphan visualization. Decisione: agent.tick come root-span per ogni dispatched user (semanticamente "una iterazione = un trace, indipendente da come è stata schedulata"). Aggregation cross-tick fattibile via `vifaras_scheduler_tick_total` counter. Pattern detach context documentato in IDEAS_BACKLOG come V0.5+ refinement.
+- **Gauge in-memory come source of truth scheduler heartbeat**. Niente DB write nel hot path scheduler, coerenza con osservabilità (stessa metric Prometheus è autorevole), V0 single-replica zero friction. V0.5+ multi-replica refactor a DB-backed/Redis tramite rewrite del solo helper `_read_scheduler_last_tick_epoch()` (boundary già isolato).
+- **Test fixture monkey-patcha `_tracer` modulo-level**, non `_TRACER_PROVIDER` global. Bypassa `ProxyTracer` caching subtle, isolato per test, niente global state mutation. Pattern preservato come standard.
+- **Direct-call test pattern per processor puro** invece di `LogCapture`. Test al livello giusto di astrazione: pure function `(logger, method, event_dict) -> dict` → direct call, no structlog reconfigure. `LogCapture` è integration-level, overhead inutile per contratto del singolo processor.
+- **`scheduler_status="no_data"` → 200, non 503**. Distinzione "not ready yet" (transitional, accept) vs "stale" (degraded, reject). Fresh boot con scheduler enabled ma gauge ancora 0 fino al primo tick (60s default): se ritornassimo 503 in quella finestra, k8s rifiuterebbe traffico per 60s a ogni rolling update — orchestrator deadlock pattern. Calibrazione conservativa.
+- **Niente probe rate limiting**. `/api/health/live` e `/api/health/ready` sono scrape-rate (k8s probe ogni 10s = 360 req/h). Rate limit aggiungerebbe overhead per zero protezione (no sensitive data leak). Pattern preservato.
+- **Test 503 su misura**: ogni 503 path ha test esplicito (db-down, scheduler-stale). Future regression catch su readiness logic = catch immediato.
+
+### Schema reconciliation NON toccato
+
+Drift sistemico schema.py vs DB scoperto in [7.1.5] (HNSW index, partial indexes, DESC ordering, server_default, deal_messages.sent_at NOT NULL) **resta aperto**. [7.2.x] non ha richiesto migration alembic, quindi nessun trigger per autogenerate. Reconciliation pass (~2-4 ore) resta nel backlog come blocker per future migration non-banali.
+
+### Test scritti / coverage
+
+Pre-7.2: 429 test. Post-7.2: **456 test** (delta +27 cumulativo).
+
+| Sub-task | Tests | File |
+|----------|-------|------|
+| [7.2.1-2] Prometheus | 8 | `test_metrics.py` |
+| [7.2.3] OpenTelemetry | 8 | `test_telemetry.py` |
+| [7.2.4] Structlog correlation | 5 | `test_telemetry_logging.py` |
+| [7.2.5] K8s probes | 6 | `test_health_probes.py` |
+| **Total delta** | **+27** | |
+
+`pytest backend/tests/` → 456 passed in ~16s.
+
+### Blocker / dubbi
+
+- **Schema reconciliation è blocker per future migration non-banali**. Trigger naturale: prima task in [7.4] pre-launch checklist con migration KMS keys table o simile. Vedi `IDEAS_BACKLOG.md` "Schema reconciliation pass".
+- **Warning "Attempting to instrument while already instrumented"** può comparire in standalone scripts (test residui in stesso Python process). Non si ripete in suite pytest (fresh process per session) né in production lifespan startup (singolo call). `_initialized` guard previene problemi reali. Documentato.
+- **OTLP gRPC exporter non testato end-to-end** (richiede collector reale). V0.5+ deploy: configurare collector Tempo/Jaeger + smoke test trace export. Pattern preventivo.
+- **TZ-naive datetime audit deferred a V0.5+** (vedi IDEAS_BACKLOG). Bug fix puntuale è in [7.2.5], audit codebase-wide rinviato al pre-launch checklist.
+
+### Cosa significa "FASE 7.2 completa"
+
+Backend production-ready su 4 dimensioni di osservabilità:
+- **Metriche** ([7.2.1-2]): Prometheus exposition + 11 custom counter/histogram/gauge, /metrics endpoint scrape-ready.
+- **Tracing distribuito** ([7.2.3]): OpenTelemetry SDK + auto-instrumentation HTTP/DB/HTTPX + manual spans agent semantici, console + OTLP exporter.
+- **Log correlation** ([7.2.4]): trace_id+span_id additive injection in JSON logs, future Loki query immediata.
+- **Health probes** ([7.2.5]): liveness + readiness Kubernetes-style, scheduler heartbeat via gauge, separation k8s probe vs frontend status banner.
+
+456 test verdi. **FASE 7.2 chiusa**. Resta FASE 7.3 (cost monitoring + per-user soft cap, 4-6h) + 7.4 (KMS reale, refresh rotation, JWT rotation, privacy policy, 8-12h). Stima residua FASE 7: 12-18 ore.
+
+### Prossima task
+
+**FASE 7.3 — Cost monitoring + per-user soft cap** (4-6h). Brief denso atteso. Backend pausa fino ad allora.

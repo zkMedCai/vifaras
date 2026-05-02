@@ -29,6 +29,12 @@ dependencies = [
   "tenacity>=8.2",
   "cachetools>=5.3",
   "slowapi>=0.1.9",
+  "prometheus-fastapi-instrumentator>=7.1.0",
+  "opentelemetry-sdk>=1.41.1",
+  "opentelemetry-exporter-otlp>=1.41.1",
+  "opentelemetry-instrumentation-fastapi>=0.62b1",
+  "opentelemetry-instrumentation-sqlalchemy>=0.62b1",
+  "opentelemetry-instrumentation-httpx>=0.62b1",
 ]
 
 [project.optional-dependencies]

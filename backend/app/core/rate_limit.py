@@ -104,6 +104,13 @@ async def rate_limit_exceeded_handler(
     if retry_after is not None:
         headers["Retry-After"] = str(int(retry_after))
 
+    # Metrics hook — record cap hit per endpoint for Grafana panels.
+    try:
+        from app.core.metrics import RATE_LIMIT_HITS_TOTAL
+        RATE_LIMIT_HITS_TOTAL.labels(endpoint=request.url.path).inc()
+    except Exception:
+        pass
+
     # Audit hook — never break the response on audit failure.
     try:
         from app.core.db import AsyncSessionLocal

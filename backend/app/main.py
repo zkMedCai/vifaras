@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
@@ -27,6 +28,7 @@ from app.core.db import engine
 from app.core.error_handlers import moderation_error_handler
 from app.core.logging import configure_logging, log
 from app.core.rate_limit import limiter, rate_limit_exceeded_handler
+from app.core.telemetry import setup_telemetry, shutdown_telemetry
 from app.services import agent_scheduler, match_scheduler
 from app.services.content_moderation import ModerationError
 
@@ -35,6 +37,7 @@ from app.services.content_moderation import ModerationError
 async def lifespan(app: FastAPI):
     configure_logging()
     log.info("app.startup", env=settings.app_env, name=settings.app_name)
+    setup_telemetry(app)
     match_scheduler.start_scheduler()
     agent_scheduler.start_scheduler()
     try:
@@ -43,6 +46,7 @@ async def lifespan(app: FastAPI):
         agent_scheduler.shutdown_scheduler()
         match_scheduler.shutdown_scheduler()
         await engine.dispose()
+        shutdown_telemetry()
         log.info("app.shutdown")
 
 
@@ -76,6 +80,23 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Prometheus metrics (7.2). Auto-instruments FastAPI handlers with
+# `http_requests_total`, `http_request_duration_seconds`, and
+# `http_requests_inprogress`; exposes them on /metrics in Prometheus
+# text format. Custom domain metrics live in `app.core.metrics` and are
+# imported below at module scope so they register with the global
+# CollectorRegistry the moment the app boots — otherwise the first
+# scrape on a freshly-started process would miss any counter that
+# hadn't been incremented yet.
+from app.core import metrics as _metrics  # noqa: F401
+
+_instrumentator = Instrumentator(
+    should_group_status_codes=False,
+    should_ignore_untemplated=True,
+    excluded_handlers=["/metrics"],
+)
+_instrumentator.instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 app.include_router(auth_routes.router)
 app.include_router(identity_routes.router)

@@ -52,12 +52,26 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.agents.tool_layer import AGENT_TOOLS, AsyncToolHandler
 from app.core.db import AsyncSessionLocal, SyncSessionLocal
 from app.core.logging import log
+from app.core.telemetry import get_tracer
 from app.models.schema import Agent, DailyCostTracking
 from app.models.views import AgentFullState
 from app.services import audit_service
 from app.services.agent_state_service import AgentNotFound, get_full_state
 from app.services.audit_service import AgentActions
 from app.services.mandate_verifier import MandateVerifier
+
+_tracer = get_tracer("app.agents.orchestrator")
+
+# Tool name → manual-span name. Tools not listed here fall through to the
+# generic ``agent.tool`` span. The split mirrors the brief 7.2.3 taxonomy
+# (matching / negotiation / signing) so dashboards can filter by intent.
+_TOOL_SPAN_NAMES: dict[str, str] = {
+    "search_matches": "agent.matching",
+    "send_offer": "agent.negotiation",
+    "send_counter_offer": "agent.negotiation",
+    "reject_offer": "agent.negotiation",
+    "accept_offer": "agent.signing",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +173,23 @@ class AgentOrchestrator:
         gates pass — so skipped ticks don't consume a connection.
         """
         agent_id = str(agent_id)
+        with _tracer.start_as_current_span("agent.tick") as tick_span:
+            tick_span.set_attribute("agent.id", agent_id)
+            result = await self._run_tick_inner(agent_id, tick_span)
+            tick_span.set_attribute("agent.tick.reason", result.reason)
+            tick_span.set_attribute("agent.tick.success", result.success)
+            tick_span.set_attribute("agent.tick.turns_used", result.turns_used)
+            tick_span.set_attribute(
+                "agent.tick.tool_calls_count", result.tool_calls_count
+            )
+            tick_span.set_attribute(
+                "agent.tick.estimated_cost_usd", result.estimated_cost_usd
+            )
+            return result
+
+    async def _run_tick_inner(
+        self, agent_id: str, tick_span: Any
+    ) -> TickResult:
         async with self._async_session_factory() as async_db:
             # Pre-tick: load state + gate.
             try:
@@ -169,6 +200,12 @@ class AgentOrchestrator:
                     success=False,
                     reason="agent_not_found",
                     error=f"agent {agent_id!r} not found",
+                )
+
+            tick_span.set_attribute("user.id", str(state.user_id))
+            if state.mandate is not None:
+                tick_span.set_attribute(
+                    "mandate.id", str(state.mandate.mandate_id)
                 )
 
             if state.agent_status != "active":
@@ -237,6 +274,7 @@ class AgentOrchestrator:
         while turns < MAX_TURNS_PER_TICK:
             turns += 1
 
+            from app.core.metrics import AGENT_API_CALLS_TOTAL
             try:
                 response = await self.client.messages.create(
                     model=CLAUDE_MODEL,
@@ -245,7 +283,9 @@ class AgentOrchestrator:
                     tools=AGENT_TOOLS,
                     messages=messages,
                 )
+                AGENT_API_CALLS_TOTAL.labels(status="success").inc()
             except Exception as exc:
+                AGENT_API_CALLS_TOTAL.labels(status="error").inc()
                 log.error(
                     "orchestrator.claude_call_failed",
                     agent_id=state.agent_id,
@@ -292,7 +332,18 @@ class AgentOrchestrator:
             tool_results: list[dict[str, Any]] = []
             for block in tool_use_blocks:
                 tool_calls_count += 1
-                tool_result = await handler.handle(block.name, block.input)
+                span_name = _TOOL_SPAN_NAMES.get(block.name, "agent.tool")
+                with _tracer.start_as_current_span(span_name) as tool_span:
+                    tool_span.set_attribute("tool.name", block.name)
+                    tool_result = await handler.handle(block.name, block.input)
+                    tool_span.set_attribute("tool.status", tool_result.status)
+                    if (
+                        block.name == "search_matches"
+                        and tool_result.status == "ok"
+                        and isinstance(tool_result.data, dict)
+                    ):
+                        matches = tool_result.data.get("matches") or []
+                        tool_span.set_attribute("matches.count", len(matches))
                 tool_calls_log.append({
                     "tool": block.name,
                     "status": tool_result.status,

@@ -351,6 +351,9 @@ async def _upsert_match(
             },
             success=True,
         )
+        from app.core.metrics import MATCHES_DISCOVERED_TOTAL
+        MATCHES_DISCOVERED_TOTAL.inc()
+
         # 6.1 — fire-and-forget UX notification to BOTH parties on net-new
         # match. We deliberately don't notify on score-only updates: a
         # match that already exists is already in the user's list, the
