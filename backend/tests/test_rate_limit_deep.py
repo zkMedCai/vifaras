@@ -414,7 +414,7 @@ def test_user_key_falls_back_when_token_uses_wrong_kind():
 
     bad_kind_jwt = pyjwt.encode(
         {"sub": str(uuid.uuid4()), "kind": "refresh"},
-        settings.jwt_secret,
+        settings.jwt_secret_current,
         algorithm=settings.jwt_alg,
     )
     req = _request_with_headers(

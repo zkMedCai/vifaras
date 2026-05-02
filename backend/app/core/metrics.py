@@ -52,6 +52,14 @@ REFRESH_TOKEN_REUSE_TOTAL = Counter(
     "audit log query (action=refresh_token_reuse).",
 )
 
+JWT_DECODE_FALLBACK_TOTAL = Counter(
+    "vifaras_jwt_decode_fallback_total",
+    "JWT decodes that succeeded only via the previous (rotation-window) "
+    "secret rather than the current one. Indicates an active rotation; should "
+    "fall to zero once the overlap window closes and `jwt_secret_previous` "
+    "is cleared.",
+)
+
 MODERATION_REJECTIONS_TOTAL = Counter(
     "vifaras_moderation_rejections_total",
     "Total content-moderation rejections (HTTP 422 responses).",

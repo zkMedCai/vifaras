@@ -32,6 +32,7 @@ import jwt
 from fastapi import Header, HTTPException
 
 from app.core.config import settings
+from app.core.metrics import JWT_DECODE_FALLBACK_TOTAL
 
 _KIND_ACCESS = "access"
 _KIND_CHALLENGE = "challenge"
@@ -44,15 +45,44 @@ def _now() -> datetime:
 
 
 def _encode(payload: dict[str, Any]) -> str:
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_alg)
+    """Sign with the current JWT secret. Always — `previous` is verify-only."""
+    return jwt.encode(payload, settings.jwt_secret_current, algorithm=settings.jwt_alg)
 
 
 def _decode(token: str, *, expected_kind: str) -> dict[str, Any]:
-    payload = jwt.decode(
-        token,
-        settings.jwt_secret,
-        algorithms=[settings.jwt_alg],
-    )
+    """Verify with `current` first, fall back to `previous` if it is set.
+
+    The rotation overlap window pattern: during a rotation, `previous` keeps
+    pre-rotation tokens valid until they expire on their own. Empty
+    `previous` (the steady-state default) means a single decode attempt.
+
+    `ExpiredSignatureError` short-circuits the fallback — if the signature
+    matched and the token is just expired, trying the other secret would
+    only succeed if the same secret signed it twice, which it didn't.
+    """
+    secrets_to_try = [settings.jwt_secret_current]
+    if settings.jwt_secret_previous:
+        secrets_to_try.append(settings.jwt_secret_previous)
+
+    payload: dict[str, Any] | None = None
+    last_exc: jwt.InvalidTokenError | None = None
+    for index, secret in enumerate(secrets_to_try):
+        try:
+            payload = jwt.decode(token, secret, algorithms=[settings.jwt_alg])
+            if index > 0:
+                JWT_DECODE_FALLBACK_TOTAL.inc()
+            break
+        except jwt.ExpiredSignatureError:
+            raise
+        except jwt.InvalidTokenError as exc:
+            last_exc = exc
+            continue
+
+    if payload is None:
+        # Both attempts failed (or only one secret was configured and it failed).
+        # last_exc is guaranteed to be set because the loop ran at least once.
+        raise last_exc  # type: ignore[misc]
+
     if payload.get("kind") != expected_kind:
         raise jwt.InvalidTokenError(
             f"expected kind={expected_kind!r}, got {payload.get('kind')!r}"

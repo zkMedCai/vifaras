@@ -137,7 +137,7 @@ async def test_non_access_jwt_used_as_access_returns_401(http_client) -> None:
 
     bad_kind_jwt = pyjwt.encode(
         {"sub": "u-xyz", "kind": "refresh"},
-        settings.jwt_secret,
+        settings.jwt_secret_current,
         algorithm=settings.jwt_alg,
     )
     http_client.headers["Authorization"] = f"Bearer {bad_kind_jwt}"

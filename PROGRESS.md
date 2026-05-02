@@ -2159,3 +2159,83 @@ Refresh token production-grade end-to-end:
 ### Prossima task
 
 **[7.4.3] JWT secret rotation overlap window** (1-2h). Pattern: `current_secret` + `previous_secret` overlap, transition period per zero-downtime rotation. Brief denso atteso.
+
+---
+
+## [7.4.3] jwt secret rotation overlap window — 2026-05-02
+
+### Discovery — Scenario A pieno, scope ridotto
+
+Singolo `jwt_secret` in config + 2 callsite ENTRAMBI in `core/security.py` (`_encode` line 47, `_decode` line 51). Zero callsite esterni — `core/security.py` è gateway centralizzato. Refactor cross-module: 0. Scope reale ~70 min vs 1.5-2h stima brief, gateway pattern già in place.
+
+### Cosa è stato fatto
+
+#### Architettura
+- **Settings**: `jwt_secret` (single) → `jwt_secret_current` + `jwt_secret_previous` (dual). Rename clean (no alias backward-compat — V0 dev environment, coerenza con [7.4.2]).
+- **`_encode`**: firma sempre con `jwt_secret_current`. Niente branching, gateway uniforme.
+- **`_decode`**: try `current` first, fallback to `previous` solo se non-empty. Loop minimal (~20 lines), niente over-engineering.
+- **`ExpiredSignatureError` short-circuit**: signature OK + `exp` past → raise immediato, niente fallback. Razionale: stesso secret non firmerebbe mai 2 volte lo stesso token, fallback su altro secret restituirebbe solo `InvalidSignatureError` che maschera l'expiry meaningful.
+- **Kind validation POST-loop**: signature loop valida WHO firmò, kind check POST-payload valida COSA è il token. Concerns separati. Future debugger vede error specifico (kind error vs signature error).
+
+#### Observability
+- **Prometheus counter** `vifaras_jwt_decode_fallback_total` in `core/metrics.py` (sezione Security): increment solo su fallback success. Niente labels — global aggregate counter (rotation health visibility). Coerente con pattern `USER_COST_CAP_HITS_TOTAL` ([7.3.4]) e `REFRESH_TOKEN_REUSE_TOTAL` ([7.4.2.5]).
+
+#### Operational documentation
+- **`docs/JWT_ROTATION_PROCEDURE.md`** (~145 lines, prima volta che project ha `docs/` directory): 5-step founder procedure (generate → atomic env update → reload → monitor window → retire previous) + rollback procedure + 6-box pre-rotation checklist.
+- Pattern verbose Path 1 confermato per high-risk operational doc (founder under pressure during real rotation).
+- Niente sample secret/token inline (security-conscious).
+- Future maintainer beneficia di "stressed-future-self" disciplined writing.
+
+#### Lock contract α
+- Challenge tokens usano stesso rotation pool come access tokens. Single `_encode` / `_decode` gateway uniform per tutti i JWT. Decisione α confermata da founder pre-implementation. Test esplicito `test_decode_challenge_token_falls_back_to_previous` lock il contract per future maintainer.
+
+### Bug catched durante esecuzione
+
+**2 leftover refs** `settings.jwt_secret` in `test_rate_limit_deep.py:417` + `test_tier_gating.py:140` (hand-crafted JWT inline aggiunto in `[7.4.2.6]`). Catched dal `grep jwt_secret | grep -v "_current\|_previous"` post-rename. Pattern: grep verify post-rename è disciplina worth preserving — senza, regression sarebbe esplosa silently in test execution. Esempio concreto del valore "verify > assume".
+
+### Test scritti / coverage
+
+Pre-7.4.3: 484 test. Post-7.4.3: **494 test** (delta +10, zero regression, zero warnings).
+
+| Test | Coverage |
+|---|---|
+| `test_encode_uses_current_secret` | `_encode` firma con current; foreign secret InvalidSignatureError |
+| `test_decode_with_current_secret_succeeds` | Steady state decode OK |
+| `test_decode_no_fallback_no_increment` | Counter non incrementa su current path |
+| `test_decode_falls_back_to_previous_when_active` | Token signed previous → decode OK via fallback |
+| `test_decode_fallback_increments_metric` | Fallback success → counter +1 |
+| `test_decode_does_not_fall_back_when_previous_empty` | No previous → foreign signed → InvalidTokenError |
+| `test_decode_invalid_token_raises_after_all_attempts` | Random secret → both fail → raise |
+| `test_decode_expired_token_short_circuits_no_fallback` | exp past → ExpiredSignatureError immediately |
+| `test_decode_kind_mismatch_raises` | Signature OK + kind mismatch → kind error specifico |
+| `test_decode_challenge_token_falls_back_to_previous` | Lock contract α |
+| **Total delta** | **+10** |
+
+`pytest backend/tests/` → 494 passed in 16.55s. Run time invariato.
+
+### Decisioni V0 documentate
+
+- **Settings field naming**: `jwt_secret_current` / `jwt_secret_previous` (descriptive, env vars `JWT_SECRET_CURRENT/PREVIOUS`). Rename clean da `jwt_secret`, coerente con pattern [7.4.2] setting rename `jwt_refresh_ttl_days → refresh_token_ttl_days`.
+- **Niente `kid` header JWT**: V0 simplification "try current then previous" pattern. Worst case 2 attempts decode (~50μs). V0.5+ refinement con `kid` lookup (IDEAS_BACKLOG entry).
+- **Manual rotation procedure**: V0.5+ automation deferred (DB-backed secret storage + scheduled cron + audit trail). Markdown founder procedure è sufficient per single-instance dev/alpha.
+- **Single rotation pool per JWT type** (decisione α): challenge + access usano gateway uniforme. Trade-off: challenge fallback è naturalmente unused (TTL 5 min < window 30 min) ma niente edge case mentale per future maintainer.
+- **Counter aggregato globale** (no labels): rotation health visibility, niente cardinalità issue. Coerente con pattern observability anomaly-rate counters [7.3.4]/[7.4.2.5].
+- **`ExpiredSignatureError` short-circuit**: explicit branch nel loop. Pattern: ogni exception class ha semantica diversa, preserva propagation per caller meaningful debug.
+- **Test secret length ≥32 bytes**: production-grade constraints anche in test (RFC 7518 §3.2 HMAC SHA-256). Disciplina che evita "test passa con weak key, production fail con strong key validation enabled".
+- **`_payload()` helper inline test**: DRY locale, scope file, niente conftest pollution.
+- **`type: ignore[misc]`** su `raise last_exc` post-loop: pragmatic, mypy non sa che last_exc è guaranteed non-None se loop ran. Trade-off vs `assert last_exc is not None` — equally valid, scelto type-ignore per minimal noise.
+
+### Cosa significa "FASE 7.4.3 completa"
+
+JWT secret rotation production-grade end-to-end:
+- **Zero-downtime rotation**: overlap window pattern, access token in flight pre-rotation continuano a funzionare via fallback finché TTL scade naturalmente.
+- **Observability**: Prometheus counter per rotation window monitoring, founder può seguire l'andamento durante rotation reale.
+- **Operational doc**: 5-step procedure documentata + rollback path + checklist pre-rotation per founder.
+- **Test coverage**: 10 test su encode/decode/fallback/short-circuit/kind/lock-contract — pure-unit, run 0.23s.
+- **Future-proof**: 3 IDEAS_BACKLOG entries (kid header V0.5+, automation V0.5+, KMS signing V1+) tracciano evoluzione architetturale.
+
+494 test verdi. **FASE 7.4.3 chiusa**. Resta FASE 7.4.4 (privacy policy custom GDPR-compliant, 1-2h, scope diverso: legal text invece di code).
+
+### Prossima task
+
+**[7.4.4] privacy policy custom GDPR-compliant** (1-2h). Scope: testo legale strutturato + integrazione sito/app. Closure FASE 7.4 + closure FASE 7.

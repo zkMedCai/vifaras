@@ -27,7 +27,13 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     postgres_db: str = "marketplace"
 
-    jwt_secret: str = "change-me-in-dev-and-always-rotate-in-prod"
+    # JWT signing secrets ([7.4.3]). Two-secret overlap window for zero-downtime
+    # rotation: `current` signs every new token, `previous` is the optional
+    # fallback that verifies still-valid tokens issued before the rotation.
+    # Empty `previous` means no rotation in progress — verify happens against
+    # `current` only. Bootstrap procedure: docs/JWT_ROTATION_PROCEDURE.md.
+    jwt_secret_current: str = "change-me-in-dev-and-always-rotate-in-prod"
+    jwt_secret_previous: str = ""
     jwt_alg: str = "HS256"
     jwt_access_ttl_min: int = 15
     refresh_token_ttl_days: int = 30  # opaque, DB-backed since [7.4.2]

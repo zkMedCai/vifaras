@@ -58,6 +58,56 @@ Catched 2 volte in FASE 7.4:
 
 ---
 
+### JWT `kid` header for explicit key ID (V0.5+ refinement)
+
+**Trigger**: V0.5+ scaling con multiple key candidates simultaneously (es. multiple regions, multiple services, N-secret rotation history).
+
+**Background**: V0 [7.4.3] usa "try current then previous" pattern senza `kid`. Worst case 2 attempts decode (~50μs total). Funziona per overlap window 2-secret. Non scala a N-secret né a key catalogs cross-region.
+
+**Action V0.5+**:
+- Aggiungere `kid` claim nell'header JWT al sign time (`{"kid": "v3"}`)
+- Decode lookup secret by `kid` invece di trial-and-error loop
+- Settings da single pair a key catalog: `jwt_secrets: dict[str, str]` mappato `kid → secret`
+- Backward compat: token senza `kid` cadono sul fallback loop esistente per X giorni
+
+**Effort**: 2-3 ore (header injection + lookup logic + settings refactor + test).
+
+---
+
+### JWT secret rotation automation (V0.5+ deploy)
+
+**Trigger**: V0.5+ deploy production, esp. multi-replica.
+
+**Background**: V0 [7.4.3] manual rotation via env var update + restart, documentato in `docs/JWT_ROTATION_PROCEDURE.md`. Acceptable single-instance dev/alpha, friction in production multi-replica (atomic env var update cross-replica è non-trivial).
+
+**Action V0.5+**:
+- DB-backed secret storage (analogous a KMS pattern V0 [7.4.1])
+- Scheduled rotation cron (es. weekly auto-rotate, configurable)
+- Auto-retire `previous` post-window (no manual cleanup founder)
+- Audit trail: `SecurityActions.JWT_SECRET_ROTATED` constant + log entry
+- Multi-replica safe: secret rotation state in DB, ogni replica reads at decode time
+
+**Effort**: 3-4 ore (DB schema + scheduler + audit + multi-replica test).
+
+---
+
+### JWT signing via KMS asymmetric (V1+ enterprise)
+
+**Trigger**: V1+ se compliance richiede HSM-backed signing keys o federation cross-service.
+
+**Background**: V0 HMAC-SHA256 con shared secret in env. Symmetric crypto significa che anyone con verify capability ha anche sign capability — unsuitable per scenarios federated/HSM. V1+ pre-enterprise potrebbe richiedere asymmetric (RS256/ES256) con private key in cloud KMS (AWS KMS Sign API o equivalent).
+
+**Action V1+**:
+- Switch HS256 → RS256 (o ES256 per smaller signature)
+- Sign via KMS provider Sign API (AWS KMS supporta RSA/ECDSA signing senza esporre private key)
+- Public key esposto via JWKS endpoint per verification third-party
+- Caching layer JWKS per performance (TTL configurabile)
+- Frontend impact: cambia algorithm in JWT header, niente altro client-side
+
+**Effort**: 1 settimana (significant refactor + auth flow change + JWKS endpoint + frontend coordination + test integration end-to-end).
+
+---
+
 ### Conftest settings caching: testcontainer effective vs LOCAL DB shadow (V0.5+ refactor)
 
 **Trigger**: scoperto durante diagnosi `[7.4.1.fix]`. Non bloccante per V0 ma anti-pattern test isolation.
@@ -217,9 +267,10 @@ Catched 2 volte in FASE 7.4:
 - Risolve race condition teorica
 - Riferimento: DQ-9
 
-### JWT secret rotation strategy (7.4)
-- Rolling key, kid claim, graceful rotation
-- Pre-launch checklist obbligatoria
+### ~~JWT secret rotation strategy (7.4)~~ — DONE in [7.4.3]
+- ✅ Implementato in `[7.4.3]`: dual-secret (`current` + `previous`) overlap window pattern + Prometheus counter monitoring + 5-step founder procedure in `docs/JWT_ROTATION_PROCEDURE.md`.
+- `kid` claim deferred a V0.5+ (entry "JWT kid header for explicit key ID" in Auth tokens hardening).
+- Pre-launch checklist embedded in operational doc.
 
 ### WebAuthn config pre-launch (7.4)
 - Trigger: pre-launch alpha (deploy pubblico).
