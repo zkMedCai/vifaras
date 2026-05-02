@@ -119,29 +119,24 @@
 
 ## Categoria: Schema / Migrations
 
-### Schema reconciliation pass [URGENT, blocker per future autogenerate]
+### Schema reconciliation policy (V0.5+ defensive)
 
-**Discovered**: [7.1.5 step 1] durante autogenerate per audit_log migration.
+**Status**: [7.4.0] one-time reconciliation **COMPLETED** (2026-05-02). 23 drift risolti, future autogenerate produce migration vuote.
 
-**Problem**: `alembic --autogenerate` produce spurious DROP/REWRITE su elementi DB esistenti che non sono dichiarati in model `schema.py`:
-- HNSW index `ix_intents_embedding_hnsw` (CRITICAL: required for FASE 4.3 vector match)
-- Partial indexes su `matches` table (`ix_matches_buy_intent_discovered_score`, `ix_matches_sell_intent_discovered_score`)
-- DESC vs ASC ordering su `ix_notifications_user_*` (model says ASC, DB has DESC)
-- `server_default` parametri mancanti su ~10 columns (notifications.payload, daily_cost_tracking.*, users.tier, deals.*)
-- `deal_messages.sent_at` NOT NULL discrepancy
+**Trigger periodico**: ogni 5 migration nuove o pre-major release.
 
-**Risk**: future autogenerate mid-flight di altra migration rischia di applicare spurious diff, rompendo features critiche (HNSW = match pipeline).
+**Background**: V0 [7.4.0] è snapshot one-time. Drift può ri-accumulare se future migration custom aggiunge DDL non riflesso in `schema.py` (es. raw `op.execute("CREATE INDEX ...")` senza corresponding `__table_args__` update).
 
-**Mitigation V0** (immediate): documento in PROGRESS.md di [7.1.5] che ogni autogenerate output va manualmente filtrato per applicare SOLO i diff intenzionali.
+**Action periodica**:
+1. `uv run alembic revision --autogenerate -m "DRIFT_CHECK" --rev-id zzz_check`
+2. Inspect output: `cat backend/migrations/versions/zzz_check_*.py`
+3. Atteso: `def upgrade(): pass` + `def downgrade(): pass`
+4. Se drift presente: immediate reconciliation con same pattern di [7.4.0] (categorize accidentale/intentional, reflect in model o document)
+5. Cleanup: `rm backend/migrations/versions/zzz_check_*.py`
 
-**Action V0.5+** (task [7.X] dedicata, ~2-4 ore):
-1. Audit complete schema.py vs live DB con `alembic check` o equivalent
-2. Per ogni drift, decidere: reflect in model OR document as intentional drift in comments
-3. Sync `server_default` parametri
-4. Add missing index declarations in model
-5. Verify autogenerate produce clean diff (no spurious changes) post-reconciliation
+**Tooling possible V0.5+**: pre-commit hook che runna dry-run check su CI, fail se output non è `pass`. Catches drift al PR-time invece di accumular durante development cycles.
 
-**Trigger**: prima task che richiede nuova migration NON banale (es. nuova table, alter column complex).
+**Effort recurring**: 30 min - 2h per cycle, dipende drift accumulato (idealmente zero se policy è seguita).
 
 ---
 

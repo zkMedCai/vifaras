@@ -1873,3 +1873,82 @@ Cost protection infrastructure end-to-end:
 ### Prossima task
 
 **FASE 7.4 — Pre-launch checklist** (8-12h). Brief denso atteso. Schema reconciliation pass è prerequisite per future migration; valuteremo ordering nel brief.
+
+---
+
+## [7.4.0] schema reconciliation pass — 2026-05-02
+
+### Cosa è stato fatto
+
+Eliminato il drift latente accumulato tra `schema.py` e DB live. Reconciliation one-time pre-step per [7.4.x] (KMS migration) — future autogenerate produce migration vuote, niente più filter manuale per ogni nuova migration.
+
+### Discovery (`[7.4.0.1]`)
+
+23 drift identificati e classificati via 2 strategie complementari:
+- **Strategy A — alembic dry-run autogenerate**: ha catturato l'inventario completo (indexes mancanti, `server_default` mancanti, NOT NULL discrepancy).
+- **Strategy B — SQLAlchemy reflection** su `pg_indexes` + `information_schema.columns`: ground truth DB-side per validare classificazione su casi sospetti.
+
+**Classificazione finale** (zero INTENTIONAL drift emersi):
+- 22 ACCIDENTAL: model dichiarazioni accidentalmente incomplete vs DB
+- 1 UNSURE escalata al founder: `deal_messages.sent_at` model regression vs migration history
+
+### Apply (`[7.4.0.2]`) — pattern incrementale per categoria
+
+#### Cat 1 — INDEXES (6) — `__table_args__`
+- `ix_intents_embedding_hnsw` — HNSW vector index pgvector cosine_ops m=16 ef=64. Commento esplicativo (3 righe) per syntax PostgreSQL-specific non-portabile.
+- `ix_matches_buy/sell_intent_discovered_score` — partial WHERE `status='discovered'` su `(intent_id, combined_score DESC)`. Pattern `text("col DESC")` + `postgresql_where=text(...)`.
+- `ix_notifications_user_recent` + `ix_notifications_user_unread` — DESC ordering corretto via `text("created_at DESC")` (model dichiarava ASC).
+- `ix_daily_cost_user_date` — drift mio da [7.3.2] migration non riflesso in `__table_args__`. Aggiunto a `DailyCostTracking`.
+
+#### Cat 2 — NULLABILITY (1) — Path A (relax model)
+- `deal_messages.sent_at`: `nullable=False` → `nullable=True`. Drift originato da regressione model-side (commit successivo che ha cambiato il model senza migration di accompagnamento; DB era coerente con migration `5ef3a914c6e6_initial_schema.py`). Path A scelto per:
+  1. DB è source of truth per chi dei 2 ha la storia coerente.
+  2. Path B (accept residual) violerebbe scope criterio "future autogenerate produce migration vuota".
+  3. Path C (defer migration per re-strict DB) sarebbe scope creep — la realtà del DB è OK così, ORM `default=datetime.utcnow` continua a fornire value automatic on INSERT.
+
+  Commento di 5 righe documentano: origine del drift, mitigazione, path di re-strict futuro.
+
+#### Cat 3 — SERVER_DEFAULT (16) — pattern uniforme two-layer
+- Aggiunto `server_default=text(...)` a ogni Column, **`default=` Python-side preservato**.
+- Mappatura: `text("0")` per integer/numeric, `text("false")` per boolean, `func.now()` per timestamps, `text("'literal'")` per string defaults, `text("'{}'::jsonb")` per JSONB defaults, `text("now() + interval '24 hours'")` per `deals.expires_at`.
+- 17 column updated across 7 tables (users, mandate_drafts, mandate_revocation_drafts, step_up_requests, deals, deal_signature_drafts, daily_cost_tracking, notifications, user_questions).
+
+### Verify (`[7.4.0.3]`)
+- Final dry-run autogenerate produce migration vuota: `def upgrade(): pass` + `def downgrade(): pass`. Zero `op.*` calls.
+- Approach incrementale: ogni categoria (Cat 1/2/3) ha avuto dry-run dedicato per isolare regression syntax in tempo zero. Ha catturato edge case `column.desc()` vs `text("col DESC")` (la seconda è la forma canonical che alembic emette nel reverse path, conferma con dry-run).
+- Cleanup tutti i file `zzz*` dry-run rimossi.
+
+### Test (`[7.4.0.4]`)
+- `pytest backend/tests/` → **464 passed in 16.39s** invariati.
+- Niente regressione: reconciliation è solo schema declaration changes, niente logica modificata.
+- ORM `default=` Python-side preservato ovunque, two-layer pattern garantisce backward compat.
+
+### Decisioni V0 documentate
+
+- **Path A su `deal_messages.sent_at`** (relax model). Confermato dal founder. Trade-off accettato: ORM-side strict-check perso, ma `default=datetime.utcnow` continua a fornire value automatic; nessun call site V0 passa esplicitamente `sent_at=None`.
+- **Pattern two-layer defaults preservato**: `default=` Python-side (ORM fires before INSERT) + `server_default=` DDL safety net per raw SQL inserts. Migration originali avevano impostato server_default deliberatamente per safety, model li riflette ora per coerenza autogenerate.
+- **`func.now()` per timestamps**, **`text(...)` per literal expressions**: mix coerente con SQLAlchemy idioms. `func.now()` è canonical e portable; `text(...)` è esplicito per espressioni complesse (`now() + interval '24 hours'`, `'{}'::jsonb`).
+- **Niente migration nuova** in [7.4.0]: scope strict, solo model declaration sync. DB già contiene la realtà.
+- **Zero drift INTENTIONAL emersi**: pattern dominante è "model dichiarazioni accidentalmente incomplete", non "intentional drift consapevole". Reconciliation completa fattibile senza casi grigi.
+- **Commenti sintassi PostgreSQL-specific**: 3-4 righe per HNSW + 2 righe per partial indexes. Documentazione di **complessità sintattica**, non di intentional drift. Future maintainer beneficia.
+
+### Schema reconciliation status
+
+**COMPLETED**. Future autogenerate produce clean diff. Pattern filter manuale [7.1.5]/[7.3.2] **non più richiesto** per [7.4.x] e oltre.
+
+### Drift catalogati
+
+| Categoria | Count | Risoluzione |
+|---|---|---|
+| Indexes mancanti | 6 | Reflect in `__table_args__` |
+| Nullability discrepancy | 1 | Relax model (Path A) |
+| Server_default mancanti | 16 | Two-layer pattern (Python `default=` + DDL `server_default=`) |
+| **Totale** | **23** | |
+
+### Removes blocker for
+
+`[7.4.1]` KMS implementation con migration nuova clean. Niente più "filter manuale" pattern necessario — autogenerate output sarà direttamente applicable.
+
+### Prossima task
+
+**[7.4.1] KMS reale implementation** — replace mock KMS con cloud-managed (AWS KMS / GCP KMS / Hashicorp Vault). Migration probabile per `kms_keys` table (versioning + rotation history). Brief denso atteso.

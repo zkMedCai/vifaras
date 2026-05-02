@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from sqlalchemy import (
     Column, String, Integer, Numeric, Date, DateTime, Boolean,
-    ForeignKey, Text, JSON, BigInteger, Index, UniqueConstraint, LargeBinary
+    ForeignKey, Text, JSON, BigInteger, Index, UniqueConstraint, LargeBinary,
+    func, text
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship
@@ -42,7 +43,7 @@ class User(Base):
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
 
     # Tier corrente di onboarding. Monotonicamente crescente: 0 → 1 → 2.
-    tier = Column(Integer, nullable=False, default=0)
+    tier = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
     # Identità ZK (popolato a tier ≥ 1)
     nullifier_hash = Column(Text, unique=True, nullable=True, index=True)
@@ -170,7 +171,9 @@ class MandateDraft(Base):
     challenge = Column(LargeBinary, nullable=False)
 
     expires_at = Column(DateTime, nullable=False)
-    consumed = Column(Boolean, nullable=False, default=False)
+    consumed = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -197,7 +200,9 @@ class MandateRevocationDraft(Base):
     challenge = Column(LargeBinary, nullable=False)
 
     expires_at = Column(DateTime, nullable=False)
-    consumed = Column(Boolean, nullable=False, default=False)
+    consumed = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -241,7 +246,12 @@ class StepUpRequest(Base):
     challenge = Column(LargeBinary, nullable=False)
     canonical_payload = Column(LargeBinary, nullable=False)
 
-    status = Column(String(16), nullable=False, default="pending")
+    status = Column(
+        String(16),
+        nullable=False,
+        default="pending",
+        server_default=text("'pending'"),
+    )
     expires_at = Column(DateTime, nullable=False)
     resolved_at = Column(DateTime, nullable=True)
 
@@ -308,6 +318,17 @@ class Intent(Base):
     
     __table_args__ = (
         Index("ix_intents_active_category_side", "status", "category", "side"),
+        # HNSW vector index for fast cosine-similarity search on intent
+        # embeddings. Used by FASE 4.3 match pipeline (k-nearest neighbor
+        # retrieval). PostgreSQL-specific syntax via the pgvector extension;
+        # not portable to other DBs. m / ef_construction tuned at v0 default.
+        Index(
+            "ix_intents_embedding_hnsw",
+            "description_embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"description_embedding": "vector_cosine_ops"},
+        ),
     )
 
 
@@ -334,6 +355,22 @@ class Match(Base):
 
     __table_args__ = (
         UniqueConstraint("buy_intent_id", "sell_intent_id", name="uq_match"),
+        # Partial indexes optimising "discovered" status queries — by far the
+        # most common access pattern (scheduler scan, dashboard listings).
+        # Filter clause keeps the index small and queries fast: only
+        # candidate matches awaiting negotiation are in scope.
+        Index(
+            "ix_matches_buy_intent_discovered_score",
+            "buy_intent_id",
+            text("combined_score DESC"),
+            postgresql_where=text("status = 'discovered'"),
+        ),
+        Index(
+            "ix_matches_sell_intent_discovered_score",
+            "sell_intent_id",
+            text("combined_score DESC"),
+            postgresql_where=text("status = 'discovered'"),
+        ),
     )
 
 
@@ -386,7 +423,9 @@ class Deal(Base):
     # negotiated value at accept; "final" is reserved for V1.5+ Trustee
     # post-settlement state.
     agreed_price_cents = Column(BigInteger, nullable=False)
-    currency = Column(String(3), nullable=False, default="EUR")
+    currency = Column(
+        String(3), nullable=False, default="EUR", server_default=text("'EUR'")
+    )
 
     # Step-up signatures (passkey-firmate dagli umani)
     buyer_signature = Column(JSONB, nullable=True)
@@ -394,7 +433,11 @@ class Deal(Base):
     seller_signature = Column(JSONB, nullable=True)
     seller_signed_at = Column(DateTime, nullable=True)
 
-    status = Column(String(20), default="pending_signatures")
+    status = Column(
+        String(20),
+        default="pending_signatures",
+        server_default=text("'pending_signatures'"),
+    )
     # pending_signatures | confirmed | cancelled | expired | completed | disputed
 
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -405,6 +448,7 @@ class Deal(Base):
         DateTime,
         nullable=False,
         default=lambda: datetime.utcnow() + timedelta(hours=24),
+        server_default=text("now() + interval '24 hours'"),
     )
     confirmed_at = Column(DateTime, nullable=True)
     cancelled_at = Column(DateTime, nullable=True)
@@ -440,8 +484,15 @@ class DealSignatureDraft(Base):
     challenge = Column(LargeBinary, nullable=False)
 
     expires_at = Column(DateTime, nullable=False)
-    consumed = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    consumed = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         Index(
@@ -465,7 +516,13 @@ class DealMessage(Base):
 
     encrypted_content = Column(LargeBinary, nullable=False)
     nonce = Column(LargeBinary, nullable=False)
-    sent_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # nullable=True intentionally: ORM `default=datetime.utcnow` always fills
+    # value on INSERT, so an explicit `sent_at=None` is the only path to a
+    # NULL row. Strict `nullable=False` was a model-side regression vs the
+    # migration history (see 5ef3a914c6e6_initial_schema), relaxed in [7.4.0]
+    # reconciliation to align with DB. If a future requirement demands strict
+    # NOT NULL, add a dedicated migration + revert this declaration.
+    sent_at = Column(DateTime, default=datetime.utcnow, nullable=True)
 
 
 # ============================================================================
@@ -487,16 +544,28 @@ class UserQuestion(Base):
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
 
     question = Column(Text, nullable=False)
-    context = Column(JSONB, nullable=False, default=dict)
+    context = Column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
 
-    status = Column(String(20), nullable=False, default="pending")
+    status = Column(
+        String(20),
+        nullable=False,
+        default="pending",
+        server_default=text("'pending'"),
+    )
     # pending | answered | expired
 
     answer = Column(Text, nullable=True)
     answered_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         Index("ix_user_questions_agent_status", "agent_id", "status"),
@@ -521,25 +590,35 @@ class Notification(Base):
 
     title = Column(Text, nullable=False)
     body = Column(Text, nullable=False)
-    payload = Column(JSONB, nullable=False, default=dict)
+    payload = Column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
 
     read_at = Column(DateTime, nullable=True)
     acted_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+        server_default=func.now(),
+    )
 
     __table_args__ = (
+        # `created_at DESC` ordering matches the dominant access pattern
+        # (latest-first inbox listings + unread filter). Partial WHERE on
+        # the unread variant keeps that index small.
         Index(
             "ix_notifications_user_unread",
             "user_id",
-            "created_at",
+            text("created_at DESC"),
             postgresql_where=(read_at.is_(None)),
         ),
         Index(
             "ix_notifications_user_recent",
             "user_id",
-            "created_at",
+            text("created_at DESC"),
         ),
     )
 
@@ -618,6 +697,23 @@ class DailyCostTracking(Base):
 
     date = Column(Date, primary_key=True)
     user_id = Column(UUID(as_uuid=False), primary_key=True)
-    total_cost_usd = Column(Numeric(12, 6), nullable=False, default=0)
-    tick_count = Column(Integer, nullable=False, default=0)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    total_cost_usd = Column(
+        Numeric(12, 6), nullable=False, default=0, server_default=text("0")
+    )
+    tick_count = Column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # Inverse-order index for the per-user soft-cap path
+        # (`get_user_cost_today`): the composite PK starts with date for
+        # the SUM-cross-users hard-cap query, this one starts with user_id
+        # for the per-user lookup.
+        Index("ix_daily_cost_user_date", "user_id", "date"),
+    )
