@@ -1,46 +1,52 @@
 # SPEC_V0.md — Vifaras V0 Architecture Specification
 
 **Date**: 2026-05-03
-**Status**: LOCKED (post-pivot decision sezioni 1–4, OPEN sezioni 5–7)
-**Supersedes sections**: PROJECT_BRIEF v1.3 §2.5 (onboarding), §2.8 (OAuth roadmap), §3.1 (USP), §4.3 (audience), §6.4 (take rate)
+**Status**: LOCKED (V0 platform-managed AI decision, sections 1–4 + 6.1 locked)
+**Supersedes sections**: PROJECT_BRIEF v1.3 §2.5 (onboarding), §2.8 (OAuth roadmap), §3.1 (USP), §4.3 (audience), §6.4 (monetization)
 **Authors**: Teodoro Domenico (founder)
 
 ---
 
-## 1. Pivot Context
+## 1. Architecture Context
 
 ### 1.1 Decision summary
 
-Il 3 maggio 2026, durante FASE 10.1.2 S3 closure, il founder ha deciso di pivotare l'architettura V0 da **platform-managed AI** a **AI-only OpenCode-style**.
+Il 3 maggio 2026, durante discovery FASE 10.2, il founder ha confermato **Path A: V0 platform-managed AI**.
+
+Vifaras gestisce direttamente i provider AI tramite account API propri (Anthropic per agente, OpenAI per embedding). Gli utenti consumer non collegano abbonamenti Claude Pro/Max o ChatGPT Plus/Pro. BYOK API key, connector locale e MCP pubblico restano estensioni power-user V0.5+/V1+.
+
+Decisione motivante: Anthropic vieta esplicitamente a prodotti terzi di offrire Claude.ai login o routare richieste tramite credenziali Free/Pro/Max; OpenAI mantiene billing ChatGPT e API separati. Quindi il modello "utente porta subscription consumer" non è una base legale/operativa per V0.
 
 ### 1.2 Cosa cambia da PROJECT_BRIEF v1.3
 
 | Dimensione | Brief v1.3 | SPEC_V0 |
 |------------|------------|---------|
-| LLM provider V0 | Platform-managed (Anthropic + OpenAI) | User-bring (cloud OAuth + API key + AI locale via connector) |
-| OAuth roadmap | V1.5+ optional power user | V0 prerequisite per agent operation |
-| Free tier | 5 negoziazioni/mese sui crediti platform | N/A (utente porta proprio motore) |
-| Modalità | Manuale + agente AI | AI-only operativo (no manual trading) |
-| Audience target | Mass-market reseller flipper IT | Tech-aware AI-native users IT |
-| Cost LLM platform | ~€300/anno fino 5K user | ~€0 (utente paga proprio provider) |
-| Take rate | 8% blended | 5% seller-only |
+| LLM provider V0 | Platform-managed (Anthropic + OpenAI) | Confermato: Vifaras-managed API accounts |
+| OAuth roadmap | V1.5+ optional power user | Consumer OAuth rimosso; solo API/BYOK o connector futuri se consentiti |
+| Free tier | 5 negoziazioni/mese sui crediti platform | AI inclusa con limiti bassi + crediti/piani extra |
+| Modalità | Manuale + agente AI | Agent-first consumer; umano governa con mandate + HITL |
+| Audience target | Mass-market reseller flipper IT | Consumer marketplace IT, onboarding no-API-key |
+| Cost LLM platform | ~€300/anno fino 5K user | Costo variabile da controllare con cap/crediti |
+| Monetization | 5–8% blended | 5% seller fee + AI credits/subscription guardrail |
 
-### 1.3 Razionale del pivot
+### 1.3 Razionale
 
-Il pivot riflette la convinzione fondamentale del founder che il marketplace agent-native sia **categoria nuova**, non un Vinted-with-AI-feature. La piattaforma è infrastructure + protocol per coordinamento di agenti autonomi; l'AI è capability dell'utente, non del marketplace.
+Il prodotto consumer non può chiedere all'utente medio di creare account developer, attivare billing API, generare API key e capire costi/token. Quell'onboarding sposta Vifaras verso una nicchia power-user e riduce drasticamente conversione.
 
-Pattern di riferimento: OpenCode (sst.dev/opencode), Cursor BYOK mode, Cline, Continue.dev. Tutti costruiti sul principio "user porta proprio motore AI".
+La tesi V0 torna quindi consumer:
 
-Trade-off accettato: audience target ridotta drastically (~80–300K total IT vs milioni), revenue projection ridimensionata (~€2-7K Anno 1 vs €32K brief), GTM strategy ridisegnata (canale tech-aware: r/LocalLLaMA, Hacker News, X tech-AI invece di r/Vinted).
+> Vifaras crea e gestisce il tuo agente di compravendita. Tu imposti limiti e mandato; l'AI è inclusa.
+
+Trade-off accettato: UX molto più semplice e mercato più largo, in cambio di costo LLM platform che richiede pricing, cap e observability stringenti.
 
 ### 1.4 Cosa NON cambia
 
 - Backend FASE 1–7 (auth + identity + mandate + intent + match + negotiation + deal + orchestrator + step-up + production-grade hardening)
-- Schema DB (eventuale aggiunta `user.ai_provider_link` table)
+- Schema DB attuale: nessun `ai_provider_link` richiesto per V0
 - Frontend FASE 10.0–10.1.2 (auth + mandate creation + intent CRUD UI)
 - USP marketplace + identity ZK + privacy by design
 - HITL minimal A3 design intent (vedi §5)
-- Roadmap sequence B locked (vedi §6.3)
+- Cost monitoring FASE 7.3 resta fondamentale per V0
 
 ---
 
@@ -48,23 +54,23 @@ Trade-off accettato: audience target ridotta drastically (~80–300K total IT vs
 
 ### 2.1 Tesi prodotto
 
-> Vifaras V0 è il marketplace italiano agent-native dove gli utenti collegano la propria AI per attivare agenti autonomi che cercano, negoziano e chiudono deal entro limiti pre-firmati. Niente trading manuale: chi entra senza AI guarda, configura il proprio agente e prepara intenti. Chi collega un motore AI compatibile abilita azioni economiche reali.
+> Vifaras V0 è il marketplace italiano agent-native dove gli utenti creano un agente di compravendita in pochi minuti. Vifaras fornisce l'AI via API provider ufficiali, mentre l'utente definisce limiti, firma il mandate e approva le azioni sopra soglia.
 
 ### 2.2 Differentiation
 
 **Vifaras NON è**:
 - Marketplace umano-to-umano (Vinted/eBay/Subito)
-- LLM-as-a-service (Vifaras niente vende AI)
+- Rivendita di Claude/OpenAI come prodotto standalone
 - Manual chat-and-deal platform (HITL solo per governance, niente commerce diretto)
 
 **Vifaras È**:
 - Marketplace agent-native (categoria nuova)
-- Infrastructure + protocol per coordinamento agenti
+- Servizio consumer che include l'agente AI come infrastruttura interna
 - Piattaforma con identità ZK + mandate criptografico + audit by design
 
 ### 2.3 Promessa core
 
-> "Connect AI → configure agent → set mandate → agent operates within limits"
+> "Crea agente → imposta limiti → firma mandato → l'agente opera entro regole verificabili"
 
 ### 2.4 Scope V0 locked
 
@@ -73,13 +79,14 @@ Trade-off accettato: audience target ridotta drastically (~80–300K total IT vs
 | Categoria | Libera (usato + nuovo + servizi) — vincoli per categoria gestiti via mandate `categories_allowed` |
 | Geografia | Italia |
 | Lingua UI | Italiano + Inglese |
-| Modalità operativa | AI-only (Modello A — no manual trading) |
+| Modalità operativa | Agent-first; umano governa tramite mandate/HITL, non negozia manualmente |
 | HITL | Minimal A3 (deferred design, vedi §5) |
-| Monetization | Take rate 5% seller-only su deal chiusi |
+| AI provider | Vifaras-managed Anthropic/OpenAI API accounts |
+| Monetization | 5% seller fee + AI usage caps/credits/subscription |
 
 ### 2.5 USP riformulata
 
-> "Vifaras: agenti AI negoziano deal per te. Porta tuo motore AI."
+> "Vifaras: crea il tuo agente di compravendita in 2 minuti."
 
 ---
 
@@ -105,11 +112,7 @@ VERIFY → Self Protocol ZK proof
 TIER 1: Verified Human
         - Crea bozze intent (no submit)
         - Configura mandate parameters (no signing yet)
-        - Link AI provider (cloud OAuth o connector setup)
         ↓
-
-AI LINK → Provider scelta + linking flow
-        ↓ (ai_connection_active = true)
 
 MANDATE → Firma mandate (WebAuthn step-up)
         ↓ (mandate_signed = true → Tier 2 acquired)
@@ -125,7 +128,7 @@ TIER 2: Agent Mandated (operativo)
 
 ```
 Tier 1 = identity_verified ∧ Tier 0 capabilities
-Tier 2 = identity_verified ∧ ai_connection_active ∧ mandate_signed
+Tier 2 = identity_verified ∧ mandate_signed
 ```
 
 ### 3.3 Runtime status (orthogonal a tier)
@@ -133,10 +136,10 @@ Tier 2 = identity_verified ∧ ai_connection_active ∧ mandate_signed
 ```
 identity_verified: bool
 mandate_signed: bool
-ai_connection_active: bool
+llm_service_available: bool  // platform-level, not per-user capability
 agent_status: enum {
   active,
-  paused_ai_unavailable,    // AI disconnect transient (PC offline, OAuth refresh)
+  paused_provider_outage,   // platform AI provider degraded/cost cap hit
   paused_user_request,      // user click "pause agent"
   paused_mandate_revoked    // mandate cleanup post-revoke
 }
@@ -146,8 +149,7 @@ agent_status: enum {
 
 | Trigger | Effect |
 |---------|--------|
-| AI disconnect transient | `agent_status = paused_ai_unavailable`, tier intact |
-| AI unlink definitivo | `agent_status = paused_ai_unavailable`, tier intact (V0 simple) |
+| Platform AI outage/cost cap | `agent_status` unchanged; scheduler skips tick and surfaces degraded state |
 | Mandate revoke deliberate | Tier downgrade Tier 1, `agent_status = paused_mandate_revoked` |
 | Identity revoke deliberate | Tier downgrade Tier 0 (cascading) |
 
@@ -158,15 +160,14 @@ agent operates IFF
   tier == 2
   ∧ identity_verified
   ∧ mandate_signed
-  ∧ ai_connection_active
   ∧ agent_status == active
+  ∧ platform_llm_budget_available
 ```
 
 ### 3.6 Note
 
-- Stati di setup intermedi (`provider_link_pending`, `oauth_in_progress`, `connector_waiting_heartbeat`) possono esistere nella UI/backend come stati di setup, ma NON contano come capability.
-- AI link può precedere mandate signing (Tier 1 può fare entrambi prep work, ordine UX preferito è AI link → mandate).
-- Tier promotion è atomica: Tier 2 acquired SOLO se identity + AI active + mandate signed passano nella stessa verifica backend.
+- V0 non ha linking AI utente. Provider outage/cost cap è condizione operativa platform, non gate tier.
+- Tier promotion è atomica: Tier 2 acquired quando identity + mandate signed passano nella stessa verifica backend.
 
 ---
 
@@ -185,7 +186,6 @@ CAPABILITIES
 ✓ Upgrade flow start (verify identity)
 ✗ Crea intent
 ✗ Configura mandate
-✗ Link AI
 ```
 
 ### 4.2 Tier 1 — Verified Human
@@ -198,7 +198,6 @@ CAPABILITIES
 ✓ All Tier 0 capabilities
 ✓ Crea bozze intent (draft, no submit)
 ✓ Configura mandate parameters (no signing yet)
-✓ Link AI provider (cloud OAuth o connector setup)
 ✓ Upgrade flow start (sign mandate)
 ✗ Submit intent
 ✗ Operate agent
@@ -208,7 +207,6 @@ CAPABILITIES
 
 ```
 Promotion gate: Tier 1
-  + ai_connection_active = true
   + mandate_signed = true (WebAuthn step-up)
 Downgrade:
   - mandate revoke deliberate → Tier 1
@@ -227,8 +225,9 @@ CAPABILITIES
 
 ### 4.4 V0 design constraints
 
-- **Single provider per user**: V0 single AI provider attivo per account/agente. Multi-provider/fallback policy è V1+.
-- **`ai_connection_active` boolean**: false finché OAuth/connector non completano davvero. Per connector locale: true SOLO dopo first heartbeat.
+- **No consumer subscription linking**: niente Claude Pro/Max OAuth, niente ChatGPT Plus/Pro come motore agentico.
+- **Provider account platform-managed**: API key Anthropic/OpenAI custodite come secrets di deploy, non su profilo utente.
+- **BYOK/connector futuri**: ammessi solo tramite API ufficiali o runtime locale consentito; non bloccano V0.
 - **Tier promotion atomica**: backend mandate verifier è idempotent + retry-safe. Concorrenza su gates verificata transactionally.
 
 ---
@@ -288,54 +287,62 @@ Action: Approva | Rifiuta
 
 ---
 
-## 6. Open Sections (post-PAUSA)
+## 6. V0 AI Operations
 
-Da definire in continuation session:
+### 6.1 Platform-managed AI scope ✅ LOCKED
 
-### 6.1 Provider Linking V0 scope ✅ LOCKED
+V0 usa provider AI ufficiali tramite account API controllati da Vifaras:
 
-V0 supporta DUE provider AI:
+**1. Anthropic API per agent runtime**
+- Backend `AgentOrchestrator` usa `AsyncAnthropic`.
+- API key come secret di deploy (`ANTHROPIC_API_KEY`), mai esposta al client.
+- Cost tracking FASE 7.3 rimane enforcement primario.
+- Scheduler agente resta opt-in (`ENABLE_AGENT_SCHEDULER=true`) per evitare costi accidentali.
 
-**1. Anthropic Claude Pro/Max via OAuth**
-- 1-click flow frictionless
-- Audience: ~5-15K Anthropic Pro/Max IT 2026
-- Token storage backend (access_token + refresh_token)
-- Heartbeat verification ongoing
+**2. OpenAI API per embeddings**
+- `text-embedding-3-small` per matching semantico.
+- API key come secret di deploy (`OPENAI_API_KEY`).
+- `EMBEDDING_BACKEND=fake` resta dev/test escape hatch.
 
-**2. OpenAI via API key paste**
-- User crea account platform.openai.com (separato da ChatGPT consumer)
-- User genera API key
-- User paste in Vifaras Settings → "Connetti OpenAI"
-- Backend stores encrypted (KMS pattern, vedi backend FASE 7.2)
-- Audience: ~30-80K developer OpenAI API IT
+**NON supportato in V0**:
+- Claude Pro/Max OAuth o credenziali Claude.ai consumer.
+- ChatGPT Plus/Pro come motore agentico.
+- Browser automation, cookie/session scraping, reverse-engineered consumer APIs.
+- BYOK utente nel backend.
+- Connector locale Ollama/LM Studio/LocalAI.
+- MCP server pubblico.
 
-**Total V0 audience addressable**: ~35-95K IT.
+**Ammesso V0.5+/V1+ solo se compliant**:
+- BYOK API key utente via API ufficiali, con storage cifrato KMS o custody locale.
+- Connector locale che usa modello locale o API key ufficiale custodita localmente.
+- MCP server Vifaras come tool surface per agent client esterni consentiti.
 
-**OUT OF SCOPE V0**:
-- Google Gemini (TOS vieta 3rd-party)
-- Connector locale (Ollama/LM Studio/LocalAI) — entry V0.5+ IDEAS_BACKLOG
-- Multi-provider per agent (single provider V0)
-- Bedrock/Vertex/Azure (enterprise, niente target consumer)
+### 6.2 Monetization guardrails
 
-**Effort**: ~2-3 weeks dev (FASE 10.2)
+V0 platform-managed AI richiede un modello economico che copra costo variabile LLM:
 
-**Open design questions deferred to FASE 10.2 implementation**:
-1. User può linkare entrambi o singolo per agent? (mio bias: V0 single per agent)
-2. Token rotation Anthropic OAuth: TTL custom o default?
-3. OpenAI API key validation pre-storage: test call /models endpoint?
-4. UI "Connetti OpenAI": text input mascherato + helper link
-5. Heartbeat failure handling: re-link prompt UX
+- 5% seller fee sui deal chiusi.
+- AI inclusa con limiti bassi per onboarding.
+- Crediti o piano mensile per uso extra.
+- Per-user soft cap giornaliero (`daily_user_cost_cap_usd`) già implementato.
+- Global hard cap giornaliero (`max_daily_llm_cost_usd`) già implementato.
+- Max round negoziazione e max turns per tick restano hard guardrail tecnici.
+- Modello forte solo dove serve; modello economico per parsing/triage se introdotto.
 
-### 6.2 Connector App architecture
+Decisione V0: nessuna promessa "AI illimitata". Ogni claim marketing deve restare compatibile con cap e fair-use.
 
-Decisioni open:
+### 6.3 Connector App architecture (V0.5+/V1+)
+
+Decisioni open, non blocking V0:
 - Tauri vs Electron vs Python CLI tool?
 - Distribution strategy (npm? GitHub releases? auto-update?)
-- OS support V0 (Linux + macOS + Windows?)
+- OS support (Linux + macOS + Windows?)
 - Connector lifetime (always-on daemon vs on-demand?)
 - Connector ↔ Marketplace protocol (HTTP polling vs WebSocket vs SSE?)
+- Local AI endpoint discovery (Ollama, LM Studio, LocalAI)
+- Authentication connector ↔ Vifaras (API token, mTLS, signed JWT)
 
-### 6.3 Roadmap V0 nuova ✅ LOCKED (Sequence B — AI-first prerequisite)
+### 6.4 Roadmap V0 nuova ✅ LOCKED (Sequence C — consumer platform-managed)
 
 **✅ COMPLETATE**
 
@@ -344,27 +351,28 @@ Decisioni open:
 - Frontend FASE 10.1.1 (mandate creation, pre-pivot semantically valid)
 - Frontend FASE 10.1.2 (intent CRUD UI, pre-pivot — S2 commit 159bcc4)
 
-**🔲 PENDING — Sequence B (AI-first prerequisite)**
+**🔲 PENDING — Sequence C (consumer platform-managed)**
 
-1. **FASE 10.2 — AI provider linking**
-   - Backend: AIProvider abstraction + Anthropic OAuth + OpenAI key encrypted storage
-   - Frontend: Settings UI dual ("Connetti Claude" + "Connetti OpenAI")
-   - Effort stima: 2-3 weeks
+1. **FASE 10.2 — Platform AI production setup**
+   - Backend: production env checklist (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, caps)
+   - Backend: provider health/cost visibility for founder/admin
+   - Frontend: remove/avoid provider-linking UX; explain AI included + fair-use
+   - Effort stima: 2-4 days
 
-2. **FASE 10.3 — HITL approval implementation**
-   - Backend: mandate v2 (auto_approve_threshold) + agent_action_pending_approval table
-   - Frontend: approval UI (list pending + detail card + approve/reject)
-   - Effort stima: 2-3 weeks
-
-3. **FASE 10.1.3 — Match view + negotiation read-only**
+2. **FASE 10.1.3 — Match view + negotiation read-only**
    - Frontend: match feed + negotiation transcripts read-only
    - Backend already implemented FASE 5
    - Effort stima: 1-2 weeks
 
-4. **FASE 10.1.4 — Deal pending signature step-up**
+3. **FASE 10.1.4 — Deal pending signature step-up**
    - Frontend: deal sign UI + WebAuthn step-up
    - Backend already implemented FASE 6
    - Effort stima: 1 week
+
+4. **FASE 10.3 — HITL approval implementation**
+   - Backend: mandate v2 (auto_approve_threshold) + agent_action_pending_approval table
+   - Frontend: approval UI (list pending + detail card + approve/reject)
+   - Effort stima: 2-3 weeks
 
 5. **FASE 11 — i18n IT/EN bootstrap**
    - Frontend: next-intl setup + traduzione UI strings + locale toggle
@@ -373,14 +381,15 @@ Decisioni open:
 
 **V0 ALPHA LAUNCH**
 
-- Cumulative effort estimate: ~7-10 weeks dev solo
+- Cumulative effort estimate: ~5-8 weeks dev solo
 - Plus integration testing + smoke verify cycles + stabilization
-- Realistic launch window: 3-4 mesi from pivot decision (2026-08 / 2026-09)
+- Realistic launch window: 2-3 mesi from platform-managed decision (2026-07 / 2026-08)
 
-**Razionale Sequence B**:
-- Coerenza con pivot V0 AI-only — utenti senza AI link niente raggiungono Tier 2
-- Validation tecnica precoce su parts riskier (OAuth + HITL)
-- Match view + deal sign sono frontend builds-on-top, niente blocking AI integration
+**Razionale Sequence C**:
+- Coerenza consumer: niente provider linking in V0.
+- Backend platform-managed AI è già implementato; serve production setup, non schema nuovo.
+- Match/deal UI diventano più urgenti perché completano il marketplace loop già costruito.
+- HITL rimane importante ma può seguire il read-only surface minimo.
 - i18n V0 last (polish pre-launch, niente blocking)
 
 ---
@@ -391,15 +400,15 @@ Sezioni da rivedere/riscrivere in PROJECT_BRIEF v2.0:
 
 | Sezione | Update needed |
 |---------|---------------|
-| §2.5 Onboarding flow | Riscrivere: signup → identity → AI link + mandate → Tier 2 |
-| §2.8 OAuth provider linking | RIBALTARE: V0 prerequisite, niente più V1.5+ optional. Tabella provider + connector locale |
-| §3.1 USP | Riscrivere: "Marketplace agent-native, porta tuo motore AI" |
-| §3.x Modalità operativa | NUOVO: documentare AI-only Modello A, tier system formale |
-| §4.1 TAM/SAM/SOM | Ricalibrare: ~80-300K total IT vs milioni Vinted-style. SOM realistic V0 alpha 500-2K |
-| §4.3 Customer segments | RIBALTARE: tech-aware AI-native users (Anthropic Pro/Max + OpenAI API + local AI capable) |
-| §6.4 Take rate | Update: 5% seller-only (era 8% blended) |
-| §8 GTM | Riscrivere: canali tech-aware (r/LocalLLaMA, Hacker News, X tech-AI). Niente più Reddit r/Vinted |
-| §11 Financial projections | Ricalibrare: revenue Anno 1 ~€2-7K, break-even Anno 2 |
+| §2.5 Onboarding flow | Riscrivere: signup → identity → mandate → Tier 2; niente AI link |
+| §2.8 OAuth provider linking | Rimuovere consumer OAuth; BYOK/connector solo V0.5+/V1+ compliant |
+| §3.1 USP | Riscrivere: "crea il tuo agente di compravendita in 2 minuti" |
+| §3.x Modalità operativa | Documentare agent-first + HITL governance, non manual trading |
+| §4.1 TAM/SAM/SOM | Tornare consumer-marketplace; non restringere a AI-native BYOK users |
+| §4.3 Customer segments | Consumer/reseller IT + power-user future segment |
+| §6.4 Monetization | Aggiungere AI credits/subscription guardrail oltre seller fee |
+| §8 GTM | Consumer marketplace channels + trust/privacy narrative |
+| §11 Financial projections | Includere costo LLM variabile e cap/fair-use assumptions |
 
 Effort stima update brief: 4-8h scrittura + 2h review + version bump v1.3 → v2.0.
 
@@ -407,7 +416,8 @@ Effort stima update brief: 4-8h scrittura + 2h review + version bump v1.3 → v2
 
 ## Changelog
 
-- **2026-05-03**: SPEC_V0 v1.0 created. Pivot decision locked. §1–4 LOCKED, §5 intent LOCKED design DEFERRED, §6–7 OPEN.
+- **2026-05-03**: SPEC_V0 v1.0 created. AI-only BYOK pivot drafted.
+- **2026-05-03**: SPEC_V0 v1.1 corrected after provider ToS discovery. V0 locked to platform-managed AI; consumer OAuth/BYOK removed from V0.
 
 ---
 
@@ -418,5 +428,5 @@ Effort stima update brief: 4-8h scrittura + 2h review + version bump v1.3 → v2
 - `MANDATE_UX_FLOW.md` (will need update post-pivot, V0.5+)
 - `TRADE_WINDOW_FLOW.md` (still valid, niente impact pivot)
 - `DESIGN_QUESTIONS.md` (review needed: alcune DQ deferred adesso decided in SPEC_V0)
-- Frontend `PROGRESS.md` FASE 10.1.2 entry (S2 implementation pre-pivot, valid storico)
-- Frontend `IDEAS_BACKLOG.md` 13 entries uncommitted (review post-pivot needed)
+- Frontend `PROGRESS.md` FASE 10.1.2 entry (platform-managed prerequisites remain valid)
+- Frontend `IDEAS_BACKLOG.md` provider-linking entries need platform-managed correction

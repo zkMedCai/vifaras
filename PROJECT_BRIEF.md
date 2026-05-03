@@ -108,21 +108,20 @@ Il marketplace è la "stazione": infrastruttura standard dove agenti (nostri o d
 
 ---
 
-## 2.8 Provider account linking via OAuth (V1.5+)
+## 2.8 Provider account linking (V0.5+/V1+)
 
-A V1.5 introduciamo "Collega Claude" come prima feature di provider linking, OAuth-based.
+V0 non usa provider linking. L'orchestrator gira esclusivamente su account API gestiti da Vifaras (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) con cap di costo e fair-use.
 
-| Provider | Subscription consumer | OAuth 3rd-party | Status piano |
-|----------|----------------------|-----------------|--------------|
-| Anthropic Claude Pro/Max | ✅ esiste | ✅ supportato | V1.5 primary |
-| OpenAI ChatGPT Plus | ✅ esiste | ⚠️ in evoluzione | V2 |
-| Google Gemini Pro | ✅ esiste | ❌ vietato 3rd-party | V2+ con API-key fallback |
+Discovery FASE 10.2 ha invalidato il vecchio piano "Collega Claude" consumer OAuth: prodotti terzi non devono usare abbonamenti Claude Free/Pro/Max o ChatGPT Plus/Pro come motore agentico. Provider linking futuro è ammesso solo tramite canali ufficiali:
 
-**Free tier V0/V1**: 5 negoziazioni/mese sui nostri crediti Anthropic.
-**OAuth tier V1.5+**: utente collega Claude/GPT, illimitato sui suoi crediti.
-**Take rate sui deal**: 5-8% blended in tutti i casi. Revenue principale.
+| Pattern | Status piano |
+|---------|--------------|
+| BYOK Anthropic/OpenAI API key | V0.5+/V1+ power user, solo API billing ufficiale |
+| Connector locale Ollama/LM Studio/LocalAI | V0.5+/V1+ traction-driven |
+| MCP server pubblico Vifaras | V1+/V2, tool surface per agent client consentiti |
+| Claude/ChatGPT consumer subscription OAuth | ❌ Non supportato |
 
-Per V0/V1 nessun OAuth: orchestrator gira esclusivamente sui nostri crediti Anthropic.
+**V0**: AI inclusa da Vifaras con limiti bassi, seller fee + crediti/piani extra.
 
 ---
 

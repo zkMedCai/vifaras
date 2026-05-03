@@ -2477,3 +2477,38 @@ Privacy V0 baseline:
 ### Prossima task
 
 **TBD founder** post-tag `v0-backend-fase-7-complete`. Backend in pausa pending direction decision.
+
+---
+
+## FASE 10.2 Discovery — Platform-managed AI V0 confirmed — 2026-05-03
+
+### Decisione
+
+Founder ha confermato Path A: V0 consumer con AI gestita da Vifaras tramite account API propri Anthropic/OpenAI.
+
+### Discovery blocker risolto
+
+Il piano alternativo "utente collega Claude Pro/Max o ChatGPT Plus/Pro" non è base valida per V0:
+
+- Anthropic non consente a prodotti terzi di offrire Claude.ai login o routare richieste tramite credenziali Free/Pro/Max.
+- OpenAI mantiene ChatGPT subscription e API billing separati.
+- Browser automation, cookie/session scraping e OAuth non ufficiali sono fuori scope prodotto.
+
+### Artifact updates
+
+- `SPEC_V0.md` corretto a v1.1: platform-managed AI locked, consumer OAuth/BYOK rimosso da V0.
+- `PROJECT_BRIEF.md` §2.8 corretto: provider linking solo V0.5+/V1+ compliant.
+- `IDEAS_BACKLOG.md` provider linking aggiornato: BYOK API key, connector locale, MCP; no subscription consumer.
+
+### Impatto tecnico
+
+Backend attuale è già coerente con Path A:
+
+- `AgentOrchestrator` usa Anthropic SDK platform-managed.
+- Embedding service usa OpenAI API platform-managed.
+- Cost monitoring FASE 7.3 protegge runaway usage.
+- Nessun `ai_provider_link` schema richiesto per V0.
+
+### Prossima task
+
+FASE 10.2 diventa **Platform AI production setup**: env/secrets, provider health/cost visibility, fair-use copy, e verifica end-to-end con chiavi reali controllate.

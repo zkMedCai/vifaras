@@ -37,7 +37,6 @@ V0 simplifications (documented for 7.x revisits):
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session as SyncSession
 
 from app.agents.tool_layer import AGENT_TOOLS, AsyncToolHandler
+from app.core.config import settings
 from app.core.db import AsyncSessionLocal, SyncSessionLocal
 from app.core.logging import log
 from app.core.telemetry import get_tracer
@@ -76,7 +76,6 @@ _TOOL_SPAN_NAMES: dict[str, str] = {
 # Tunables
 # ---------------------------------------------------------------------------
 
-CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 MAX_TURNS_PER_TICK: int = 10
 MAX_TOKENS_PER_RESPONSE: int = 4096
 
@@ -152,6 +151,7 @@ class AgentOrchestrator:
         outer transaction (and rolled back on teardown).
         """
         self.client = anthropic_client or AsyncAnthropic()
+        self.model = settings.anthropic_model
         self._verifier_factory = verifier_factory or (
             lambda sync_db: MandateVerifier(sync_db)
         )
@@ -274,7 +274,7 @@ class AgentOrchestrator:
             from app.core.metrics import AGENT_API_CALLS_TOTAL, COST_USD_TOTAL
             try:
                 response = await self.client.messages.create(
-                    model=CLAUDE_MODEL,
+                    model=self.model,
                     max_tokens=MAX_TOKENS_PER_RESPONSE,
                     system=system_prompt,
                     tools=AGENT_TOOLS,
@@ -302,7 +302,8 @@ class AgentOrchestrator:
                     error=f"{type(exc).__name__}: {exc}",
                 )
 
-            turn_cost = self._estimate_cost(response.usage)
+            response_model = getattr(response, "model", None) or self.model
+            turn_cost = self._estimate_cost(response.usage, model=response_model)
             cost_acc += turn_cost
             # Per-turn increment so the counter reflects actual API spend
             # in real time (not just at tick close). `response.model` is
@@ -312,7 +313,7 @@ class AgentOrchestrator:
             # don't).
             COST_USD_TOTAL.labels(
                 user_id=state.user_id,
-                model=getattr(response, "model", None) or CLAUDE_MODEL,
+                model=response_model,
             ).inc(turn_cost)
             last_stop_reason = response.stop_reason
 
@@ -490,11 +491,10 @@ You'll receive your full current state as the first user message. Plan first, th
     # Cost
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _estimate_cost(usage: Any) -> float:
+    def _estimate_cost(self, usage: Any, *, model: str | None = None) -> float:
         """USD estimate from Anthropic usage block. Tolerates missing fields."""
         return anthropic_pricing.calculate_cost_usd(
-            CLAUDE_MODEL,
+            model or self.model,
             input_tokens=getattr(usage, "input_tokens", 0) or 0,
             output_tokens=getattr(usage, "output_tokens", 0) or 0,
         )
@@ -596,5 +596,4 @@ You'll receive your full current state as the first user message. Plan first, th
             "tools": result.tool_calls,
             "prompt_version": PROMPT_VERSION,
         }
-
 

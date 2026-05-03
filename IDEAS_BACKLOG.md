@@ -415,23 +415,28 @@ Catched 2 volte in FASE 7.4:
 
 ---
 
-## Categoria: Provider linking (V1.5+)
+## Categoria: Provider linking compliant (V0.5+/V1+)
 
-### OAuth "Collega Claude"
-- A V1.5: bottone "Collega Claude" nell'app web/mobile
-- OAuth flow → Anthropic, salviamo access_token cifrato
-- Orchestrator usa quel token invece del nostro account
-- Free tier limitato sui nostri crediti per chi non collega
-- Riferimento dettagli: PROJECT_BRIEF §2.8
+### BYOK API key utente (Anthropic/OpenAI)
+- Solo API ufficiali con billing API separato, mai subscription consumer.
+- UI Settings power-user: paste API key mascherata + provider-specific validation.
+- Storage option A: backend KMS encrypted (`kms_agent_keys` pattern adattato).
+- Storage option B: connector locale custodisce key sul device, backend vede solo output.
+- Riferimento dettagli: PROJECT_BRIEF §2.8 + SPEC_V0 §6.1.
 
-### OAuth ChatGPT (V2)
-- Quando OpenAI maturera l'OAuth flow per terzi
-- Stesso pattern di Claude
+### Connector locale Ollama / LM Studio / LocalAI
+- Utente installa connector desktop/CLI.
+- Connector usa modello locale o API key ufficiale custodita localmente.
+- PC spento = agente in pausa o degrada a platform-managed fallback se user opt-in.
 
-### API-key fallback Gemini (V2+)
-- Google vieta OAuth third-party per Gemini consumer
-- Possiamo guidare l'utente a generare API key da AI Studio
-- Friction maggiore ma fattibile per power user
+### MCP server pubblico Vifaras
+- Esposizione tool layer come MCP server stand-alone.
+- Utile per power user con agent client esterni consentiti.
+- Non è un workaround per Claude/ChatGPT consumer subscription.
+
+### Consumer subscription OAuth (Claude Pro/Max, ChatGPT Plus/Pro)
+- ❌ Non supportato. Non costruire browser automation, cookie/session scraping o OAuth non ufficiali.
+- V0 resta platform-managed AI con account API Vifaras.
 
 ---
 
