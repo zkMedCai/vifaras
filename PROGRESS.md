@@ -2884,3 +2884,22 @@ Risultati:
 - Ruff verde sui file toccati.
 - 71 test verdi sulle suite match/intents/launch/dev-ai.
 - Launch config current: OK, 1 warning atteso su JWT dev default.
+
+### Smoke reale Anthropic matching
+
+Script aggiunto:
+
+```bash
+uv run python scripts/smoke_anthropic_matching.py
+```
+
+Risultato run reale fuori sandbox:
+
+- `run_id=6eb1d183`
+- `matches_returned=1`
+- `match_id=bc4b80eb-0a5b-412f-befb-d48eac623ab9`
+- `similarity_score=1.0000`
+- `price_proximity_score=0.7833`
+- `combined_score=0.9350`
+- `today_cost_delta_usd=0.00363900`
+- `/api/market?location=Roma,%20IT&limit=10` mostra i due intent smoke.
