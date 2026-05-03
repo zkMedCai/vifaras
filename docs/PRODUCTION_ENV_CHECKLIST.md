@@ -59,6 +59,20 @@ DAILY_USER_COST_CAP_USD=0.50
 AGENT_TICK_COST_CAP_USD=0.10
 ```
 
+## Founder Diagnostics
+
+For local/staging checks only, temporarily enable dev endpoints and inspect
+the AI operations snapshot:
+
+```bash
+curl -sS http://127.0.0.1:8000/api/_dev/ai/status
+```
+
+The payload reports provider configured booleans, model names, scheduler
+settings and daily cost caps. It must not print secret values.
+
+Keep `ENABLE_DEV_ENDPOINTS=false` on any public production surface.
+
 ## Smoke Tests
 
 After static config passes:

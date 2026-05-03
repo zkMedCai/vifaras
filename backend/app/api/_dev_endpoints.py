@@ -21,7 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.security import CurrentUser, require_tier
-from app.services import agent_scheduler, agent_state_service, embedding_service
+from app.services import (
+    agent_scheduler,
+    agent_state_service,
+    anthropic_pricing,
+    cost_tracking_service,
+    embedding_service,
+)
 
 router = APIRouter(prefix="/api/_dev", tags=["_dev (gated)"])
 
@@ -111,5 +117,59 @@ async def scheduler_status(
         "rate_limiter": {
             "in_flight": rl.in_flight if rl else 0,
             "minute_window_count": rl.minute_window_count if rl else 0,
+        },
+    }
+
+
+@router.get("/ai/status")
+async def ai_status(
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Founder/dev AI operations snapshot. 404 unless dev flag is on.
+
+    The endpoint is deliberately static/no-network: it confirms provider
+    configuration and cost guardrails without calling Anthropic/OpenAI or
+    exposing secret values.
+    """
+    if not settings.enable_dev_endpoints:
+        raise HTTPException(
+            status_code=404, detail={"code": "not_found", "message": "Not Found"}
+        )
+
+    today_cost = await cost_tracking_service.get_today_cost_usd(db)
+    daily_cap = settings.max_daily_llm_cost_usd
+    known_anthropic_models = set(anthropic_pricing.known_models())
+
+    return {
+        "providers": {
+            "anthropic": {
+                "configured": bool(settings.anthropic_api_key),
+                "model": settings.anthropic_model,
+                "pricing_known": (
+                    settings.anthropic_model in known_anthropic_models
+                ),
+            },
+            "openai_embeddings": {
+                "configured": bool(settings.openai_api_key),
+                "backend": settings.embedding_backend,
+                "model": settings.openai_embedding_model,
+            },
+        },
+        "cost": {
+            "today_cost_usd": round(today_cost, 6),
+            "max_daily_llm_cost_usd": daily_cap,
+            "daily_cap_remaining_usd": round(
+                max(daily_cap - today_cost, 0.0), 6
+            ),
+            "daily_cap_reached": today_cost >= daily_cap,
+            "daily_user_cost_cap_usd": settings.daily_user_cost_cap_usd,
+            "agent_tick_cost_cap_usd": settings.agent_tick_cost_cap_usd,
+        },
+        "scheduler": {
+            "enabled": settings.enable_agent_scheduler,
+            "running": agent_scheduler._scheduler is not None,
+            "interval_seconds": settings.agent_scheduler_interval_seconds,
+            "max_concurrent": settings.agent_scheduler_max_concurrent,
+            "max_per_minute": settings.agent_scheduler_max_per_minute,
         },
     }

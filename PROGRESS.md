@@ -2751,3 +2751,44 @@ Risultati:
 - Ruff verde sui file toccati.
 - Dev/current profile: OK con 1 warning atteso (`jwt_secret_default_dev`).
 - Production profile sul `.env` dev: FAIL atteso con errori su JWT/KMS/WebAuthn/OpenAI/rate limiting/CORS.
+
+---
+
+## FASE 10.2.6 — Provider health/cost visibility founder/dev — 2026-05-03
+
+### Backend changes
+
+- Aggiunto `GET /api/_dev/ai/status`.
+- Endpoint gated da `ENABLE_DEV_ENDPOINTS`; con flag spento ritorna 404.
+- Snapshot no-network: non chiama Anthropic/OpenAI e non consuma token.
+- Payload espone solo:
+  - provider configurati come booleani;
+  - modello Anthropic e stato `pricing_known`;
+  - backend/model embeddings;
+  - costi giornalieri e cap (`MAX_DAILY_LLM_COST_USD`, `DAILY_USER_COST_CAP_USD`, `AGENT_TICK_COST_CAP_USD`);
+  - stato scheduler agenti.
+- Nessuna API key o secret viene serializzata.
+
+### Docs
+
+- `docs/PRODUCTION_ENV_CHECKLIST.md` ora include il check founder/dev:
+
+```bash
+curl -sS http://127.0.0.1:8000/api/_dev/ai/status
+```
+
+- `SPEC_V0.md` aggiornata per puntare alla diagnostics route dev-gated.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/api/_dev_endpoints.py backend/tests/test_dev_ai_status.py
+uv run ruff check backend/app/api/_dev_endpoints.py backend/tests/test_dev_ai_status.py
+uv run pytest backend/tests/test_dev_ai_status.py backend/tests/test_embedding.py::test_dev_embedding_stats_endpoint_gated backend/tests/test_pre_frontend.py::test_api_health_today_cost_reflects_upserts
+```
+
+Risultati:
+
+- Compileall verde.
+- Ruff verde sui file toccati.
+- 5 test verdi.
