@@ -74,6 +74,29 @@ from tests.factories import setup_active_mandate_async
 # ---------------------------------------------------------------------------
 
 
+def test_default_anthropic_client_uses_settings_api_key(monkeypatch) -> None:
+    calls: dict[str, str] = {}
+
+    class FakeDefaultClient:
+        def __init__(self, *, api_key: str) -> None:
+            calls["api_key"] = api_key
+
+    monkeypatch.setattr(orchestrator_module.settings, "anthropic_api_key", "sk-test")
+    monkeypatch.setattr(orchestrator_module, "AsyncAnthropic", FakeDefaultClient)
+
+    orch = AgentOrchestrator()
+
+    assert isinstance(orch.client, FakeDefaultClient)
+    assert calls == {"api_key": "sk-test"}
+
+
+def test_default_anthropic_client_requires_api_key(monkeypatch) -> None:
+    monkeypatch.setattr(orchestrator_module.settings, "anthropic_api_key", "")
+
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        AgentOrchestrator()
+
+
 @pytest.fixture(autouse=True)
 def _force_fake_embedding(monkeypatch):
     """Tool layer's `_create_intent` calls embedding_service even though we

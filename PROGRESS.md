@@ -2512,3 +2512,50 @@ Backend attuale è già coerente con Path A:
 ### Prossima task
 
 FASE 10.2 diventa **Platform AI production setup**: env/secrets, provider health/cost visibility, fair-use copy, e verifica end-to-end con chiavi reali controllate.
+
+---
+
+## FASE 10.2.1 — Anthropic-only smoke path — 2026-05-03
+
+### Cosa è stato fatto
+
+- `AgentOrchestrator` ora costruisce il client Anthropic di produzione con `settings.anthropic_api_key`, non affidandosi all'env lookup implicito dell'SDK.
+- Fail-fast esplicito se `ANTHROPIC_API_KEY` manca quando viene creato il client reale.
+- Aggiunto `scripts/smoke_anthropic.py`: smoke test minimale Anthropic-only, senza DB e senza scheduler.
+- Aggiunti test su default client da settings + errore key mancante.
+
+### Verifica locale
+
+Comando:
+
+```bash
+uv run python scripts/smoke_anthropic.py
+```
+
+Output confermato:
+
+```text
+Anthropic smoke OK
+model=claude-sonnet-4-5-20250929
+stop_reason=end_turn
+usage=input_tokens=26,output_tokens=13
+estimated_cost_usd=0.00027300
+text=vifaras-anthropic-smoke-ok
+```
+
+### Test
+
+```bash
+python3 -m compileall -q backend/app/agents/orchestrator.py backend/tests/test_orchestrator.py scripts/smoke_anthropic.py
+uv run pytest backend/tests/test_orchestrator.py backend/tests/test_scheduler.py backend/tests/test_cost_metrics.py
+```
+
+Risultato: 48 test verdi.
+
+### Prossima task
+
+Commit + push dell'hardening Anthropic-only. Poi scegliere tra:
+
+1. manual tick script su agente seeded/attivo con `EMBEDDING_BACKEND=fake`;
+2. backend startup smoke con `ENABLE_AGENT_SCHEDULER=false`;
+3. frontend copy/fair-use update.

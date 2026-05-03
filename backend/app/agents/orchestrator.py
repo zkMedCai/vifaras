@@ -72,6 +72,15 @@ _TOOL_SPAN_NAMES: dict[str, str] = {
 }
 
 
+def _default_anthropic_client() -> AsyncAnthropic:
+    """Build the production Anthropic client from Pydantic settings."""
+    if not settings.anthropic_api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is required to create the production Anthropic client"
+        )
+    return AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -150,7 +159,7 @@ class AgentOrchestrator:
         writes performed inside `run_tick` are visible to the test's
         outer transaction (and rolled back on teardown).
         """
-        self.client = anthropic_client or AsyncAnthropic()
+        self.client = anthropic_client or _default_anthropic_client()
         self.model = settings.anthropic_model
         self._verifier_factory = verifier_factory or (
             lambda sync_db: MandateVerifier(sync_db)
@@ -596,4 +605,3 @@ You'll receive your full current state as the first user message. Plan first, th
             "tools": result.tool_calls,
             "prompt_version": PROMPT_VERSION,
         }
-
