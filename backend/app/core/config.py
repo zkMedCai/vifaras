@@ -43,6 +43,12 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5"
+    # Match discovery backend:
+    #   - "embedding": existing pgvector/OpenAI embedding pipeline
+    #   - "anthropic": SQL pre-filter + Claude semantic ranking, no OpenAI key
+    matching_backend: str = "embedding"
+    anthropic_match_candidate_limit: int = 30
+    anthropic_match_max_tokens: int = 1000
 
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"

@@ -51,16 +51,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
-from typing import Any
 
 import pytest
+from app.core.config import settings
+from app.core.security import create_access_token
+from app.models.schema import Intent, Match, User
+from app.services import embedding_service, match_scheduler, match_service
 from sqlalchemy import select
 
-from app.core.security import create_access_token
-from app.models.schema import Agent, Intent, Mandate, Match, User
-from app.services import embedding_service, match_scheduler, match_service
+from tests.conftest import FakeAnthropicClient, _make_message, text_block
 from tests.factories import default_user_kwargs, setup_active_mandate_async
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -112,6 +112,7 @@ async def _seed_intent(
     ideal_eur: float = 1100,
     status: str = "active",
     expires_in_days: int = 14,
+    with_embedding: bool = True,
 ) -> str:
     """Insert an Intent row with embedding seeded by `seed_text`.
 
@@ -131,7 +132,11 @@ async def _seed_intent(
         title=f"intent-{intent_id[:6]}",
         description=seed_text,
         category=category,
-        description_embedding=embedding_service._fake_embedding(seed_text),
+        description_embedding=(
+            embedding_service._fake_embedding(seed_text)
+            if with_embedding
+            else None
+        ),
         reservation_price_cents=int(reservation_eur * 100),
         ideal_price_cents=int(ideal_eur * 100),
         currency="EUR",
@@ -479,6 +484,93 @@ async def test_find_matches_rejects_trade_intent(async_db_session) -> None:
 
 
 # ===========================================================================
+# Anthropic-only discovery
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_anthropic_matching_discovers_without_embeddings(
+    async_db_session, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "matching_backend", "anthropic")
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test")
+    monkeypatch.setattr(settings, "max_daily_llm_cost_usd", 50.0)
+    monkeypatch.setattr(settings, "daily_user_cost_cap_usd", 0.50)
+
+    seller = await _seed_user(
+        async_db_session, tier=0, email="anthropic-seller@x.com"
+    )
+    buyer = await _seed_user(
+        async_db_session, tier=0, email="anthropic-buyer@x.com"
+    )
+    sell_id = await _seed_intent(
+        async_db_session,
+        user_id=seller,
+        side="sell",
+        seed_text="MacBook Pro 14 M3 with 18GB RAM",
+        reservation_eur=1000,
+        ideal_eur=1150,
+        with_embedding=False,
+    )
+    buy_id = await _seed_intent(
+        async_db_session,
+        user_id=buyer,
+        side="buy",
+        seed_text="Looking for MacBook Pro 14 Apple Silicon laptop",
+        reservation_eur=1300,
+        ideal_eur=1050,
+        with_embedding=False,
+    )
+    client = FakeAnthropicClient(
+        [
+            _make_message(
+                [
+                    text_block(
+                        '{"scores":[{"candidate_id":"'
+                        + buy_id
+                        + '","semantic_score":0.92}]}'
+                    )
+                ],
+                stop_reason="end_turn",
+                input_tokens=120,
+                output_tokens=20,
+            )
+        ]
+    )
+
+    matches = await match_service.find_matches_for_intent(
+        async_db_session,
+        intent_id=sell_id,
+        anthropic_client=client,
+    )
+
+    assert buy_id in client.calls[0]["messages"][0]["content"]
+    assert len(matches) == 1
+    match = matches[0]
+    assert match.sell_intent_id == sell_id
+    assert match.buy_intent_id == buy_id
+    assert float(match.similarity_score) == pytest.approx(0.92)
+    assert float(match.combined_score) > 0.70
+
+
+def test_parse_anthropic_match_scores_clamps_and_ignores_invalid() -> None:
+    parsed = match_service._parse_anthropic_match_scores(  # noqa: SLF001
+        """```json
+        {
+          "scores": [
+            {"candidate_id": "a", "semantic_score": 1.4},
+            {"candidate_id": "b", "semantic_score": -0.2},
+            {"candidate_id": "c", "semantic_score": "bad"},
+            {"candidate_id": 123, "semantic_score": 0.5}
+          ]
+        }
+        ```"""
+    )
+
+    assert parsed == {"a": 1.0, "b": 0.0}
+
+
+# ===========================================================================
 # 15. match persisted with unique constraint
 # ===========================================================================
 
@@ -765,7 +857,7 @@ async def test_refresh_low_match_intents_targets_correct_intents(
 
     # No opposite intent yet → sell_id has 0 matches.
     # Now add the opposite intent.
-    buy_id = await _seed_intent(
+    await _seed_intent(
         async_db_session,
         user_id=b,
         side="buy",

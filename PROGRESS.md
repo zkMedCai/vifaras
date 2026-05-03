@@ -2840,3 +2840,47 @@ Risultati:
 - Ruff verde sui file toccati.
 - 3 test verdi.
 - Live smoke `/api/market?limit=1` HTTP `200`.
+
+---
+
+## FASE 10.2.7 — Anthropic-only matching backend — 2026-05-03
+
+### Backend changes
+
+- Aggiunto `MATCHING_BACKEND`:
+  - `embedding` mantiene il path storico OpenAI embeddings + pgvector.
+  - `anthropic` abilita SQL pre-filter + Claude semantic scoring.
+- In `MATCHING_BACKEND=anthropic`, `create_intent` e `update_intent`
+  non generano embeddings: niente dipendenza OpenAI per il flusso V0
+  Anthropic-only.
+- Il matcher Anthropic:
+  - filtra in SQL per lato opposto, categoria, stato active, non self-user,
+    non expired e price overlap;
+  - passa a Claude solo campi marketplace-facing (`title`, `description`,
+    `category`, `side`, `location`);
+  - calcola price proximity e combined score nel backend;
+  - persiste `Match` via la stessa upsert/audit/notification path esistente.
+- Cost guardrails riusati:
+  - global daily cap;
+  - per-user daily cap;
+  - `daily_cost_tracking`;
+  - `vifaras_cost_usd_total`.
+- `/api/_dev/ai/status` ora espone anche il backend matching attivo.
+- `scripts/check_launch_config.py` accetta produzione Anthropic-only senza
+  `OPENAI_API_KEY` quando `MATCHING_BACKEND=anthropic`.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/services/match_service.py backend/app/services/intent_service.py backend/app/core/config.py backend/app/core/launch_config.py backend/app/api/_dev_endpoints.py backend/tests/test_match.py backend/tests/test_intents.py backend/tests/test_launch_config.py backend/tests/test_dev_ai_status.py
+uv run ruff check backend/app/services/match_service.py backend/app/services/intent_service.py backend/app/core/config.py backend/app/core/launch_config.py backend/app/api/_dev_endpoints.py backend/tests/test_match.py backend/tests/test_intents.py backend/tests/test_launch_config.py backend/tests/test_dev_ai_status.py
+uv run pytest backend/tests/test_match.py backend/tests/test_intents.py backend/tests/test_launch_config.py backend/tests/test_dev_ai_status.py
+uv run python scripts/check_launch_config.py
+```
+
+Risultati:
+
+- Compileall verde.
+- Ruff verde sui file toccati.
+- 71 test verdi sulle suite match/intents/launch/dev-ai.
+- Launch config current: OK, 1 warning atteso su JWT dev default.

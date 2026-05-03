@@ -299,10 +299,12 @@ V0 usa provider AI ufficiali tramite account API controllati da Vifaras:
 - Cost tracking FASE 7.3 rimane enforcement primario.
 - Scheduler agente resta opt-in (`ENABLE_AGENT_SCHEDULER=true`) per evitare costi accidentali.
 
-**2. OpenAI API per embeddings**
-- `text-embedding-3-small` per matching semantico.
-- API key come secret di deploy (`OPENAI_API_KEY`).
-- `EMBEDDING_BACKEND=fake` resta dev/test escape hatch.
+**2. Matching semantico**
+- Default storico: OpenAI `text-embedding-3-small` + pgvector
+  (`MATCHING_BACKEND=embedding`, richiede `OPENAI_API_KEY`).
+- Path Anthropic-only V0: SQL pre-filter + Claude semantic scoring
+  (`MATCHING_BACKEND=anthropic`, non richiede OpenAI embeddings).
+- `EMBEDDING_BACKEND=fake` resta dev/test escape hatch solo per rehearsal.
 
 **NON supportato in V0**:
 - Claude Pro/Max OAuth o credenziali Claude.ai consumer.
@@ -355,7 +357,7 @@ Decisioni open, non blocking V0:
 **🔲 PENDING — Sequence C (consumer platform-managed)**
 
 1. **FASE 10.2 — Platform AI production setup**
-   - Backend: production env checklist (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, caps)
+   - Backend: production env checklist (`ANTHROPIC_API_KEY`, matching backend, caps)
    - Backend: static launch sanity via `scripts/check_launch_config.py`
    - Backend: provider health/cost visibility via dev-gated `/api/_dev/ai/status`
    - Frontend: remove/avoid provider-linking UX; explain AI included + fair-use

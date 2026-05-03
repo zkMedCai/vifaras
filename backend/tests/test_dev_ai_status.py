@@ -25,6 +25,8 @@ async def test_dev_ai_status_reports_provider_config_without_secrets(
     monkeypatch.setattr(settings, "anthropic_model", "claude-sonnet-4-5")
     monkeypatch.setattr(settings, "openai_api_key", "")
     monkeypatch.setattr(settings, "embedding_backend", "fake")
+    monkeypatch.setattr(settings, "matching_backend", "anthropic")
+    monkeypatch.setattr(settings, "anthropic_match_candidate_limit", 30)
 
     r = await http_client.get("/api/_dev/ai/status")
 
@@ -39,6 +41,11 @@ async def test_dev_ai_status_reports_provider_config_without_secrets(
         "configured": False,
         "backend": "fake",
         "model": settings.openai_embedding_model,
+    }
+    assert body["providers"]["matching"] == {
+        "backend": "anthropic",
+        "requires_embeddings": False,
+        "anthropic_candidate_limit": 30,
     }
     assert "sk-ant-secret-test" not in r.text
 

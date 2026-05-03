@@ -50,16 +50,16 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
+from app.core.config import settings
+from app.core.security import create_access_token
+from app.models.schema import Intent, Mandate, Match, Negotiation, User
+from app.services import embedding_service
 from sqlalchemy import select
 
-from app.core.security import create_access_token
-from app.models.schema import Agent, Intent, Mandate, Match, Negotiation, User
-from app.services import embedding_service, intent_service
 from tests.factories import (
     default_user_kwargs,
     setup_active_mandate_async,
 )
-
 
 # ---------------------------------------------------------------------------
 # Module-wide fixtures
@@ -267,6 +267,32 @@ async def test_create_intent_generates_embedding(
     assert len(stored) == embedding_service.EMBEDDING_DIM
     assert pytest.approx(stored[0], rel=1e-6) == expected_embedding[0]
     assert pytest.approx(stored[-1], rel=1e-6) == expected_embedding[-1]
+
+
+@pytest.mark.db
+async def test_create_intent_skips_embedding_for_anthropic_matching(
+    http_client, async_db_session, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "matching_backend", "anthropic")
+    user_id = await _seed_tier_0_or_1_user(async_db_session, tier=0)
+    _bearer(http_client, user_id, tier=0)
+
+    calls: list[str] = []
+
+    async def spy(text: str):
+        calls.append(text)
+        raise AssertionError("embedding should not be generated")
+
+    monkeypatch.setattr(embedding_service, "generate_embedding", spy)
+
+    response = await http_client.post("/api/intents", json=_valid_create_body())
+
+    assert response.status_code == 201, response.text
+    intent = await async_db_session.scalar(
+        select(Intent).where(Intent.id == response.json()["intent_id"])
+    )
+    assert intent.description_embedding is None
+    assert calls == []
 
 
 # ===========================================================================

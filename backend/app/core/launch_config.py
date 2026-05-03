@@ -102,6 +102,15 @@ def _check_common_ai_caps(
             ),
         )
 
+    matching_backend = cfg.matching_backend.strip().lower()
+    if matching_backend not in {"embedding", "anthropic"}:
+        _add(
+            issues,
+            severity,
+            "matching_backend_unknown",
+            "MATCHING_BACKEND must be either embedding or anthropic.",
+        )
+
     if cfg.max_daily_llm_cost_usd <= 0:
         _add(
             issues,
@@ -210,6 +219,10 @@ def _check_prod_provider_config(
             "anthropic_api_key_missing",
             "ANTHROPIC_API_KEY is required for platform-managed agent runtime.",
         )
+
+    matching_backend = cfg.matching_backend.strip().lower()
+    if matching_backend == "anthropic":
+        return
 
     backend = cfg.embedding_backend.strip().lower()
     if backend == "openai" and not cfg.openai_api_key:

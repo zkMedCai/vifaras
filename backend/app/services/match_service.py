@@ -33,6 +33,10 @@ Two layers of filtering before ranking:
 The oversampling factor (×3) compensates for candidates we drop on the
 price filter — empirically enough that the top-N is rarely starved.
 
+FASE 10.2.7 adds `MATCHING_BACKEND=anthropic`: same persistence contract,
+but candidate retrieval is SQL-only and Claude scores semantic compatibility.
+That path lets V0 run Anthropic-only without OpenAI embeddings.
+
 Persistence: `Match` rows are upserted on `(buy_intent_id, sell_intent_id)`
 unique constraint. Net-new rows audit `match_created`; rows whose score
 moved past `_AUDIT_SCORE_DELTA` audit `update_match_score`. Sub-threshold
@@ -40,16 +44,23 @@ drift (re-discovery with same embedding + same prices) is silent.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Final
+from datetime import UTC, datetime
+from typing import Any, Final
 
+from anthropic import AsyncAnthropic
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
+from app.core.logging import log
 from app.models.schema import Intent, Match
-from app.services import audit_service
-
+from app.services import (
+    anthropic_pricing,
+    audit_service,
+    cost_tracking_service,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -98,6 +109,16 @@ class TradeMatchingNotImplemented(MatchError):
 
     code = "trade_matching_not_implemented"
     http_status = 422
+
+
+class MatchingBackendUnknown(MatchError):
+    code = "matching_backend_unknown"
+    http_status = 500
+
+
+class MatchingProviderUnavailable(MatchError):
+    code = "matching_provider_unavailable"
+    http_status = 503
 
 
 class MatchNotFound(MatchError):
@@ -172,7 +193,7 @@ def combine_scores(*, similarity: float, price_proximity: float) -> float:
 
 
 def _utcnow_naive() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _resolve_buy_sell(
@@ -195,12 +216,47 @@ class _ScoredCandidate:
     combined: float
 
 
+def _matching_backend() -> str:
+    return settings.matching_backend.strip().lower()
+
+
+def uses_embedding_matching() -> bool:
+    """Whether new intents must carry pgvector embeddings for discovery."""
+    return _matching_backend() != "anthropic"
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
 
 
 async def find_matches_for_intent(
+    db: AsyncSession,
+    *,
+    intent_id: str,
+    limit: int = DEFAULT_MATCH_LIMIT,
+    anthropic_client: AsyncAnthropic | None = None,
+) -> list[Match]:
+    backend = _matching_backend()
+    if backend == "anthropic":
+        return await _find_matches_for_intent_anthropic(
+            db,
+            intent_id=intent_id,
+            limit=limit,
+            anthropic_client=anthropic_client,
+        )
+    if backend != "embedding":
+        raise MatchingBackendUnknown(
+            f"unsupported MATCHING_BACKEND={settings.matching_backend!r}"
+        )
+    return await _find_matches_for_intent_embedding(
+        db,
+        intent_id=intent_id,
+        limit=limit,
+    )
+
+
+async def _find_matches_for_intent_embedding(
     db: AsyncSession,
     *,
     intent_id: str,
@@ -305,6 +361,321 @@ async def find_matches_for_intent(
         .order_by(Match.combined_score.desc())
     )
     return list((await db.scalars(final_stmt)).all())
+
+
+async def _find_matches_for_intent_anthropic(
+    db: AsyncSession,
+    *,
+    intent_id: str,
+    limit: int = DEFAULT_MATCH_LIMIT,
+    anthropic_client: AsyncAnthropic | None = None,
+) -> list[Match]:
+    """Discover matches without embeddings: SQL pre-filter + Claude ranker.
+
+    This is the Anthropic-only V0 path. It keeps hard privacy boundaries:
+    SQL does categorical/opposite-side/price-overlap filtering and Claude
+    receives only marketplace-facing item fields for semantic compatibility.
+    Strategic price scoring stays deterministic in-process.
+    """
+    intent = await db.get(Intent, intent_id)
+    if intent is None or intent.status != "active":
+        return []
+    if intent.side == "trade":
+        raise TradeMatchingNotImplemented(
+            "TRADE matching not implemented in V0 (FASE 8)"
+        )
+
+    limit = max(1, min(MAX_MATCH_LIMIT, limit))
+    if await _matching_cost_cap_reached(db, user_id=intent.user_id):
+        return []
+
+    candidates = await _anthropic_candidate_rows(db, intent=intent, limit=limit)
+    if not candidates:
+        await db.commit()
+        return []
+
+    try:
+        scored = await _score_candidates_with_anthropic(
+            db=db,
+            intent=intent,
+            candidates=candidates,
+            client=anthropic_client,
+        )
+    except MatchingProviderUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "match.anthropic.call_failed",
+            intent_id=intent.id,
+            user_id=intent.user_id,
+            error=type(exc).__name__,
+            message=str(exc),
+        )
+        raise MatchingProviderUnavailable(
+            f"Anthropic matching call failed: {type(exc).__name__}"
+        ) from exc
+    scored.sort(key=lambda s: s.combined, reverse=True)
+    top = scored[:limit]
+
+    persisted_ids: list[str] = []
+    for sc in top:
+        match_id = await _upsert_match(db, sc, owning_user_id=intent.user_id)
+        persisted_ids.append(match_id)
+
+    await db.commit()
+
+    if not persisted_ids:
+        return []
+
+    final_stmt = (
+        select(Match)
+        .where(Match.id.in_(persisted_ids))
+        .order_by(Match.combined_score.desc())
+    )
+    return list((await db.scalars(final_stmt)).all())
+
+
+async def _matching_cost_cap_reached(
+    db: AsyncSession, *, user_id: str
+) -> bool:
+    today_cost = await cost_tracking_service.get_today_cost_usd(db)
+    if today_cost >= settings.max_daily_llm_cost_usd:
+        log.warning(
+            "match.anthropic.global_cost_cap_reached",
+            user_id=user_id,
+            today_cost_usd=round(today_cost, 6),
+            cap_usd=settings.max_daily_llm_cost_usd,
+        )
+        return True
+
+    user_cost = await cost_tracking_service.get_user_cost_today(
+        db, user_id=user_id
+    )
+    if user_cost >= settings.daily_user_cost_cap_usd:
+        log.warning(
+            "match.anthropic.user_cost_cap_reached",
+            user_id=user_id,
+            user_cost_usd=round(user_cost, 6),
+            cap_usd=settings.daily_user_cost_cap_usd,
+        )
+        return True
+    return False
+
+
+async def _anthropic_candidate_rows(
+    db: AsyncSession, *, intent: Intent, limit: int
+) -> list[Intent]:
+    opposite_side = "buy" if intent.side == "sell" else "sell"
+    candidate_limit = max(
+        limit,
+        min(settings.anthropic_match_candidate_limit, MAX_MATCH_LIMIT * 5),
+    )
+    filters = [
+        Intent.id != intent.id,
+        Intent.side == opposite_side,
+        Intent.category == intent.category,
+        Intent.status == "active",
+        Intent.user_id != intent.user_id,
+        Intent.expires_at > _utcnow_naive(),
+    ]
+    if intent.side == "buy":
+        # Candidate is SELL: seller floor must fit buyer cap.
+        filters.append(Intent.reservation_price_cents <= intent.reservation_price_cents)
+    else:
+        # Candidate is BUY: buyer cap must cover seller floor.
+        filters.append(Intent.reservation_price_cents >= intent.reservation_price_cents)
+
+    return list(
+        await db.scalars(
+            select(Intent)
+            .where(*filters)
+            .order_by(Intent.created_at.desc())
+            .limit(candidate_limit)
+        )
+    )
+
+
+async def _score_candidates_with_anthropic(
+    *,
+    db: AsyncSession,
+    intent: Intent,
+    candidates: list[Intent],
+    client: AsyncAnthropic | None,
+) -> list[_ScoredCandidate]:
+    client = client or _default_anthropic_client()
+    candidate_by_id = {candidate.id: candidate for candidate in candidates}
+    response = await client.messages.create(
+        model=settings.anthropic_model,
+        max_tokens=settings.anthropic_match_max_tokens,
+        temperature=0,
+        system=_anthropic_match_system_prompt(),
+        messages=[
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "source_intent": _intent_for_anthropic(intent),
+                        "candidate_intents": [
+                            _intent_for_anthropic(candidate)
+                            for candidate in candidates
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        ],
+    )
+
+    response_model = getattr(response, "model", None) or settings.anthropic_model
+    usage = getattr(response, "usage", None)
+    estimated_cost = anthropic_pricing.calculate_cost_usd(
+        response_model,
+        input_tokens=getattr(usage, "input_tokens", 0) or 0,
+        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+    )
+    await _record_matching_cost(
+        db,
+        intent.user_id,
+        model=response_model,
+        cost_usd=estimated_cost,
+    )
+
+    raw_scores = _parse_anthropic_match_scores(_response_text(response))
+    scored: list[_ScoredCandidate] = []
+    for candidate_id, semantic_score in raw_scores.items():
+        candidate = candidate_by_id.get(candidate_id)
+        if candidate is None:
+            continue
+        buy_intent, sell_intent = _resolve_buy_sell(intent, candidate)
+        price_proximity = compute_price_proximity(
+            buyer_cap_cents=buy_intent.reservation_price_cents,
+            buyer_ideal_cents=buy_intent.ideal_price_cents,
+            seller_floor_cents=sell_intent.reservation_price_cents,
+            seller_ideal_cents=sell_intent.ideal_price_cents,
+        )
+        combined = combine_scores(
+            similarity=semantic_score,
+            price_proximity=price_proximity,
+        )
+        scored.append(
+            _ScoredCandidate(
+                buy_intent_id=buy_intent.id,
+                sell_intent_id=sell_intent.id,
+                buy_user_id=buy_intent.user_id,
+                sell_user_id=sell_intent.user_id,
+                similarity=semantic_score,
+                price_proximity=price_proximity,
+                combined=combined,
+            )
+        )
+    return scored
+
+
+def _default_anthropic_client() -> AsyncAnthropic:
+    if not settings.anthropic_api_key:
+        raise MatchingProviderUnavailable(
+            "ANTHROPIC_API_KEY is required when MATCHING_BACKEND=anthropic"
+        )
+    return AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+
+async def _record_matching_cost(
+    db: AsyncSession, user_id: str, *, model: str, cost_usd: float
+) -> None:
+    from app.core.metrics import COST_USD_TOTAL
+
+    COST_USD_TOTAL.labels(user_id=user_id, model=model).inc(cost_usd)
+    await cost_tracking_service.upsert_daily_cost(
+        db, user_id=user_id, cost_usd=cost_usd
+    )
+
+
+def _anthropic_match_system_prompt() -> str:
+    return """You score compatibility between marketplace intents.
+
+Return ONLY a JSON object with this exact shape:
+{"scores":[{"candidate_id":"...","semantic_score":0.0}]}
+
+Rules:
+- semantic_score is a number from 0 to 1.
+- 1.0 means same item/need and very likely compatible.
+- 0.5 means weak but plausible.
+- 0.0 means not compatible.
+- Score semantic/item compatibility only. Price overlap is handled elsewhere.
+- Use only the fields provided; do not infer private user identity."""
+
+
+def _intent_for_anthropic(intent: Intent) -> dict[str, Any]:
+    return {
+        "candidate_id": intent.id,
+        "side": intent.side,
+        "title": intent.title,
+        "description": intent.description or "",
+        "category": intent.category,
+        "location": _location_from_constraints(intent.hard_constraints),
+    }
+
+
+def _location_from_constraints(
+    hard_constraints: dict[str, Any] | None,
+) -> str | None:
+    if not hard_constraints:
+        return None
+    location = hard_constraints.get("location")
+    return location if isinstance(location, str) else None
+
+
+def _response_text(response: Any) -> str:
+    blocks = getattr(response, "content", []) or []
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in blocks
+        if getattr(block, "type", None) == "text"
+    ).strip()
+
+
+def _parse_anthropic_match_scores(text: str) -> dict[str, float]:
+    try:
+        payload = json.loads(_extract_json_object(text))
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "match.anthropic.invalid_json",
+            error=type(exc).__name__,
+            message=str(exc),
+        )
+        return {}
+
+    scores = payload.get("scores") if isinstance(payload, dict) else None
+    if not isinstance(scores, list):
+        return {}
+
+    parsed: dict[str, float] = {}
+    for item in scores:
+        if not isinstance(item, dict):
+            continue
+        candidate_id = item.get("candidate_id")
+        semantic_score = item.get("semantic_score")
+        if not isinstance(candidate_id, str):
+            continue
+        try:
+            score = float(semantic_score)
+        except (TypeError, ValueError):
+            continue
+        parsed[candidate_id] = max(0.0, min(1.0, score))
+    return parsed
+
+
+def _extract_json_object(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("no JSON object in Anthropic response")
+    return stripped[start : end + 1]
 
 
 async def _upsert_match(

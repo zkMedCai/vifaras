@@ -154,6 +154,15 @@ async def ai_status(
                 "backend": settings.embedding_backend,
                 "model": settings.openai_embedding_model,
             },
+            "matching": {
+                "backend": settings.matching_backend,
+                "requires_embeddings": (
+                    settings.matching_backend.strip().lower() == "embedding"
+                ),
+                "anthropic_candidate_limit": (
+                    settings.anthropic_match_candidate_limit
+                ),
+            },
         },
         "cost": {
             "today_cost_usd": round(today_cost, 6),

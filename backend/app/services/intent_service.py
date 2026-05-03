@@ -21,9 +21,11 @@ Design notes:
   to V0_DEFAULT). The cap is checked on *active* intents only —
   matched/closed/cancelled/expired/paused don't count.
 
-- Embedding generation is sync-inline via `embedding_service`. Failure is
-  terminal for `create_intent`: an intent without an embedding is invisible
-  to the matcher (4.3), so we'd rather 503 than persist a ghost row.
+- Embedding generation is sync-inline via `embedding_service` when the
+  matcher backend is `embedding`. Failure is terminal in that mode: an
+  intent without an embedding is invisible to the pgvector matcher. In
+  `MATCHING_BACKEND=anthropic`, intents can be persisted without embeddings
+  because Claude performs semantic scoring after a SQL pre-filter.
 
 - `side='trade'` is rejected operationally with 422
   (`trade_not_yet_available`) per PROJECT_BRIEF §2.9. Schema accepts it
@@ -44,14 +46,15 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
 
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import categories, platform_limits as pl
+from app.core import categories
+from app.core import platform_limits as pl
 from app.models.schema import Intent, Mandate, Match, Negotiation, User
 from app.services import (
     audit_service,
@@ -60,7 +63,6 @@ from app.services import (
     negotiation_service,
 )
 from app.services.content_moderation import moderate_optional, moderate_text
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -241,7 +243,7 @@ class UpdateIntentInput(BaseModel):
     side: str | None = None
 
     @model_validator(mode="after")
-    def _at_least_one_field(self) -> "UpdateIntentInput":
+    def _at_least_one_field(self) -> UpdateIntentInput:
         if all(getattr(self, f) is None for f in type(self).model_fields):
             raise ValueError("at least one field must be provided")
         return self
@@ -266,7 +268,7 @@ class IntentListPage:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _eur_to_cents(eur: float) -> int:
@@ -483,14 +485,16 @@ async def create_intent(
             f"(currently {current})"
         )
 
-    # 3. Embedding (sync inline). Terminal failure on unavailable.
-    text_to_embed = embedding_service.build_embedding_text(
-        title=input.title, description=input.description
-    )
-    try:
-        embedding = await embedding_service.generate_embedding(text_to_embed)
-    except embedding_service.EmbeddingServiceUnavailable as exc:
-        raise EmbeddingUnavailable(str(exc)) from exc
+    # 3. Embedding (sync inline) only when the active matcher needs it.
+    embedding = None
+    if match_service.uses_embedding_matching():
+        text_to_embed = embedding_service.build_embedding_text(
+            title=input.title, description=input.description
+        )
+        try:
+            embedding = await embedding_service.generate_embedding(text_to_embed)
+        except embedding_service.EmbeddingServiceUnavailable as exc:
+            raise EmbeddingUnavailable(str(exc)) from exc
 
     # 4. Persist.
     now = _utcnow()
@@ -739,10 +743,10 @@ async def update_intent(
             ideal_eur=_cents_to_eur(intent.ideal_price_cents),
         )
 
-    # Regenerate embedding if title or description changed. The matcher
-    # would otherwise rank the intent against stale text — semantically
-    # incoherent. Inline + sync, same failure contract as create_intent.
-    if embedding_relevant_changed:
+    # Regenerate embedding if title or description changed and the active
+    # matcher uses pgvector. Anthropic matching reads the latest text fields
+    # directly, so no OpenAI call is needed in that mode.
+    if embedding_relevant_changed and match_service.uses_embedding_matching():
         text_to_embed = embedding_service.build_embedding_text(
             title=intent.title, description=intent.description
         )
