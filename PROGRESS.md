@@ -2648,3 +2648,50 @@ curl -sS -o /tmp/vifaras_frontend_root.html -w "%{http_code}" -m 5 http://127.0.
 Risultato confermato: HTTP `200` e HTML Vifaras servito.
 
 Nota: una prima richiesta al dev server Next ha restituito una pagina `_error` con `Cannot find module './948.js'`, poi la richiesta ripetuta e passata. Interpretazione: warm-up/cache dev server Next, non blocker backend.
+
+---
+
+## FASE 10.2.4 — Anthropic-only cost/fair-use guardrails — 2026-05-03
+
+### Gap trovato
+
+I cap giornalieri esistevano gia nel scheduler:
+
+- global daily hard cap: `MAX_DAILY_LLM_COST_USD`
+- per-user daily soft cap: `DAILY_USER_COST_CAP_USD`
+
+Pero `AgentOrchestrator.run_tick()` poteva essere chiamato direttamente da script/dev hook/futuri trigger manuali e bypassare il preflight scheduler. Questo era accettabile in FASE 6, ma non piu dopo il passaggio V0 a platform-managed Anthropic.
+
+### Backend changes
+
+- `AgentOrchestrator` ora controlla i cap global/per-user prima di chiamare Anthropic.
+- Se un cap e raggiunto, ritorna:
+  - `early_return:global_cost_cap`
+  - `early_return:user_cost_cap`
+- I cap preflight scrivono `tick_skipped` audit row e non avanzano `last_tick_at`.
+- Nuovo setting `AGENT_TICK_COST_CAP_USD=0.10`: circuit breaker per singolo tick.
+- Se il costo stimato accumulato del tick raggiunge il cap, il loop si ferma con `tick_cost_cap_reached`, registra `tick_failed` e persiste il costo gia speso in `daily_cost_tracking`.
+- `.env.example` aggiornato con il nuovo cap.
+
+### Frontend copy
+
+Frontend home page aggiornata in repo `vifaras-frontend`:
+
+- "Set your deal and AI-use limits"
+- "Vifaras-managed AI ... within fair-use caps"
+
+Niente provider-linking Settings UI V0.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/agents/orchestrator.py backend/app/core/config.py backend/tests/test_orchestrator.py
+uv run pytest backend/tests/test_orchestrator.py backend/tests/test_user_cost_cap.py backend/tests/test_scheduler.py backend/tests/test_cost_metrics.py
+uv run python scripts/smoke_agent_runtime.py --timeout-seconds 45
+```
+
+Risultati:
+
+- 57 test verdi.
+- Runtime smoke reale post-guardrail: `tick_completed`, `turns=1`, `estimated_cost_usd=0.01494000`, `cleanup=done`.
+- Frontend `npm run lint` e `npm run build` verdi in repo `vifaras-frontend`.

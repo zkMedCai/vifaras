@@ -127,6 +127,11 @@ class Settings(BaseSettings):
     # agent stuck in a tool-use loop on one user's intent). Reset at UTC
     # midnight (the daily_cost_tracking row keys on UTC date).
     daily_user_cost_cap_usd: float = 0.50
+    # Per-tick circuit breaker inside AgentOrchestrator itself. Unlike
+    # the daily caps above (scheduler pre-dispatch), this applies to any
+    # direct orchestrator entry point too: CLI smoke scripts, dev hooks,
+    # future manual tick APIs. 0 disables the breaker.
+    agent_tick_cost_cap_usd: float = 0.10
 
     # CORS (7.0): comma-separated origin list (env var
     # `CORS_ALLOWED_ORIGINS=https://a.com,https://b.com`). Pydantic v2

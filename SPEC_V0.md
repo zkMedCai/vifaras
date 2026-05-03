@@ -326,6 +326,7 @@ V0 platform-managed AI richiede un modello economico che copra costo variabile L
 - Crediti o piano mensile per uso extra.
 - Per-user soft cap giornaliero (`daily_user_cost_cap_usd`) già implementato.
 - Global hard cap giornaliero (`max_daily_llm_cost_usd`) già implementato.
+- Per-tick circuit breaker (`agent_tick_cost_cap_usd`) dentro `AgentOrchestrator`, così anche script/dev hook/futuri trigger manuali non bypassano i cap scheduler.
 - Max round negoziazione e max turns per tick restano hard guardrail tecnici.
 - Modello forte solo dove serve; modello economico per parsing/triage se introdotto.
 

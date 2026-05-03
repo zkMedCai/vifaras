@@ -1,6 +1,6 @@
 """AgentOrchestrator tests (brief task 6.3.b).
 
-22 tests organized by concern:
+25 tests organized by concern:
 
   Pre-tick gates (4):
    1. nonexistent agent → reason='agent_not_found'
@@ -20,23 +20,26 @@
   11. step_up_required result preserves data.step_up_id
   12. limit_exceeded result preserves status
 
-  Cap & safety (3):
+  Cap & safety (6):
   13. MAX_TURNS_PER_TICK breaks loop, success=False
-  14. Claude API raises → reason='claude_error', no cursor advance
-  15. Unknown tool name handled by handler (orchestrator forwards)
+  14. user daily cost cap blocks direct orchestrator calls before Claude
+  15. global daily cost cap blocks direct orchestrator calls before Claude
+  16. per-tick cost cap stops the loop and records failure cost
+  17. Claude API raises → reason='claude_error', no cursor advance
+  18. Unknown tool name handled by handler (orchestrator forwards)
 
   Audit & state (3):
-  16. successful tick updates agents.last_tick_at
-  17. successful tick writes tick_completed AuditLog row
-  18. last_tick_summary includes turns + tool_calls + cost
+  19. successful tick updates agents.last_tick_at
+  20. successful tick writes tick_completed AuditLog row
+  21. last_tick_summary includes turns + tool_calls + cost
 
   Cost tracking (2):
-  19. cost accumulates across multiple turns
-  20. cost computed from usage.input_tokens / output_tokens
+  22. cost accumulates across multiple turns
+  23. cost computed from usage.input_tokens / output_tokens
 
   Session lifecycle (2):
-  21. sync session closed even when tool loop raises
-  22. async session closed even when tool loop raises
+  24. sync session closed even when tool loop raises
+  25. async session closed even when tool loop raises
 """
 from __future__ import annotations
 
@@ -58,7 +61,7 @@ from app.agents.orchestrator import (
     TickResult,
 )
 from app.models.schema import Agent, AuditLog, Mandate
-from app.services import embedding_service
+from app.services import cost_tracking_service, embedding_service
 from app.services.audit_service import AgentActions
 from app.services.mandate_verifier import (
     ActionNotAllowed,
@@ -531,6 +534,86 @@ async def test_max_turns_exceeded_breaks_loop(
     assert result.reason == "max_turns_exceeded"
     assert result.turns_used == MAX_TURNS_PER_TICK
     assert len(client.calls) == MAX_TURNS_PER_TICK
+
+
+@pytest.mark.db
+async def test_user_cost_cap_blocks_direct_orchestrator_before_claude(
+    make_orchestrator, async_db_session, monkeypatch
+):
+    user_id, agent_id, _ = await _seed_agent(async_db_session)
+    monkeypatch.setattr(orchestrator_module.settings, "daily_user_cost_cap_usd", 0.50)
+    monkeypatch.setattr(orchestrator_module.settings, "max_daily_llm_cost_usd", 50.0)
+    await cost_tracking_service.upsert_daily_cost(
+        async_db_session, user_id=user_id, cost_usd=0.50
+    )
+    await async_db_session.commit()
+
+    orch, client, _ = make_orchestrator(responses=[_text_response("should not call")])
+    result = await orch.run_tick(agent_id)
+
+    assert result.success is False
+    assert result.reason == "early_return:user_cost_cap"
+    assert client.calls == []
+    rows = (
+        await async_db_session.execute(
+            select(AuditLog).where(AuditLog.agent_id == agent_id)
+        )
+    ).scalars().all()
+    assert any(
+        r.action == AgentActions.TICK_SKIPPED
+        and r.error_code == "early_return:user_cost_cap"
+        for r in rows
+    )
+
+
+@pytest.mark.db
+async def test_global_cost_cap_blocks_direct_orchestrator_before_claude(
+    make_orchestrator, async_db_session, monkeypatch
+):
+    user_id, agent_id, _ = await _seed_agent(async_db_session)
+    monkeypatch.setattr(orchestrator_module.settings, "max_daily_llm_cost_usd", 0.01)
+    monkeypatch.setattr(orchestrator_module.settings, "daily_user_cost_cap_usd", 100.0)
+    await cost_tracking_service.upsert_daily_cost(
+        async_db_session, user_id=user_id, cost_usd=0.02
+    )
+    await async_db_session.commit()
+
+    orch, client, _ = make_orchestrator(responses=[_text_response("should not call")])
+    result = await orch.run_tick(agent_id)
+
+    assert result.success is False
+    assert result.reason == "early_return:global_cost_cap"
+    assert client.calls == []
+
+
+@pytest.mark.db
+async def test_tick_cost_cap_stops_loop_and_records_failure_cost(
+    make_orchestrator, async_db_session, monkeypatch
+):
+    user_id, agent_id, _ = await _seed_agent(async_db_session)
+    monkeypatch.setattr(orchestrator_module.settings, "agent_tick_cost_cap_usd", 0.01)
+    custom = _make_message(
+        [text_block("expensive but complete")],
+        stop_reason="end_turn",
+        input_tokens=10_000,
+        output_tokens=2_000,
+    )
+    orch, client, _ = make_orchestrator(responses=[custom])
+
+    result = await orch.run_tick(agent_id)
+
+    assert result.success is False
+    assert result.reason == "tick_cost_cap_reached"
+    assert result.turns_used == 1
+    assert len(client.calls) == 1
+    assert result.estimated_cost_usd == pytest.approx(0.06, abs=1e-9)
+    agent = await async_db_session.get(Agent, agent_id)
+    await async_db_session.refresh(agent)
+    assert agent.last_tick_at is None
+    user_cost = await cost_tracking_service.get_user_cost_today(
+        async_db_session, user_id=user_id
+    )
+    assert user_cost == pytest.approx(0.06, abs=1e-9)
 
 
 @pytest.mark.db

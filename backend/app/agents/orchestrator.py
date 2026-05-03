@@ -111,8 +111,11 @@ class TickResult:
       - 'tick_completed'           the model called 0+ tools and ended.
       - 'early_return:not_active'  agent.status != 'active'.
       - 'early_return:no_mandate'  no non-revoked mandate.
+      - 'early_return:global_cost_cap' global daily LLM cap already hit.
+      - 'early_return:user_cost_cap'   user's daily LLM cap already hit.
       - 'agent_not_found'          DB row missing.
       - 'max_turns_exceeded'       hit the turn cap; partial work persisted.
+      - 'tick_cost_cap_reached'    per-tick estimated cost cap hit.
       - 'claude_error'             API call raised; nothing was committed.
     """
 
@@ -230,6 +233,16 @@ class AgentOrchestrator:
                     detail="no non-revoked mandate",
                 )
 
+            cost_gate = await self._check_cost_caps(async_db, state)
+            if cost_gate is not None:
+                reason, detail = cost_gate
+                return await self._record_skip(
+                    async_db,
+                    state=state,
+                    reason=reason,
+                    detail=detail,
+                )
+
             # Run the tool loop with a sync session bound to the verifier.
             # `with` guarantees close on raise — so the connection returns
             # to the pool even if the loop crashes mid-turn.
@@ -331,6 +344,31 @@ class AgentOrchestrator:
             text_blocks = [b for b in response.content if b.type == "text"]
             if text_blocks:
                 final_text = "\n".join(b.text for b in text_blocks).strip() or final_text
+
+            tick_cost_cap = settings.agent_tick_cost_cap_usd
+            if tick_cost_cap > 0 and cost_acc >= tick_cost_cap:
+                log.warning(
+                    "orchestrator.tick_cost_cap_reached",
+                    agent_id=state.agent_id,
+                    user_id=state.user_id,
+                    cost_usd=round(cost_acc, 6),
+                    cap_usd=tick_cost_cap,
+                    turn=turns,
+                )
+                return TickResult(
+                    agent_id=state.agent_id,
+                    success=False,
+                    reason="tick_cost_cap_reached",
+                    turns_used=turns,
+                    tool_calls_count=tool_calls_count,
+                    estimated_cost_usd=cost_acc,
+                    final_response_text=final_text,
+                    tool_calls=tool_calls_log,
+                    error=(
+                        f"estimated tick cost ${cost_acc:.6f} reached "
+                        f"cap ${tick_cost_cap:.6f}"
+                    ),
+                )
 
             # Terminal stop reasons: model is done. No tool dispatch.
             if response.stop_reason in ("end_turn", "stop_sequence"):
@@ -507,6 +545,34 @@ You'll receive your full current state as the first user message. Plan first, th
             input_tokens=getattr(usage, "input_tokens", 0) or 0,
             output_tokens=getattr(usage, "output_tokens", 0) or 0,
         )
+
+    async def _check_cost_caps(
+        self, db: AsyncSession, state: AgentFullState
+    ) -> tuple[str, str] | None:
+        """Preflight cost gates that apply to every orchestrator entry point."""
+        today_cost = await cost_tracking_service.get_today_cost_usd(db)
+        if today_cost >= settings.max_daily_llm_cost_usd:
+            return (
+                "early_return:global_cost_cap",
+                (
+                    f"global daily LLM cost cap reached: "
+                    f"${today_cost:.6f} >= ${settings.max_daily_llm_cost_usd:.6f}"
+                ),
+            )
+
+        user_cost = await cost_tracking_service.get_user_cost_today(
+            db, user_id=state.user_id
+        )
+        if user_cost >= settings.daily_user_cost_cap_usd:
+            return (
+                "early_return:user_cost_cap",
+                (
+                    f"user daily LLM cost cap reached: "
+                    f"${user_cost:.6f} >= ${settings.daily_user_cost_cap_usd:.6f}"
+                ),
+            )
+
+        return None
 
     # ------------------------------------------------------------------
     # Persistence helpers
