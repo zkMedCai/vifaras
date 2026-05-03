@@ -1,7 +1,6 @@
 """Application settings loaded from environment / .env via pydantic-settings."""
 from functools import cached_property
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -133,9 +132,8 @@ class Settings(BaseSettings):
     # future manual tick APIs. 0 disables the breaker.
     agent_tick_cost_cap_usd: float = 0.10
 
-    # CORS (7.0): comma-separated origin list (env var
-    # `CORS_ALLOWED_ORIGINS=https://a.com,https://b.com`). Pydantic v2
-    # parses lists from comma-separated strings out of the box.
+    # CORS (7.0): JSON origin list in env, e.g.
+    # `CORS_ALLOWED_ORIGINS=["https://app.example.com"]`.
     cors_allowed_origins: list[str] = ["http://localhost:3000"]
 
     # Rate limiting (7.0): slowapi-driven. Off in tests by default; on in

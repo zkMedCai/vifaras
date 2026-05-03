@@ -2695,3 +2695,59 @@ Risultati:
 - 57 test verdi.
 - Runtime smoke reale post-guardrail: `tick_completed`, `turns=1`, `estimated_cost_usd=0.01494000`, `cleanup=done`.
 - Frontend `npm run lint` e `npm run build` verdi in repo `vifaras-frontend`.
+
+---
+
+## FASE 10.2.5 — Production env checklist + launch config sanity — 2026-05-03
+
+### Gap trovato
+
+`.env.example` era driftato rispetto a `Settings` post-JWT rotation:
+
+- esempio vecchio: `JWT_SECRET`
+- setting reale: `JWT_SECRET_CURRENT`
+- esempio vecchio: `JWT_REFRESH_TTL_DAYS`
+- setting reale: `REFRESH_TOKEN_TTL_DAYS`
+
+Con `extra="ignore"` di Pydantic, quei nomi vecchi sarebbero stati ignorati e il backend avrebbe tenuto il secret default. Corretto ora.
+
+### Backend changes
+
+- Aggiunto `backend/app/core/launch_config.py`: validator statico senza DB/network e senza stampa secrets.
+- Aggiunto `scripts/check_launch_config.py`.
+- Aggiunto `docs/PRODUCTION_ENV_CHECKLIST.md`.
+- Aggiunti test `backend/tests/test_launch_config.py`.
+- `.env.example` aggiornato con:
+  - `JWT_SECRET_CURRENT`
+  - `JWT_SECRET_PREVIOUS`
+  - `REFRESH_TOKEN_TTL_DAYS`
+  - `CORS_ALLOWED_ORIGINS`
+  - `ENABLE_RATE_LIMITING`
+  - `ENABLE_DEV_ENDPOINTS`
+
+### Comandi operativi
+
+```bash
+uv run python scripts/check_launch_config.py
+uv run python scripts/check_launch_config.py --profile production --require-scheduler
+uv run python scripts/check_launch_config.py --profile production --allow-fake-embeddings
+```
+
+`--allow-fake-embeddings` e solo per rehearsal Anthropic-only; non e postura launch marketplace.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/core/launch_config.py backend/tests/test_launch_config.py scripts/check_launch_config.py
+uv run ruff check backend/app/core/launch_config.py backend/app/core/config.py backend/tests/test_launch_config.py scripts/check_launch_config.py
+uv run pytest backend/tests/test_launch_config.py backend/tests/test_jwt_rotation.py backend/tests/test_kms.py
+uv run python scripts/check_launch_config.py
+uv run python scripts/check_launch_config.py --profile production --allow-fake-embeddings
+```
+
+Risultati:
+
+- 30 test verdi.
+- Ruff verde sui file toccati.
+- Dev/current profile: OK con 1 warning atteso (`jwt_secret_default_dev`).
+- Production profile sul `.env` dev: FAIL atteso con errori su JWT/KMS/WebAuthn/OpenAI/rate limiting/CORS.

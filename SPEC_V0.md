@@ -356,6 +356,7 @@ Decisioni open, non blocking V0:
 
 1. **FASE 10.2 — Platform AI production setup**
    - Backend: production env checklist (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, caps)
+   - Backend: static launch sanity via `scripts/check_launch_config.py`
    - Backend: provider health/cost visibility for founder/admin
    - Frontend: remove/avoid provider-linking UX; explain AI included + fair-use
    - Effort stima: 2-4 days
