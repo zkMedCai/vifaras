@@ -2559,3 +2559,47 @@ Commit + push dell'hardening Anthropic-only. Poi scegliere tra:
 1. manual tick script su agente seeded/attivo con `EMBEDDING_BACKEND=fake`;
 2. backend startup smoke con `ENABLE_AGENT_SCHEDULER=false`;
 3. frontend copy/fair-use update.
+
+---
+
+## FASE 10.2.2 — Agent runtime smoke script — 2026-05-03
+
+### Cosa e stato fatto
+
+- Aggiunto `scripts/smoke_agent_runtime.py`.
+- Lo script crea un utente tier-2 disposable, agente attivo e mandate attivo.
+- Il mandate smoke permette solo tool read-only (`read_inbox`, `check_state`) per evitare write marketplace accidentali.
+- Esegue un tick reale con `AgentOrchestrator` e Anthropic platform-managed.
+- Verifica persistenza di:
+  - `agents.last_tick_at`
+  - `agents.last_tick_summary`
+  - audit row `tick_completed`
+  - row `daily_cost_tracking`
+- Default: pulisce le righe seeded dopo la verifica. `--keep` le conserva per inspection manuale.
+- Guardrail: blocca se `ANTHROPIC_API_KEY` manca o se `APP_ENV` e production senza `--allow-prod`.
+- Timeout Anthropic esplicito via `--timeout-seconds` per evitare smoke appesi.
+- Recovery command `--cleanup-stale` per pulire eventuali righe disposable dopo run interrotti.
+
+### Verifica locale
+
+```bash
+uv run python scripts/smoke_agent_runtime.py --timeout-seconds 45
+```
+
+Output confermato:
+
+```text
+Agent runtime smoke OK
+model=claude-sonnet-4-5
+reason=tick_completed
+turns=1
+tool_calls=0
+estimated_cost_usd=0.01569000
+audit_tick_completed=1
+audit_total=1
+daily_cost_usd=0.015690
+daily_tick_count=1
+cleanup=done
+```
+
+Nota runtime: il primo tentativo dentro sandbox restava appeso per assenza di accesso a Postgres localhost. Run confermato fuori sandbox con accesso DB locale + Anthropic API.
