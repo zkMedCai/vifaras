@@ -366,17 +366,23 @@ Decisioni open, non blocking V0:
    - Backend already implemented FASE 5
    - Effort stima: 1-2 weeks
 
-3. **FASE 10.1.4 — Deal pending signature step-up**
+3. **FASE 10.1.3.1 — Public market board**
+   - Backend: `GET /api/market` public safe listing surface
+   - Frontend: `/market` public board with basic filters
+   - Hide strategic fields (`ideal_price_eur`, owner id, soft preferences, transcripts)
+   - Effort stima: 0.5-1 day
+
+4. **FASE 10.1.4 — Deal pending signature step-up**
    - Frontend: deal sign UI + WebAuthn step-up
    - Backend already implemented FASE 6
    - Effort stima: 1 week
 
-4. **FASE 10.3 — HITL approval implementation**
+5. **FASE 10.3 — HITL approval implementation**
    - Backend: mandate v2 (auto_approve_threshold) + agent_action_pending_approval table
    - Frontend: approval UI (list pending + detail card + approve/reject)
    - Effort stima: 2-3 weeks
 
-5. **FASE 11 — i18n IT/EN bootstrap**
+6. **FASE 11 — i18n IT/EN bootstrap**
    - Frontend: next-intl setup + traduzione UI strings + locale toggle
    - Backend: error code + email templates localized
    - Effort stima: 3-5 days

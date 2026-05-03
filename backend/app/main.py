@@ -20,6 +20,7 @@ from app.api import (
     intents as intent_routes,
     legal as legal_routes,
     mandates as mandate_routes,
+    market as market_routes,
     matches as match_routes,
     negotiations as negotiation_routes,
     notifications as notification_routes,
@@ -108,6 +109,7 @@ app.include_router(agents_routes.router)
 app.include_router(mandate_routes.router)
 app.include_router(step_up_routes.router)
 app.include_router(intent_routes.router)
+app.include_router(market_routes.router)
 app.include_router(match_routes.router)
 app.include_router(negotiation_routes.router)
 app.include_router(deal_routes.router)

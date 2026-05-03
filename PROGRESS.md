@@ -2792,3 +2792,51 @@ Risultati:
 - Compileall verde.
 - Ruff verde sui file toccati.
 - 5 test verdi.
+
+---
+
+## FASE 10.1.3.1 — Public market board API — 2026-05-03
+
+### Backend changes
+
+- Aggiunto `GET /api/market`, pubblico e read-only.
+- Espone solo intent attivi e non scaduti.
+- Filtri supportati:
+  - `side=buy|sell`
+  - `category`
+  - `location`
+  - `limit`
+  - `offset`
+- Campi pubblici:
+  - `intent_id`
+  - `side`
+  - `title`
+  - `description`
+  - `category`
+  - `public_price_eur`
+  - `currency`
+  - `location`
+  - `status`
+  - `created_at`
+  - `expires_at`
+- Campi intenzionalmente esclusi:
+  - `user_id`
+  - `ideal_price_eur`
+  - `soft_preferences`
+  - transcript / negoziazioni
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/api/market.py backend/tests/test_market.py backend/app/main.py
+uv run ruff check backend/app/api/market.py backend/tests/test_market.py
+uv run pytest backend/tests/test_market.py
+curl -sS -i -m 5 http://127.0.0.1:8000/api/market?limit=1
+```
+
+Risultati:
+
+- Compileall verde.
+- Ruff verde sui file toccati.
+- 3 test verdi.
+- Live smoke `/api/market?limit=1` HTTP `200`.
