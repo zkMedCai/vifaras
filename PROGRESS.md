@@ -2603,3 +2603,48 @@ cleanup=done
 ```
 
 Nota runtime: il primo tentativo dentro sandbox restava appeso per assenza di accesso a Postgres localhost. Run confermato fuori sandbox con accesso DB locale + Anthropic API.
+
+---
+
+## FASE 10.2.3 — Backend/frontend live startup smoke — 2026-05-03
+
+### Contesto
+
+Founder aveva gia avviato:
+
+- backend su `http://127.0.0.1:8000`
+- frontend su `http://127.0.0.1:3000`
+
+Nessun nuovo server e stato avviato o fermato da Codex in questa fase.
+
+### Backend smoke
+
+```bash
+curl -sS -m 5 http://127.0.0.1:8000/health
+curl -sS -m 5 http://127.0.0.1:8000/api/health/ready
+curl -sS -m 5 http://127.0.0.1:8000/api/health
+```
+
+Output confermato:
+
+```json
+{"status":"ok","service":"marketplace","env":"dev","db":"ok"}
+```
+
+```json
+{"status":"ready","checks":{"database":"healthy","scheduler":"disabled"}}
+```
+
+```json
+{"status":"healthy","service":"marketplace","version":"0.1.0","env":"dev","timestamp":"2026-05-03T16:47:18.348733","checks":{"database":"healthy","agent_scheduler":"disabled","last_successful_tick":null,"today_cost_usd":0.0,"daily_cap_remaining_usd":50.0}}
+```
+
+### Frontend smoke
+
+```bash
+curl -sS -o /tmp/vifaras_frontend_root.html -w "%{http_code}" -m 5 http://127.0.0.1:3000
+```
+
+Risultato confermato: HTTP `200` e HTML Vifaras servito.
+
+Nota: una prima richiesta al dev server Next ha restituito una pagina `_error` con `Cannot find module './948.js'`, poi la richiesta ripetuta e passata. Interpretazione: warm-up/cache dev server Next, non blocker backend.
