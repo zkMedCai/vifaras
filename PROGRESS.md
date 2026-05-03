@@ -2903,3 +2903,53 @@ Risultato run reale fuori sandbox:
 - `combined_score=0.9350`
 - `today_cost_delta_usd=0.00363900`
 - `/api/market?location=Roma,%20IT&limit=10` mostra i due intent smoke.
+
+---
+
+## FASE 10.1.3.2 — Agent-first intent draft endpoint — 2026-05-03
+
+### Backend changes
+
+- Aggiunto `POST /api/intents/draft-from-text`.
+- Endpoint tier 0+, rate-limited, non persiste intent.
+- Usa Anthropic platform-managed per trasformare una richiesta libera in
+  bozza strutturata:
+  - `side`
+  - `title`
+  - `description`
+  - `category`
+  - `reservation_price_eur`
+  - `ideal_price_eur`
+  - `duration_days`
+  - `hard_constraints`
+  - `soft_preferences`
+  - `confidence`
+  - `missing_fields`
+  - `summary`
+- Prompt vincolato alla category vocabulary V0.
+- Cost guardrails riusati:
+  - global daily cap;
+  - per-user daily cap;
+  - `daily_cost_tracking`;
+  - `vifaras_cost_usd_total`.
+- Il matcher embedding legacy ora ignora candidati con
+  `description_embedding IS NULL`, necessario dopo l'introduzione di intent
+  Anthropic-only senza embeddings.
+- Test env forza `MATCHING_BACKEND=embedding` come default suite, così il
+  `.env` locale Anthropic-only non rende i test dipendenti dalla macchina.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/services/intent_draft_service.py backend/app/api/intents.py backend/tests/test_intent_draft.py
+uv run ruff check backend/app/services/intent_draft_service.py backend/app/api/intents.py backend/app/services/match_service.py backend/tests/test_intent_draft.py backend/tests/conftest.py
+uv run pytest backend/tests/test_intent_draft.py backend/tests/test_intents.py backend/tests/test_match.py
+curl -sS -o /tmp/vifaras_intent_draft_unauth.json -w "%{http_code}" -m 5 -X POST http://127.0.0.1:8000/api/intents/draft-from-text -H "Content-Type: application/json" -d '{"prompt":"Voglio vendere una bici a Roma, minimo 600 euro"}'
+```
+
+Risultati:
+
+- Compileall verde.
+- Ruff verde sui file toccati.
+- 63 test verdi su draft/intents/match.
+- Live unauth smoke: endpoint presente e risponde `401` senza token.

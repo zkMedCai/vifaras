@@ -12,7 +12,11 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import limiter, user_key
 from app.core.security import CurrentUser, require_tier
-from app.services import intent_service, negotiation_service
+from app.services import (
+    intent_draft_service,
+    intent_service,
+    negotiation_service,
+)
 
 router = APIRouter(prefix="/api/intents", tags=["intents"])
 
@@ -44,6 +48,31 @@ class UpdateIntentRequest(BaseModel):
     soft_preferences: dict[str, Any] | None = None
     category: str | None = None
     side: str | None = None
+
+
+class NaturalIntentDraftRequest(BaseModel):
+    prompt: str = Field(
+        ...,
+        min_length=intent_draft_service.MIN_PROMPT_LEN,
+        max_length=intent_draft_service.MAX_PROMPT_LEN,
+    )
+
+
+class NaturalIntentDraftResponse(BaseModel):
+    side: str | None
+    title: str
+    description: str | None
+    category: str | None
+    reservation_price_eur: float | None
+    ideal_price_eur: float | None
+    duration_days: int
+    hard_constraints: dict[str, Any]
+    soft_preferences: dict[str, Any]
+    confidence: float
+    missing_fields: list[str]
+    summary: str
+    model: str
+    estimated_cost_usd: float
 
 
 class IntentResponse(BaseModel):
@@ -116,6 +145,13 @@ def _to_http(
     return HTTPException(status_code=exc.http_status, detail=detail)
 
 
+def _draft_to_http(exc: intent_draft_service.IntentDraftError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.http_status,
+        detail={"code": exc.code, "message": str(exc)},
+    )
+
+
 def _intent_to_response(intent) -> IntentResponse:
     return IntentResponse(
         intent_id=intent.id,
@@ -152,6 +188,51 @@ def _intent_to_list_item(intent) -> IntentListItem:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/draft-from-text",
+    response_model=NaturalIntentDraftResponse,
+    summary="Draft an intent from natural language",
+    description=(
+        "Use platform-managed Anthropic to turn a user instruction into a "
+        "structured intent draft. The result is not persisted; the user must "
+        "review and submit it through POST /api/intents."
+    ),
+)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
+async def draft_intent_from_text_endpoint(
+    request: Request,
+    body: NaturalIntentDraftRequest,
+    user: CurrentUser = Depends(require_tier(0)),
+    db: AsyncSession = Depends(get_db),
+) -> NaturalIntentDraftResponse:
+    try:
+        result = await intent_draft_service.draft_intent_from_text(
+            db,
+            user_id=user.user_id,
+            prompt=body.prompt,
+        )
+    except intent_draft_service.IntentDraftError as exc:
+        raise _draft_to_http(exc) from exc
+
+    draft = result.draft
+    return NaturalIntentDraftResponse(
+        side=draft.side,
+        title=draft.title,
+        description=draft.description,
+        category=draft.category,
+        reservation_price_eur=draft.reservation_price_eur,
+        ideal_price_eur=draft.ideal_price_eur,
+        duration_days=draft.duration_days,
+        hard_constraints=draft.hard_constraints,
+        soft_preferences=draft.soft_preferences,
+        confidence=draft.confidence,
+        missing_fields=draft.missing_fields,
+        summary=draft.summary,
+        model=result.model,
+        estimated_cost_usd=result.estimated_cost_usd,
+    )
 
 
 @router.post(

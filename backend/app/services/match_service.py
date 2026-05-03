@@ -299,6 +299,7 @@ async def _find_matches_for_intent_embedding(
         .where(Intent.status == "active")
         .where(Intent.user_id != intent.user_id)
         .where(Intent.expires_at > _utcnow_naive())
+        .where(Intent.description_embedding.is_not(None))
         .order_by(distance_expr.asc())
         .limit(limit * _OVERSAMPLING_MULTIPLIER)
     )
@@ -307,6 +308,8 @@ async def _find_matches_for_intent_embedding(
     # 2. Application-side: price overlap + scoring.
     scored: list[_ScoredCandidate] = []
     for candidate, distance in rows:
+        if distance is None:
+            continue
         buy_intent, sell_intent = _resolve_buy_sell(intent, candidate)
         if (
             buy_intent.reservation_price_cents

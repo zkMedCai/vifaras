@@ -29,13 +29,12 @@ from __future__ import annotations
 import base64
 import os
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 from testcontainers.postgres import PostgresContainer
-
 
 # Hermetic default master key for the whole test session. Set BEFORE any
 # `app.*` import so the cached `Settings()` instance picks it up. Without
@@ -49,6 +48,7 @@ os.environ.setdefault(
     "KMS_MASTER_KEY",
     base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
 )
+os.environ.setdefault("MATCHING_BACKEND", "embedding")
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +106,8 @@ def db_session(_pg_container: PostgresContainer) -> Iterator[Any]:
     transaction is rolled back at fixture teardown, so the next test sees
     a clean DB.
     """
-    from sqlalchemy.orm import Session
-
     from app.core.db import sync_engine
+    from sqlalchemy.orm import Session
 
     connection = sync_engine.connect()
     transaction = connection.begin()
@@ -180,11 +179,10 @@ async def http_client(_async_db_connection, async_db_session):
     savepoint creation drops out of the greenlet bridge after a commit
     on the same session. Per-request sessions auto-begin cleanly.
     """
-    from httpx import ASGITransport, AsyncClient
-    from sqlalchemy.ext.asyncio import AsyncSession
-
     from app.core.db import get_db
     from app.main import app
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     async def _override_get_db():
         async with AsyncSession(
