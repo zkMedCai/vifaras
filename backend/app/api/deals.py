@@ -1,9 +1,10 @@
 """Deals API — list/detail + sign/cancel signing flow + chat (brief task 5.3).
 
-Eight endpoints, all `tier ≥ 2`:
+Nine endpoints, all `tier ≥ 2`:
 
   GET  /api/deals                           — list caller's deals
   GET  /api/deals/{id}                      — detail (party-only)
+  GET  /api/deals/{id}/trade-window         — confirmed-deal logistics window
   POST /api/deals/{id}/sign/draft           — buyer/seller request sign payload
   POST /api/deals/{id}/sign/submit          — verify + apply signature
   POST /api/deals/{id}/cancel/draft         — request cancel payload
@@ -25,7 +26,11 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.rate_limit import limiter, user_key
 from app.core.security import CurrentUser, require_tier
-from app.services import deal_message_service, deal_service
+from app.services import (
+    deal_message_service,
+    deal_service,
+    deal_trade_window_service,
+)
 from app.services.mandate_service import WebAuthnAssertionPayload
 
 router = APIRouter(prefix="/api/deals", tags=["deals"])
@@ -112,6 +117,18 @@ class DealListResponse(BaseModel):
     offset: int
 
 
+class TradeWindowResponse(BaseModel):
+    deal_id: str
+    status: str
+    buyer_user_id: str
+    seller_user_id: str
+    terms_summary: dict[str, Any]
+    confirmed_at: datetime
+    expires_at: datetime | None
+    shipping_status: str
+    next_required_action: str
+
+
 class SendMessageRequest(BaseModel):
     encrypted_content_b64: str
     nonce_b64: str
@@ -176,6 +193,20 @@ def _deal_to_list_item(deal) -> DealListItem:
     )
 
 
+def _trade_window_to_response(state) -> TradeWindowResponse:
+    return TradeWindowResponse(
+        deal_id=state.deal_id,
+        status=state.status,
+        buyer_user_id=state.buyer_user_id,
+        seller_user_id=state.seller_user_id,
+        terms_summary=state.terms_summary,
+        confirmed_at=state.confirmed_at,
+        expires_at=state.expires_at,
+        shipping_status=state.shipping_status,
+        next_required_action=state.next_required_action,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -221,6 +252,23 @@ async def get_deal_endpoint(
     except deal_service.DealError as exc:
         raise _to_http(exc) from exc
     return _deal_to_detail(deal)
+
+
+@router.get("/{deal_id}/trade-window", response_model=TradeWindowResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
+async def get_trade_window_endpoint(
+    request: Request,
+    deal_id: str,
+    user: CurrentUser = Depends(require_tier(2)),
+    db: AsyncSession = Depends(get_db),
+) -> TradeWindowResponse:
+    try:
+        state = await deal_trade_window_service.get_trade_window_for_user(
+            db, user_id=user.user_id, deal_id=deal_id
+        )
+    except deal_service.DealError as exc:
+        raise _to_http(exc) from exc
+    return _trade_window_to_response(state)
 
 
 @router.post("/{deal_id}/sign/draft", response_model=SignDraftResponse)

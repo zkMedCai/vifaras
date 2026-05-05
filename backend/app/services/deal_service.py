@@ -573,6 +573,25 @@ async def submit_signature(
             result={"status": "confirmed"},
             success=True,
         )
+        await audit_service.log_intent_event(
+            db,
+            user_id=user_id,
+            action=audit_service.DealActions.CHAT_UNLOCKED,
+            params={"deal_id": deal.id},
+            result={"status": "confirmed"},
+            success=True,
+        )
+        await audit_service.log_intent_event(
+            db,
+            user_id=user_id,
+            action=audit_service.DealActions.TRADE_WINDOW_OPEN,
+            params={"deal_id": deal.id},
+            result={
+                "status": "trade_window_open",
+                "shipping_status": "shipping_pending",
+            },
+            success=True,
+        )
 
     await db.commit()
 

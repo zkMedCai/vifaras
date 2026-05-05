@@ -88,6 +88,8 @@ class DealActions:
     BUYER_SIGN: Final[str] = "buyer_sign_deal"
     SELLER_SIGN: Final[str] = "seller_sign_deal"
     CONFIRM: Final[str] = "confirm_deal"
+    CHAT_UNLOCKED: Final[str] = "deal_chat_unlocked"
+    TRADE_WINDOW_OPEN: Final[str] = "trade_window_open"
     DISPUTE: Final[str] = "dispute_deal"
     COMPLETE: Final[str] = "complete_deal"
     CANCEL: Final[str] = "cancel_deal"

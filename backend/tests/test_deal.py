@@ -1,6 +1,6 @@
 """Deal service + chat tests (brief task 5.3).
 
-32 tests organized by concern:
+38 tests organized by concern:
 
   Creation (5):
    1. accept_offer creates a pending Deal with correct fields
@@ -37,11 +37,20 @@
   24. expired deal rolls back intent state
   25. partially-signed deal still expires
 
-  Chat (4):
+  Chat (8):
   26. send message to confirmed deal succeeds
   27. send message to pending deal fails (deal not confirmed)
+  27b. list messages from pending deal fails
   28. non-party cannot send messages
+  28b. non-party cannot list messages
+  28c. cancelled deal cannot send messages
+  28d. expired deal cannot list messages
   29. message size capped at 4 KB
+
+  Trade Window (3):
+  29b. pending deal trade window is locked
+  29c. confirmed deal trade window is available
+  29d. non-party cannot open trade window
 
   Concurrency (3):
   30. only one role can sign at a time (serialize via lock)
@@ -75,6 +84,7 @@ from app.services import (
     audit_service,
     deal_message_service,
     deal_service,
+    deal_trade_window_service,
     embedding_service,
     negotiation_service,
 )
@@ -235,6 +245,21 @@ async def _seed_pending_deal(db) -> DealSetup:
         negotiation_id=nego.negotiation_id,
         deal_id=accept.deal_id,
     )
+
+
+async def _confirm_deal(db, setup: DealSetup) -> None:
+    from app.services.mandate_service import WebAuthnAssertionPayload
+
+    for user_id in (setup.buyer_user_id, setup.seller_user_id):
+        draft = await deal_service.request_sign_draft(
+            db, user_id=user_id, deal_id=setup.deal_id
+        )
+        await deal_service.submit_signature(
+            db,
+            user_id=user_id,
+            draft_id=draft.draft_id,
+            assertion=WebAuthnAssertionPayload(**_fake_assertion()),
+        )
 
 
 def _bearer(client, user_id: str, tier: int) -> None:
@@ -663,6 +688,8 @@ async def test_audit_logs_sign_and_confirm_separately(
                 audit_service.DealActions.BUYER_SIGN,
                 audit_service.DealActions.SELLER_SIGN,
                 audit_service.DealActions.CONFIRM,
+                audit_service.DealActions.CHAT_UNLOCKED,
+                audit_service.DealActions.TRADE_WINDOW_OPEN,
             )))
             .where(AuditLog.params["deal_id"].astext == s.deal_id)
         )
@@ -671,6 +698,8 @@ async def test_audit_logs_sign_and_confirm_separately(
     assert audit_service.DealActions.BUYER_SIGN in actions
     assert audit_service.DealActions.SELLER_SIGN in actions
     assert audit_service.DealActions.CONFIRM in actions
+    assert audit_service.DealActions.CHAT_UNLOCKED in actions
+    assert audit_service.DealActions.TRADE_WINDOW_OPEN in actions
 
 
 # ===========================================================================
@@ -866,18 +895,7 @@ async def test_send_message_to_confirmed_deal(
     async_db_session, webauthn_ok
 ) -> None:
     s = await _seed_pending_deal(async_db_session)
-    from app.services.mandate_service import WebAuthnAssertionPayload
-
-    for user_id in (s.buyer_user_id, s.seller_user_id):
-        draft = await deal_service.request_sign_draft(
-            async_db_session, user_id=user_id, deal_id=s.deal_id
-        )
-        await deal_service.submit_signature(
-            async_db_session,
-            user_id=user_id,
-            draft_id=draft.draft_id,
-            assertion=WebAuthnAssertionPayload(**_fake_assertion()),
-        )
+    await _confirm_deal(async_db_session, s)
 
     msg = await deal_message_service.send_message(
         async_db_session,
@@ -934,19 +952,7 @@ async def test_non_party_cannot_send_messages(
     async_db_session, webauthn_ok
 ) -> None:
     s = await _seed_pending_deal(async_db_session)
-    from app.services.mandate_service import WebAuthnAssertionPayload
-
-    # Confirm the deal so chat is open.
-    for user_id in (s.buyer_user_id, s.seller_user_id):
-        draft = await deal_service.request_sign_draft(
-            async_db_session, user_id=user_id, deal_id=s.deal_id
-        )
-        await deal_service.submit_signature(
-            async_db_session,
-            user_id=user_id,
-            draft_id=draft.draft_id,
-            assertion=WebAuthnAssertionPayload(**_fake_assertion()),
-        )
+    await _confirm_deal(async_db_session, s)
 
     outsider, _, _ = await setup_active_mandate_async(
         async_db_session, email=f"out-{uuid.uuid4().hex[:6]}@x.com"
@@ -962,6 +968,81 @@ async def test_non_party_cannot_send_messages(
 
 
 # ===========================================================================
+# 28b. non-party cannot list messages
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_non_party_cannot_list_messages(
+    async_db_session, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    outsider, _, _ = await setup_active_mandate_async(
+        async_db_session, email=f"out-{uuid.uuid4().hex[:6]}@x.com"
+    )
+
+    with pytest.raises(deal_service.NotPartyToDeal):
+        await deal_message_service.list_messages(
+            async_db_session,
+            user_id=outsider,
+            deal_id=s.deal_id,
+        )
+
+
+# ===========================================================================
+# 28c. cancelled deal cannot send messages
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_cancelled_deal_cannot_send_messages(
+    async_db_session, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    draft = await deal_service.request_cancel_draft(
+        async_db_session, user_id=s.buyer_user_id, deal_id=s.deal_id
+    )
+    from app.services.mandate_service import WebAuthnAssertionPayload
+
+    await deal_service.submit_cancel(
+        async_db_session,
+        user_id=s.buyer_user_id,
+        draft_id=draft.draft_id,
+        assertion=WebAuthnAssertionPayload(**_fake_assertion()),
+    )
+
+    with pytest.raises(deal_service.DealNotConfirmed):
+        await deal_message_service.send_message(
+            async_db_session,
+            user_id=s.buyer_user_id,
+            deal_id=s.deal_id,
+            encrypted_content=b"x",
+            nonce=b"y" * 12,
+        )
+
+
+# ===========================================================================
+# 28d. expired deal cannot list messages
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_expired_deal_cannot_list_messages(
+    async_db_session,
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await deal_service.expire_deal(async_db_session, deal_id=s.deal_id)
+
+    with pytest.raises(deal_service.DealNotConfirmed):
+        await deal_message_service.list_messages(
+            async_db_session,
+            user_id=s.buyer_user_id,
+            deal_id=s.deal_id,
+        )
+
+
+# ===========================================================================
 # 29. message size capped at 4 KB
 # ===========================================================================
 
@@ -969,19 +1050,7 @@ async def test_non_party_cannot_send_messages(
 @pytest.mark.db
 async def test_message_size_capped(async_db_session, webauthn_ok) -> None:
     s = await _seed_pending_deal(async_db_session)
-    # Confirm.
-    from app.services.mandate_service import WebAuthnAssertionPayload
-
-    for user_id in (s.buyer_user_id, s.seller_user_id):
-        draft = await deal_service.request_sign_draft(
-            async_db_session, user_id=user_id, deal_id=s.deal_id
-        )
-        await deal_service.submit_signature(
-            async_db_session,
-            user_id=user_id,
-            draft_id=draft.draft_id,
-            assertion=WebAuthnAssertionPayload(**_fake_assertion()),
-        )
+    await _confirm_deal(async_db_session, s)
 
     too_big = b"X" * (deal_message_service.MAX_MESSAGE_BYTES + 1)
     with pytest.raises(deal_message_service.MessageTooLarge):
@@ -992,6 +1061,73 @@ async def test_message_size_capped(async_db_session, webauthn_ok) -> None:
             encrypted_content=too_big,
             nonce=b"z" * 12,
         )
+
+
+# ===========================================================================
+# 29b. pending deal trade window is locked
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_pending_deal_trade_window_is_locked(
+    async_db_session, http_client
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/trade-window")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "deal_not_confirmed"
+
+
+# ===========================================================================
+# 29c. confirmed deal trade window is available
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_confirmed_deal_trade_window_is_available(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.seller_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/trade-window")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deal_id"] == s.deal_id
+    assert body["status"] == deal_trade_window_service.TRADE_WINDOW_STATUS_OPEN
+    assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_PENDING
+    assert body["next_required_action"] == "seller_prepare_shipping"
+    assert body["confirmed_at"] is not None
+    assert body["buyer_user_id"] == s.buyer_user_id
+    assert body["seller_user_id"] == s.seller_user_id
+    assert body["terms_summary"]["agreed_price_cents"] == 120000
+
+
+# ===========================================================================
+# 29d. non-party cannot open trade window
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_non_party_cannot_open_trade_window(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    outsider, _, _ = await setup_active_mandate_async(
+        async_db_session, email=f"out-{uuid.uuid4().hex[:6]}@x.com"
+    )
+    _bearer(http_client, outsider, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/trade-window")
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "not_party_to_deal"
 
 
 # ===========================================================================

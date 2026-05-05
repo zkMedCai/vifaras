@@ -2983,3 +2983,56 @@ Risultati:
 - 2 test mirati verdi.
 - Live pending chat gate: `409 deal_not_confirmed`.
 - Live confirmed chat: `GET /messages` `200`, `POST /messages` `201`.
+
+---
+
+## FASE 10.1.4.2 — Trade Window skeleton — 2026-05-05
+
+### Backend changes
+
+- Aggiunto read model derivato `deal_trade_window_service`.
+- Nuovo endpoint tier 2 party-only:
+  - `GET /api/deals/{deal_id}/trade-window`
+- La Trade Window e disponibile solo per deal `confirmed`.
+- Stato V0 derivato:
+  - `status=trade_window_open`
+  - `shipping_status=shipping_pending`
+  - `next_required_action` differenziata buyer/seller.
+- Response include:
+  - `deal_id`
+  - `buyer_user_id`
+  - `seller_user_id`
+  - `terms_summary`
+  - `confirmed_at`
+  - `expires_at`
+  - `shipping_status`
+  - `next_required_action`
+- Quando la seconda firma conferma il deal, l'audit ora scrive anche:
+  - `deal_chat_unlocked`
+  - `trade_window_open`
+- Nessuna migrazione DB: `trade_window_open` resta stato derivato da
+  `Deal.status == confirmed`.
+
+### Test
+
+- `pending` trade window locked: `409 deal_not_confirmed`.
+- `confirmed` trade window available: `200`.
+- `non-party` trade window blocked: `403 not_party_to_deal`.
+- Regressioni chat:
+  - non-party cannot list messages;
+  - cancelled deal cannot send messages;
+  - expired deal cannot list messages.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/api/deals.py backend/app/services/audit_service.py backend/app/services/deal_service.py backend/app/services/deal_trade_window_service.py backend/tests/test_deal.py
+uv run pytest backend/tests/test_deal.py::test_audit_logs_sign_and_confirm_separately backend/tests/test_deal.py::test_send_message_to_confirmed_deal backend/tests/test_deal.py::test_send_message_to_pending_deal_fails backend/tests/test_deal.py::test_list_messages_from_pending_deal_fails backend/tests/test_deal.py::test_non_party_cannot_send_messages backend/tests/test_deal.py::test_non_party_cannot_list_messages backend/tests/test_deal.py::test_cancelled_deal_cannot_send_messages backend/tests/test_deal.py::test_expired_deal_cannot_list_messages backend/tests/test_deal.py::test_message_size_capped backend/tests/test_deal.py::test_pending_deal_trade_window_is_locked backend/tests/test_deal.py::test_confirmed_deal_trade_window_is_available backend/tests/test_deal.py::test_non_party_cannot_open_trade_window
+git diff --check
+```
+
+Risultati:
+
+- Compileall verde.
+- 12 test mirati verdi.
+- `git diff --check` verde.
