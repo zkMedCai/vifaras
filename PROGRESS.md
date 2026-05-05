@@ -2953,3 +2953,33 @@ Risultati:
 - Ruff verde sui file toccati.
 - 63 test verdi su draft/intents/match.
 - Live unauth smoke: endpoint presente e risponde `401` senza token.
+
+---
+
+## FASE 10.1.4.1 — Deal chat unlock gate — 2026-05-05
+
+### Backend changes
+
+- `deal_message_service.list_messages()` ora applica lo stesso gate di
+  `send_message()`: la chat post-deal e leggibile solo quando il deal e
+  `confirmed`.
+- Prima del fix, `POST /messages` era correttamente bloccato su deal
+  `pending_signatures`, ma `GET /messages` poteva tornare `200` anche prima
+  della doppia firma.
+- Aggiunto test mirato `test_list_messages_from_pending_deal_fails`.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/services/deal_message_service.py backend/tests/test_deal.py
+uv run pytest backend/tests/test_deal.py::test_list_messages_from_pending_deal_fails backend/tests/test_deal.py::test_send_message_to_confirmed_deal
+curl -sS -i -H "Authorization: Bearer <tier2>" \
+  http://127.0.0.1:8000/api/deals/<pending_deal_id>/messages?limit=50
+```
+
+Risultati:
+
+- Compileall verde.
+- 2 test mirati verdi.
+- Live pending chat gate: `409 deal_not_confirmed`.
+- Live confirmed chat: `GET /messages` `200`, `POST /messages` `201`.

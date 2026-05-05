@@ -909,6 +909,22 @@ async def test_send_message_to_pending_deal_fails(async_db_session) -> None:
 
 
 # ===========================================================================
+# 27b. list messages from pending deal fails
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_list_messages_from_pending_deal_fails(async_db_session) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    with pytest.raises(deal_service.DealNotConfirmed):
+        await deal_message_service.list_messages(
+            async_db_session,
+            user_id=s.buyer_user_id,
+            deal_id=s.deal_id,
+        )
+
+
+# ===========================================================================
 # 28. non-party cannot send messages
 # ===========================================================================
 

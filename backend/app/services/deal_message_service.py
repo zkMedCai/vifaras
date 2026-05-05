@@ -172,6 +172,11 @@ async def list_messages(
     deal = await deal_service.get_deal_for_user(
         db, user_id=user_id, deal_id=deal_id
     )
+    if deal.status != "confirmed":
+        raise deal_service.DealNotConfirmed(
+            f"deal {deal.id!r} is in status {deal.status!r}; chat is "
+            f"unlocked only after both signatures land"
+        )
 
     base_filters = [DealMessage.deal_id == deal.id]
     if before_id is not None:
