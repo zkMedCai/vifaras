@@ -3036,3 +3036,50 @@ Risultati:
 - Compileall verde.
 - 12 test mirati verdi.
 - `git diff --check` verde.
+
+---
+
+## FASE 10.1.4.3 — Agent negotiation simulation smoke — 2026-05-05
+
+### Backend/dev tooling
+
+- Aggiunto `scripts/simulate_agent_negotiation.py`.
+- Lo script crea o riusa due parti tier 2:
+  - buyer user + buyer agent;
+  - seller user + seller agent.
+- Crea intent BUY/SELL compatibili e un match deterministico.
+- Esegue il negoziato tramite `AsyncToolHandler`, quindi passando dal
+  layer strumenti agente:
+  - `send_offer` seller agent;
+  - `send_counter_offer` buyer agent;
+  - `send_counter_offer` seller agent;
+  - `accept_offer` buyer agent.
+- Verifica che il transcript abbia sequenza:
+  - `offer`
+  - `counter_offer`
+  - `counter_offer`
+  - `accept`
+- Verifica che `accept_offer` crei un deal `pending_signatures`.
+- Con account reali (`--buyer-email`, `--seller-email`) le righe vengono
+  mantenute di default per ispezione browser e firma passkey.
+- Con utenti disposable, lo script pulisce automaticamente salvo `--keep`.
+
+### Live smoke
+
+```bash
+python3 -m compileall -q scripts/simulate_agent_negotiation.py
+uv run python scripts/simulate_agent_negotiation.py
+uv run python scripts/simulate_agent_negotiation.py \
+  --buyer-email grey.area@outlook.it \
+  --seller-email salmoit83@gmail.com
+```
+
+Risultati:
+
+- Compileall verde.
+- Disposable smoke verde con cleanup automatico.
+- Real-account smoke verde con righe mantenute:
+  - `negotiation_id=35f7801a-b1ab-4ddd-bd4b-ff39528d3a26`
+  - `deal_id=5e7f2f49-5747-40cf-9da5-524db795a843`
+  - agreed price `9000` cents.
+  - transcript 4 turni agent-vs-agent.
