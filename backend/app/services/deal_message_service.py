@@ -11,21 +11,20 @@ Caps:
 
 Auth:
   - Both endpoints require `tier ≥ 2` (only deal parties can chat).
-  - Deal must be `confirmed` before chat opens. Pending or cancelled
-    deals don't get a chat channel.
+  - Deal must be post-confirmation (`confirmed` or `completed`) before
+    chat opens. Pending or cancelled deals don't get a chat channel.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Final
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.schema import Deal, DealMessage
+from app.models.schema import DealMessage
 from app.services import audit_service, deal_service
-
 
 MAX_MESSAGES_PER_DEAL: Final[int] = 100
 MAX_MESSAGE_BYTES: Final[int] = 4096
@@ -67,7 +66,7 @@ class MessageListPage:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +91,7 @@ async def send_message(
     deal = await deal_service.get_deal_for_user(
         db, user_id=user_id, deal_id=deal_id
     )
-    if deal.status != "confirmed":
+    if deal.status not in ("confirmed", "completed"):
         raise deal_service.DealNotConfirmed(
             f"deal {deal.id!r} is in status {deal.status!r}; chat is "
             f"unlocked only after both signatures land"
@@ -172,7 +171,7 @@ async def list_messages(
     deal = await deal_service.get_deal_for_user(
         db, user_id=user_id, deal_id=deal_id
     )
-    if deal.status != "confirmed":
+    if deal.status not in ("confirmed", "completed"):
         raise deal_service.DealNotConfirmed(
             f"deal {deal.id!r} is in status {deal.status!r}; chat is "
             f"unlocked only after both signatures land"

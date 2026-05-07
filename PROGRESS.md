@@ -3083,3 +3083,59 @@ Risultati:
   - `deal_id=5e7f2f49-5747-40cf-9da5-524db795a843`
   - agreed price `9000` cents.
   - transcript 4 turni agent-vs-agent.
+
+---
+
+## FASE 10.1.4.4 — Trade Window shipping workflow — 2026-05-07
+
+### Backend
+
+- Aggiunta persistenza minima sul record `deals`:
+  - `shipping_status`
+  - `tracking_reference`
+  - `shipped_at`
+  - `delivered_at`
+  - `completed_at`
+- Aggiunta migrazione Alembic
+  `2d0c7f8e9a31_deal_trade_window_state.py`.
+- `GET /api/deals/{deal_id}/trade-window` ora espone stato logistico,
+  tracking placeholder e timestamp del workflow.
+- Aggiunto endpoint:
+  - `POST /api/deals/{deal_id}/trade-window/action`
+- Azioni V0:
+  - `mark_shipped`: solo seller, da `shipping_pending` a `shipped`;
+  - `mark_delivered`: solo buyer, da `shipped` a `delivered`;
+  - `mark_completed`: da `delivered` a `completed`, chiude il deal.
+- Audit aggiunti:
+  - `trade_shipping_marked`
+  - `trade_delivered`
+  - `trade_completed`
+- La chat post-deal resta disponibile anche dopo `Deal.status=completed`.
+
+### Test
+
+- Trade Window pending resta bloccata.
+- Deal confermato espone stato iniziale `shipping_pending`.
+- Non-party resta bloccato.
+- Seller puo segnare spedito con tracking placeholder.
+- Buyer non puo segnare spedito.
+- Buyer puo segnare consegnato dopo spedizione.
+- Completamento richiede `delivered`, poi porta deal e shipping a
+  `completed`.
+- Chat disponibile anche dopo completion.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app/api/deals.py backend/app/services/audit_service.py backend/app/services/deal_message_service.py backend/app/services/deal_trade_window_service.py backend/app/models/schema.py backend/tests/test_deal.py
+uv run pytest backend/tests/test_deal.py::test_pending_deal_trade_window_is_locked backend/tests/test_deal.py::test_confirmed_deal_trade_window_is_available backend/tests/test_deal.py::test_non_party_cannot_open_trade_window backend/tests/test_deal.py::test_seller_can_mark_trade_window_shipped backend/tests/test_deal.py::test_buyer_cannot_mark_trade_window_shipped backend/tests/test_deal.py::test_buyer_can_mark_trade_window_delivered backend/tests/test_deal.py::test_trade_window_completion_requires_delivered_and_completes_deal
+uv run pytest backend/tests/test_deal.py
+git diff --check
+```
+
+Risultati:
+
+- Compileall verde.
+- 7 test Trade Window mirati verdi.
+- `backend/tests/test_deal.py`: 43 passed.
+- `git diff --check` verde.

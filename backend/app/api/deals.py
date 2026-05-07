@@ -1,10 +1,11 @@
 """Deals API — list/detail + sign/cancel signing flow + chat (brief task 5.3).
 
-Nine endpoints, all `tier ≥ 2`:
+Ten endpoints, all `tier ≥ 2`:
 
   GET  /api/deals                           — list caller's deals
   GET  /api/deals/{id}                      — detail (party-only)
   GET  /api/deals/{id}/trade-window         — confirmed-deal logistics window
+  POST /api/deals/{id}/trade-window/action  — mutate logistics state
   POST /api/deals/{id}/sign/draft           — buyer/seller request sign payload
   POST /api/deals/{id}/sign/submit          — verify + apply signature
   POST /api/deals/{id}/cancel/draft         — request cancel payload
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -127,6 +128,15 @@ class TradeWindowResponse(BaseModel):
     expires_at: datetime | None
     shipping_status: str
     next_required_action: str
+    tracking_reference: str | None
+    shipped_at: datetime | None
+    delivered_at: datetime | None
+    completed_at: datetime | None
+
+
+class TradeWindowActionRequest(BaseModel):
+    action: Literal["mark_shipped", "mark_delivered", "mark_completed"]
+    tracking_reference: str | None = Field(default=None, max_length=120)
 
 
 class SendMessageRequest(BaseModel):
@@ -204,6 +214,10 @@ def _trade_window_to_response(state) -> TradeWindowResponse:
         expires_at=state.expires_at,
         shipping_status=state.shipping_status,
         next_required_action=state.next_required_action,
+        tracking_reference=state.tracking_reference,
+        shipped_at=state.shipped_at,
+        delivered_at=state.delivered_at,
+        completed_at=state.completed_at,
     )
 
 
@@ -265,6 +279,28 @@ async def get_trade_window_endpoint(
     try:
         state = await deal_trade_window_service.get_trade_window_for_user(
             db, user_id=user.user_id, deal_id=deal_id
+        )
+    except deal_service.DealError as exc:
+        raise _to_http(exc) from exc
+    return _trade_window_to_response(state)
+
+
+@router.post("/{deal_id}/trade-window/action", response_model=TradeWindowResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
+async def trade_window_action_endpoint(
+    request: Request,
+    deal_id: str,
+    body: TradeWindowActionRequest,
+    user: CurrentUser = Depends(require_tier(2)),
+    db: AsyncSession = Depends(get_db),
+) -> TradeWindowResponse:
+    try:
+        state = await deal_trade_window_service.apply_trade_window_action(
+            db,
+            user_id=user.user_id,
+            deal_id=deal_id,
+            action=body.action,
+            tracking_reference=body.tracking_reference,
         )
     except deal_service.DealError as exc:
         raise _to_http(exc) from exc

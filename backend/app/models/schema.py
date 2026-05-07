@@ -454,6 +454,19 @@ class Deal(Base):
     cancelled_at = Column(DateTime, nullable=True)
     cancellation_reason = Column(String(50), nullable=True)
 
+    # V0 Trade Window logistics state. Detailed escrow/tracking tables land
+    # in Trustee Service V1.5; these columns keep the current flow durable.
+    shipping_status = Column(
+        String(30),
+        nullable=False,
+        default="shipping_pending",
+        server_default=text("'shipping_pending'"),
+    )
+    tracking_reference = Column(Text, nullable=True)
+    shipped_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
     # EC5: idempotency key per evitare double-deal su stessa negoziazione
     idempotency_key = Column(Text, unique=True, nullable=False)
 

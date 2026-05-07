@@ -47,10 +47,14 @@
   28d. expired deal cannot list messages
   29. message size capped at 4 KB
 
-  Trade Window (3):
+  Trade Window (7):
   29b. pending deal trade window is locked
   29c. confirmed deal trade window is available
   29d. non-party cannot open trade window
+  29e. seller can mark shipped with tracking placeholder
+  29f. buyer cannot mark shipped
+  29g. buyer can mark delivered after shipment
+  29h. completion requires delivered and completes deal
 
   Concurrency (3):
   30. only one role can sign at a time (serialize via lock)
@@ -59,7 +63,6 @@
 """
 from __future__ import annotations
 
-import base64
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -67,18 +70,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import select
-
 from app.core.security import create_access_token
 from app.models.schema import (
     AuditLog,
     Deal,
-    DealMessage,
     DealSignatureDraft,
     Intent,
     Match,
-    Negotiation,
-    User,
 )
 from app.services import (
     audit_service,
@@ -88,8 +86,9 @@ from app.services import (
     embedding_service,
     negotiation_service,
 )
-from tests.factories import default_user_kwargs, setup_active_mandate_async
+from sqlalchemy import select
 
+from tests.factories import setup_active_mandate_async
 
 # ---------------------------------------------------------------------------
 # Module fixtures
@@ -1102,6 +1101,10 @@ async def test_confirmed_deal_trade_window_is_available(
     assert body["status"] == deal_trade_window_service.TRADE_WINDOW_STATUS_OPEN
     assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_PENDING
     assert body["next_required_action"] == "seller_prepare_shipping"
+    assert body["tracking_reference"] is None
+    assert body["shipped_at"] is None
+    assert body["delivered_at"] is None
+    assert body["completed_at"] is None
     assert body["confirmed_at"] is not None
     assert body["buyer_user_id"] == s.buyer_user_id
     assert body["seller_user_id"] == s.seller_user_id
@@ -1128,6 +1131,176 @@ async def test_non_party_cannot_open_trade_window(
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "not_party_to_deal"
+
+
+# ===========================================================================
+# 29e. seller can mark shipped with tracking placeholder
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_seller_can_mark_trade_window_shipped(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.seller_user_id, tier=2)
+
+    response = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_shipped", "tracking_reference": "GLS-123456"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_SHIPPED
+    assert body["tracking_reference"] == "GLS-123456"
+    assert body["shipped_at"] is not None
+    assert body["next_required_action"] == "wait_for_buyer_delivery"
+
+    deal = await async_db_session.get(Deal, s.deal_id)
+    await async_db_session.refresh(deal)
+    assert deal.status == "confirmed"
+    assert deal.shipping_status == deal_trade_window_service.SHIPPING_STATUS_SHIPPED
+    assert deal.tracking_reference == "GLS-123456"
+
+    audit = await async_db_session.scalar(
+        select(AuditLog)
+        .where(AuditLog.action == audit_service.DealActions.TRADE_SHIPPING_MARKED)
+        .where(AuditLog.params["deal_id"].astext == s.deal_id)
+    )
+    assert audit is not None
+    assert audit.result["shipping_status"] == "shipped"
+
+
+# ===========================================================================
+# 29f. buyer cannot mark shipped
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_buyer_cannot_mark_trade_window_shipped(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_shipped"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "trade_window_action_forbidden"
+
+
+# ===========================================================================
+# 29g. buyer can mark delivered after shipment
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_buyer_can_mark_trade_window_delivered(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+
+    _bearer(http_client, s.seller_user_id, tier=2)
+    shipped = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_shipped"},
+    )
+    assert shipped.status_code == 200
+
+    _bearer(http_client, s.buyer_user_id, tier=2)
+    response = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_delivered"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_DELIVERED
+    assert body["delivered_at"] is not None
+    assert body["next_required_action"] == "complete_trade"
+
+    audit = await async_db_session.scalar(
+        select(AuditLog)
+        .where(AuditLog.action == audit_service.DealActions.TRADE_DELIVERED)
+        .where(AuditLog.params["deal_id"].astext == s.deal_id)
+    )
+    assert audit is not None
+    assert audit.result["shipping_status"] == "delivered"
+
+
+# ===========================================================================
+# 29h. completion requires delivered and completes deal
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_trade_window_completion_requires_delivered_and_completes_deal(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+
+    _bearer(http_client, s.seller_user_id, tier=2)
+    too_early = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_completed"},
+    )
+    assert too_early.status_code == 409
+    assert too_early.json()["detail"]["code"] == "invalid_trade_window_transition"
+
+    shipped = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_shipped"},
+    )
+    assert shipped.status_code == 200
+
+    _bearer(http_client, s.buyer_user_id, tier=2)
+    delivered = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_delivered"},
+    )
+    assert delivered.status_code == 200
+
+    completed = await http_client.post(
+        f"/api/deals/{s.deal_id}/trade-window/action",
+        json={"action": "mark_completed"},
+    )
+
+    assert completed.status_code == 200
+    body = completed.json()
+    assert body["status"] == deal_trade_window_service.TRADE_WINDOW_STATUS_COMPLETED
+    assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_COMPLETED
+    assert body["completed_at"] is not None
+    assert body["next_required_action"] == "trade_completed"
+
+    deal = await async_db_session.get(Deal, s.deal_id)
+    await async_db_session.refresh(deal)
+    assert deal.status == "completed"
+    assert deal.shipping_status == deal_trade_window_service.SHIPPING_STATUS_COMPLETED
+
+    msg = await deal_message_service.send_message(
+        async_db_session,
+        user_id=s.buyer_user_id,
+        deal_id=s.deal_id,
+        encrypted_content=b"still-open",
+        nonce=b"x" * 12,
+    )
+    assert msg.id
+
+    audit = await async_db_session.scalar(
+        select(AuditLog)
+        .where(AuditLog.action == audit_service.DealActions.TRADE_COMPLETED)
+        .where(AuditLog.params["deal_id"].astext == s.deal_id)
+    )
+    assert audit is not None
+    assert audit.result["deal_status"] == "completed"
 
 
 # ===========================================================================
