@@ -130,12 +130,19 @@ class MatchView(BaseModel):
 class OfferView(BaseModel):
     """Single turn within a negotiation. Mirrors the JSONB turn shape."""
 
+    schema_version: int | None = None
     turn_number: int
     from_agent_id: str
     is_from_me: bool
     type: str  # 'offer' | 'counter_offer' | 'accept' | 'reject'
     price_cents: int
     message: str
+    public_message: str | None = None
+    terms_delta: dict[str, Any] | None = None
+    canonical_terms_snapshot: dict[str, Any] | None = None
+    proposal_hash: str | None = None
+    accepted_proposal_hash: str | None = None
+    policy_check: dict[str, Any] | None = None
     timestamp: str
 
 

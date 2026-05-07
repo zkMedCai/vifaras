@@ -140,6 +140,14 @@ AGENT_TOOLS: list[dict[str, Any]] = [
                 "match_id": {"type": "string"},
                 "price_cents": {"type": "integer", "minimum": 1},
                 "message": {"type": "string", "maxLength": 500},
+                "terms_delta": {
+                    "type": "object",
+                    "description": (
+                        "Structured terms proposed by the agent, e.g. "
+                        "shipping_required, shipping_paid_by, "
+                        "shipping_method_preference."
+                    ),
+                },
             },
             "required": ["match_id", "price_cents"],
         },
@@ -156,6 +164,13 @@ AGENT_TOOLS: list[dict[str, Any]] = [
                 "negotiation_id": {"type": "string"},
                 "price_cents": {"type": "integer", "minimum": 1},
                 "message": {"type": "string", "maxLength": 500},
+                "terms_delta": {
+                    "type": "object",
+                    "description": (
+                        "Structured terms delta to apply to the current "
+                        "canonical proposal."
+                    ),
+                },
             },
             "required": ["negotiation_id", "price_cents"],
         },
@@ -171,6 +186,13 @@ AGENT_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "negotiation_id": {"type": "string"},
+                "proposal_hash": {
+                    "type": "string",
+                    "description": (
+                        "Optional during V0.1. When present, must match "
+                        "the latest canonical proposal hash."
+                    ),
+                },
             },
             "required": ["negotiation_id"],
         },
@@ -473,6 +495,7 @@ class AsyncToolHandler:
             match_id=params["match_id"],
             price_cents=int(params["price_cents"]),
             message=params.get("message") or "",
+            terms_delta=params.get("terms_delta"),
         )
         return {
             "negotiation_id": result.negotiation_id,
@@ -480,6 +503,11 @@ class AsyncToolHandler:
             "max_rounds": result.max_rounds,
             "is_final_round": result.is_final_round,
             "created_new": result.created_new,
+            "proposal_hash": result.last_turn.get("proposal_hash"),
+            "canonical_terms_snapshot": result.last_turn.get(
+                "canonical_terms_snapshot"
+            ),
+            "policy_check": result.last_turn.get("policy_check"),
         }
 
     async def _send_counter_offer(self, params: dict) -> dict:
@@ -500,12 +528,18 @@ class AsyncToolHandler:
             match_id=nego.match_id,
             price_cents=int(params["price_cents"]),
             message=params.get("message") or "",
+            terms_delta=params.get("terms_delta"),
         )
         return {
             "negotiation_id": result.negotiation_id,
             "rounds_used": result.rounds_used,
             "max_rounds": result.max_rounds,
             "is_final_round": result.is_final_round,
+            "proposal_hash": result.last_turn.get("proposal_hash"),
+            "canonical_terms_snapshot": result.last_turn.get(
+                "canonical_terms_snapshot"
+            ),
+            "policy_check": result.last_turn.get("policy_check"),
         }
 
     async def _accept_offer(self, params: dict) -> dict:
@@ -515,11 +549,14 @@ class AsyncToolHandler:
             user_id=user_id,
             agent_id=self.agent_id,
             negotiation_id=params["negotiation_id"],
+            proposal_hash=params.get("proposal_hash"),
         )
         return {
             "deal_id": result.deal_id,
             "agreed_price_cents": result.agreed_price_cents,
             "next_step": result.next_step,
+            "proposal_hash": result.proposal_hash,
+            "canonical_terms_snapshot": result.canonical_terms_snapshot,
         }
 
     async def _reject_offer(self, params: dict) -> dict:

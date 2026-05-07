@@ -179,12 +179,19 @@ async def _query_offers_received(
             if ts <= since:
                 continue
             view = OfferView(
+                schema_version=turn.get("schema_version"),
                 turn_number=turn.get("turn_number") or 0,
                 from_agent_id=turn.get("agent_id") or "",
                 is_from_me=False,
                 type=turn.get("type"),
                 price_cents=int(turn.get("price_cents") or 0),
                 message=turn.get("message") or "",
+                public_message=turn.get("public_message"),
+                terms_delta=turn.get("terms_delta"),
+                canonical_terms_snapshot=turn.get("canonical_terms_snapshot"),
+                proposal_hash=turn.get("proposal_hash"),
+                accepted_proposal_hash=turn.get("accepted_proposal_hash"),
+                policy_check=turn.get("policy_check"),
                 timestamp=turn.get("timestamp") or "",
             )
             if turn["type"] == "offer":

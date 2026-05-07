@@ -444,12 +444,21 @@ async def _build_negotiations_view(
         awaiting_my_response = False
         if last_turn:
             last_offer_view = OfferView(
+                schema_version=last_turn.get("schema_version"),
                 turn_number=last_turn.get("turn_number") or 0,
                 from_agent_id=last_turn.get("agent_id") or "",
                 is_from_me=last_turn.get("agent_id") == agent_id,
                 type=last_turn.get("type") or "",
                 price_cents=int(last_turn.get("price_cents") or 0),
                 message=last_turn.get("message") or "",
+                public_message=last_turn.get("public_message"),
+                terms_delta=last_turn.get("terms_delta"),
+                canonical_terms_snapshot=last_turn.get(
+                    "canonical_terms_snapshot"
+                ),
+                proposal_hash=last_turn.get("proposal_hash"),
+                accepted_proposal_hash=last_turn.get("accepted_proposal_hash"),
+                policy_check=last_turn.get("policy_check"),
                 timestamp=last_turn.get("timestamp") or "",
             )
             awaiting_my_response = (

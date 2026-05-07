@@ -360,9 +360,23 @@ async def test_send_offer_creates_negotiation(async_db_session) -> None:
     )
     result = await handler.handle(
         "send_offer",
-        {"match_id": s.match_id, "price_cents": 120000, "message": "as listed"},
+        {
+            "match_id": s.match_id,
+            "price_cents": 120000,
+            "message": "as listed with tracked shipping",
+            "terms_delta": {
+                "shipping_required": True,
+                "shipping_paid_by": "buyer",
+                "shipping_method_preference": "tracked_parcel",
+            },
+        },
     )
     assert result.status == "ok"
+    assert result.data["proposal_hash"].startswith("sha256:")
+    assert (
+        result.data["canonical_terms_snapshot"]["shipping_method_preference"]
+        == "tracked_parcel"
+    )
     nego_id = result.data["negotiation_id"]
     nego = await async_db_session.get(Negotiation, nego_id)
     assert nego is not None
@@ -393,10 +407,16 @@ async def test_send_counter_offer_resolves_negotiation(async_db_session) -> None
             "negotiation_id": nego.negotiation_id,
             "price_cents": 110000,
             "message": "lower",
+            "terms_delta": {
+                "shipping_required": True,
+                "shipping_paid_by": "buyer",
+                "shipping_method_preference": "tracked_parcel",
+            },
         },
     )
     assert result.status == "ok"
     assert result.data["rounds_used"] == 2
+    assert result.data["proposal_hash"].startswith("sha256:")
 
 
 # ===========================================================================
@@ -418,11 +438,16 @@ async def test_accept_offer_creates_pending_deal(async_db_session) -> None:
         async_db_session, s.buyer_agent_id, verifier=FakeMandateVerifier()
     )
     result = await handler.handle(
-        "accept_offer", {"negotiation_id": nego.negotiation_id}
+        "accept_offer",
+        {
+            "negotiation_id": nego.negotiation_id,
+            "proposal_hash": nego.last_turn["proposal_hash"],
+        },
     )
     assert result.status == "ok"
     assert result.data["deal_id"]
     assert result.data["next_step"] == "sign_deal_with_passkey"
+    assert result.data["proposal_hash"] == nego.last_turn["proposal_hash"]
 
 
 # ===========================================================================

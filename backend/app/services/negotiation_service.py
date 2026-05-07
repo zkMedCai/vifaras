@@ -26,12 +26,17 @@ State machine:
     {
       "turns": [
         {"turn_number": 1, "agent_id": "...", "type": "offer",
-         "price_cents": 120000, "message": "...", "timestamp": "..."},
+         "price_cents": 120000, "message": "...", "timestamp": "...",
+         "schema_version": 2, "public_message": "...",
+         "terms_delta": {...}, "canonical_terms_snapshot": {...},
+         "proposal_hash": "sha256:...", "policy_check": {...}},
         ...
       ],
       "is_final_round": false,
       "final_status": null | "agreed" | "rejected",
-      "agreed_price_cents": null | int
+      "agreed_price_cents": null | int,
+      "accepted_proposal_hash": null | "sha256:...",
+      "accepted_canonical_terms_snapshot": null | object
     }
 
 Concurrency: pessimistic locks (`with_for_update()`) on Match + Negotiation
@@ -49,6 +54,7 @@ V0 caps:
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
@@ -56,6 +62,7 @@ from typing import Any, Final
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import canonicalization
 from app.models.schema import Agent, Intent, Match, Negotiation
 from app.services import audit_service, notification_service
 from app.services.content_moderation import moderate_optional
@@ -69,6 +76,27 @@ from app.services.content_moderation import moderate_optional
 MAX_ROUNDS: Final[int] = 6
 MAX_MESSAGE_LENGTH: Final[int] = 500
 MAX_PRICE_CENTS: Final[int] = 10_000_00  # €10K, mirrors intent cap
+STRUCTURED_TURN_SCHEMA_VERSION: Final[int] = 2
+CANONICAL_TERMS_SCHEMA_VERSION: Final[int] = 1
+
+TERMS_DELTA_KEYS: Final[set[str]] = {
+    "shipping_required",
+    "shipping_paid_by",
+    "shipping_method_preference",
+    "tracking_required",
+    "insurance_required",
+}
+SHIPPING_PAID_BY_VALUES: Final[set[str]] = {"buyer", "seller", "included"}
+SHIPPING_METHOD_POLICIES: Final[dict[str, dict[str, bool]]] = {
+    "pickup": {"tracking_required": False, "insurance_required": False},
+    "untracked_letter": {"tracking_required": False, "insurance_required": False},
+    "registered_letter": {"tracking_required": True, "insurance_required": False},
+    "tracked_parcel": {"tracking_required": True, "insurance_required": False},
+    "insured_tracked_parcel": {
+        "tracking_required": True,
+        "insurance_required": True,
+    },
+}
 
 DEFAULT_LIST_LIMIT: Final[int] = 20
 MAX_LIST_LIMIT: Final[int] = 50
@@ -185,6 +213,16 @@ class IntentAlreadyMatched(NegotiationError):
     http_status = 409
 
 
+class InvalidTermsDelta(NegotiationError):
+    code = "invalid_terms_delta"
+    http_status = 422
+
+
+class ProposalHashMismatch(NegotiationError):
+    code = "proposal_hash_mismatch"
+    http_status = 409
+
+
 # ---------------------------------------------------------------------------
 # Output dataclasses
 # ---------------------------------------------------------------------------
@@ -209,6 +247,8 @@ class AcceptResult:
     next_step: str  # 5.3: 'sign_deal_with_passkey'
     deal_id: str | None = None  # populated post-5.3 hook
     deal_expires_at: datetime | None = None
+    proposal_hash: str | None = None
+    canonical_terms_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -259,6 +299,179 @@ def _truncate_message(message: str | None) -> str:
     if message is None:
         return ""
     return message[:MAX_MESSAGE_LENGTH]
+
+
+def _currency_for_terms(*, buy_intent: Intent, sell_intent: Intent) -> str:
+    return sell_intent.currency or buy_intent.currency or "EUR"
+
+
+def _empty_canonical_terms(*, price_cents: int, currency: str) -> dict[str, Any]:
+    return {
+        "schema_version": CANONICAL_TERMS_SCHEMA_VERSION,
+        "item_price_cents": int(price_cents),
+        "currency": currency,
+        "shipping_required": False,
+        "shipping_paid_by": None,
+        "shipping_method_preference": None,
+        "tracking_required": False,
+        "insurance_required": False,
+    }
+
+
+def _canonical_terms_from_turn(
+    turn: dict[str, Any], *, fallback_currency: str
+) -> dict[str, Any]:
+    snapshot = turn.get("canonical_terms_snapshot")
+    if isinstance(snapshot, dict):
+        return dict(snapshot)
+    return _empty_canonical_terms(
+        price_cents=int(turn.get("price_cents") or 0),
+        currency=fallback_currency,
+    )
+
+
+def _last_proposal_terms(
+    turns: list[dict[str, Any]], *, fallback_currency: str
+) -> dict[str, Any] | None:
+    for turn in reversed(turns):
+        if turn.get("type") in ("offer", "counter_offer"):
+            return _canonical_terms_from_turn(turn, fallback_currency=fallback_currency)
+    return None
+
+
+def _normalize_terms_delta(
+    terms_delta: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    if terms_delta is None:
+        return {}, []
+    if not isinstance(terms_delta, dict):
+        raise InvalidTermsDelta("terms_delta must be an object")
+
+    normalized: dict[str, Any] = {}
+    warnings: list[str] = []
+    unknown_keys = sorted(set(terms_delta) - TERMS_DELTA_KEYS)
+    if unknown_keys:
+        warnings.append(f"ignored_unknown_terms:{','.join(unknown_keys)}")
+
+    if "shipping_required" in terms_delta:
+        value = terms_delta["shipping_required"]
+        if not isinstance(value, bool):
+            raise InvalidTermsDelta("shipping_required must be boolean")
+        normalized["shipping_required"] = value
+
+    if "shipping_paid_by" in terms_delta:
+        value = terms_delta["shipping_paid_by"]
+        if value is None:
+            normalized["shipping_paid_by"] = None
+        elif isinstance(value, str) and value in SHIPPING_PAID_BY_VALUES:
+            normalized["shipping_paid_by"] = value
+        else:
+            raise InvalidTermsDelta(
+                "shipping_paid_by must be buyer, seller, included, or null"
+            )
+
+    if "shipping_method_preference" in terms_delta:
+        value = terms_delta["shipping_method_preference"]
+        if value is None:
+            normalized["shipping_method_preference"] = None
+        elif isinstance(value, str) and value in SHIPPING_METHOD_POLICIES:
+            normalized["shipping_method_preference"] = value
+        else:
+            raise InvalidTermsDelta(
+                "shipping_method_preference is not a supported V0 method"
+            )
+
+    for key in ("tracking_required", "insurance_required"):
+        if key not in terms_delta:
+            continue
+        value = terms_delta[key]
+        if not isinstance(value, bool):
+            raise InvalidTermsDelta(f"{key} must be boolean")
+        normalized[key] = value
+
+    if (
+        normalized.get("shipping_method_preference") is not None
+        and "shipping_required" not in normalized
+    ):
+        normalized["shipping_required"] = True
+        warnings.append("shipping_required_inferred_from_method")
+
+    if (
+        normalized.get("shipping_paid_by") is not None
+        and "shipping_required" not in normalized
+    ):
+        normalized["shipping_required"] = True
+        warnings.append("shipping_required_inferred_from_paid_by")
+
+    return normalized, warnings
+
+
+def _build_policy_check(
+    *,
+    terms: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any]:
+    out = list(warnings)
+    price = int(terms["item_price_cents"])
+    if price >= 2_500 and terms["shipping_required"] and not terms["tracking_required"]:
+        out.append("tracking_recommended_over_25_eur")
+    if price >= 50_000 and terms["shipping_required"] and not terms["insurance_required"]:
+        out.append("insurance_recommended_over_500_eur")
+    return {"allowed": True, "warnings": out}
+
+
+def _apply_terms_delta(
+    *,
+    previous_terms: dict[str, Any] | None,
+    price_cents: int,
+    currency: str,
+    terms_delta: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    normalized_delta, warnings = _normalize_terms_delta(terms_delta)
+    terms = (
+        dict(previous_terms)
+        if previous_terms is not None
+        else _empty_canonical_terms(price_cents=price_cents, currency=currency)
+    )
+    terms["schema_version"] = CANONICAL_TERMS_SCHEMA_VERSION
+    terms["item_price_cents"] = int(price_cents)
+    terms["currency"] = currency
+
+    for key, value in normalized_delta.items():
+        terms[key] = value
+
+    method = terms.get("shipping_method_preference")
+    if method is not None:
+        method_policy = SHIPPING_METHOD_POLICIES[str(method)]
+        terms["tracking_required"] = method_policy["tracking_required"]
+        if method_policy["insurance_required"]:
+            terms["insurance_required"] = True
+
+    if not terms.get("shipping_required"):
+        terms["shipping_paid_by"] = None
+        terms["shipping_method_preference"] = None
+        terms["tracking_required"] = False
+        terms["insurance_required"] = False
+
+    policy_check = _build_policy_check(terms=terms, warnings=warnings)
+    return normalized_delta, terms, policy_check
+
+
+def _proposal_hash(
+    *,
+    negotiation_id: str,
+    match_id: str,
+    terms: dict[str, Any],
+) -> str:
+    payload = {
+        "schema_version": CANONICAL_TERMS_SCHEMA_VERSION,
+        "kind": "negotiation_proposal",
+        "negotiation_id": negotiation_id,
+        "match_id": match_id,
+        "canonical_terms": terms,
+    }
+    canonical = canonicalization.canonicalize(payload)
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
 async def _load_match_locked(
@@ -356,6 +569,7 @@ async def start_or_continue(
     match_id: str,
     price_cents: int,
     message: str | None = None,
+    terms_delta: dict[str, Any] | None = None,
 ) -> TurnResult:
     """First offer or subsequent counter-offer on `match_id`. Tier ≥ 1."""
     _validate_price(price_cents)
@@ -415,15 +629,37 @@ async def start_or_continue(
             f"max_rounds={nego.max_rounds} reached; only accept/reject allowed"
         )
 
-    # 5. Build + append turn.
-    turn_type = "offer" if not (nego.state or {}).get("turns") else "counter_offer"
+    # 5. Build + append turn. Natural text stays UX/audit context; only
+    # the canonical terms snapshot is binding for proposal hash/accept.
+    turns = list((nego.state or {}).get("turns") or [])
+    turn_type = "offer" if not turns else "counter_offer"
+    currency = _currency_for_terms(buy_intent=buy_intent, sell_intent=sell_intent)
+    previous_terms = _last_proposal_terms(turns, fallback_currency=currency)
+    normalized_delta, canonical_terms, policy_check = _apply_terms_delta(
+        previous_terms=previous_terms,
+        price_cents=price_cents,
+        currency=currency,
+        terms_delta=terms_delta,
+    )
     nego.rounds_used = (nego.rounds_used or 0) + 1
+    public_message = _truncate_message(message)
+    proposal_hash = _proposal_hash(
+        negotiation_id=nego.id,
+        match_id=match_id,
+        terms=canonical_terms,
+    )
     new_turn = {
+        "schema_version": STRUCTURED_TURN_SCHEMA_VERSION,
         "turn_number": nego.rounds_used,
         "agent_id": agent_id,
         "type": turn_type,
         "price_cents": price_cents,
-        "message": _truncate_message(message),
+        "message": public_message,
+        "public_message": public_message,
+        "terms_delta": normalized_delta,
+        "canonical_terms_snapshot": canonical_terms,
+        "proposal_hash": proposal_hash,
+        "policy_check": policy_check,
         "timestamp": _utc_iso_z(),
     }
     _append_turn(nego, new_turn)
@@ -450,8 +686,14 @@ async def start_or_continue(
             "agent_id": agent_id,
             "turn_number": nego.rounds_used,
             "price_cents": price_cents,
+            "proposal_hash": proposal_hash,
         },
-        result={"created_new": created_new, "turn_type": turn_type},
+        result={
+            "created_new": created_new,
+            "turn_type": turn_type,
+            "proposal_hash": proposal_hash,
+            "policy_check": policy_check,
+        },
         success=True,
         agent_id=agent_id,
     )
@@ -484,6 +726,7 @@ async def start_or_continue(
             "match_id": match_id,
             "turn_number": nego.rounds_used,
             "price_cents": price_cents,
+            "proposal_hash": proposal_hash,
             "is_final_round": bool((nego.state or {}).get("is_final_round")),
         },
     )
@@ -510,6 +753,7 @@ async def accept_offer(
     user_id: str,
     agent_id: str,
     negotiation_id: str,
+    proposal_hash: str | None = None,
 ) -> AcceptResult:
     """Accept the counterparty's last turn. Tier ≥ 2 (deal hand-off in 5.3).
 
@@ -541,10 +785,18 @@ async def accept_offer(
         raise CannotActOnOwnOffer(
             "cannot accept your own last offer; counterparty must do it"
         )
+    last_proposal_hash = last_turn.get("proposal_hash")
+    if proposal_hash is not None and proposal_hash != last_proposal_hash:
+        raise ProposalHashMismatch(
+            "proposal_hash does not match the latest proposal"
+        )
 
     # 3. Verify match still acceptable + caller is party.
     match = await _load_match_locked(db, nego.match_id)
-    await _verify_user_party_to_match(db, user_id=user_id, match=match)
+    buy_intent, sell_intent = await _verify_user_party_to_match(
+        db, user_id=user_id, match=match
+    )
+    currency = _currency_for_terms(buy_intent=buy_intent, sell_intent=sell_intent)
 
     # 4. Mini-auction lock: lock both intents in sorted-ID order. If a
     #    competing accept already promoted either intent to `matched`,
@@ -565,20 +817,33 @@ async def accept_offer(
                 f"not 'active' — another negotiation got there first"
             )
 
-    agreed_price = int(last_turn["price_cents"])
+    accepted_terms = _canonical_terms_from_turn(
+        last_turn, fallback_currency=currency
+    )
+    agreed_price = int(accepted_terms["item_price_cents"])
 
     # 5. Append accept turn + transition negotiation/match.
     accept_turn = {
+        "schema_version": STRUCTURED_TURN_SCHEMA_VERSION,
         "turn_number": (nego.rounds_used or 0) + 1,
         "agent_id": agent_id,
         "type": "accept",
         "price_cents": agreed_price,
         "message": "",
+        "public_message": "",
+        "terms_delta": {},
+        "canonical_terms_snapshot": accepted_terms,
+        "accepted_proposal_hash": last_proposal_hash,
+        "policy_check": {"allowed": True, "warnings": []},
         "timestamp": _utc_iso_z(),
     }
     _append_turn(nego, accept_turn)
     _set_state_keys(
-        nego, final_status="agreed", agreed_price_cents=agreed_price
+        nego,
+        final_status="agreed",
+        agreed_price_cents=agreed_price,
+        accepted_proposal_hash=last_proposal_hash,
+        accepted_canonical_terms_snapshot=accepted_terms,
     )
     nego.status = "agreed"
     nego.closed_at = _utcnow()
@@ -637,12 +902,14 @@ async def accept_offer(
             "match_id": nego.match_id,
             "agent_id": agent_id,
             "agreed_price_cents": agreed_price,
+            "proposal_hash": last_proposal_hash,
         },
         result={
             "status": "agreed",
             "competing_negotiations_cancelled": cancelled_count,
             "competing_matches_expired": expired_count,
             "deal_id": deal.id,
+            "canonical_terms_snapshot": accepted_terms,
         },
         success=True,
         agent_id=agent_id,
@@ -663,6 +930,7 @@ async def accept_offer(
                 "deal_id": deal.id,
                 "negotiation_id": nego.id,
                 "agreed_price_cents": agreed_price,
+                "proposal_hash": last_proposal_hash,
             },
         )
 
@@ -673,6 +941,8 @@ async def accept_offer(
         next_step="sign_deal_with_passkey",
         deal_id=deal.id,
         deal_expires_at=deal.expires_at,
+        proposal_hash=last_proposal_hash,
+        canonical_terms_snapshot=accepted_terms,
     )
 
 

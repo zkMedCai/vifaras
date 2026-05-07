@@ -1,6 +1,6 @@
 """Negotiation service + API tests (brief task 5.1).
 
-28 tests organized by concern:
+34 tests organized by concern:
 
   Start / continue (8):
    1. start creates new negotiation with first offer; match → negotiating
@@ -12,12 +12,17 @@
    7. is_final_round flag set at max-1
    8. max_rounds exceeded raises
 
-  Accept (5):
+  Accept / structured proposals (11):
    9. accept marks negotiation + match agreed
   10. accept requires tier 2 (tier 1 → 402)
   11. accept rejects own offer (must come from counterparty)
   12. accept with no offers yet raises
   13. accept response carries agreed_price + next_step
+  13b. structured terms create canonical proposal snapshot + hash
+  13c. counter offer carries forward canonical shipping terms
+  13d. accept can pin latest proposal hash
+  13e. accept rejects mismatched proposal hash
+  13f. invalid terms delta is rejected
 
   Reject (3):
   14. reject marks negotiation + match rejected
@@ -613,6 +618,190 @@ async def test_accept_response_carries_next_step(async_db_session) -> None:
 
 
 # ===========================================================================
+# 13b. structured terms create canonical proposal snapshot + hash
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_structured_terms_create_canonical_proposal_hash(
+    async_db_session,
+) -> None:
+    s = await _seed_setup(async_db_session)
+
+    result = await negotiation_service.start_or_continue(
+        async_db_session,
+        user_id=s.seller_user_id,
+        agent_id=s.seller_agent_id,
+        match_id=s.match_id,
+        price_cents=120000,
+        message="Posso includere spedizione tracciata pagata dal buyer.",
+        terms_delta={
+            "shipping_required": True,
+            "shipping_paid_by": "buyer",
+            "shipping_method_preference": "tracked_parcel",
+        },
+    )
+
+    turn = result.last_turn
+    assert turn["schema_version"] == 2
+    assert turn["public_message"] == "Posso includere spedizione tracciata pagata dal buyer."
+    assert turn["message"] == turn["public_message"]
+    assert turn["terms_delta"] == {
+        "shipping_required": True,
+        "shipping_paid_by": "buyer",
+        "shipping_method_preference": "tracked_parcel",
+    }
+    assert turn["canonical_terms_snapshot"] == {
+        "schema_version": 1,
+        "item_price_cents": 120000,
+        "currency": "EUR",
+        "shipping_required": True,
+        "shipping_paid_by": "buyer",
+        "shipping_method_preference": "tracked_parcel",
+        "tracking_required": True,
+        "insurance_required": False,
+    }
+    assert turn["proposal_hash"].startswith("sha256:")
+    assert len(turn["proposal_hash"]) == len("sha256:") + 64
+    assert turn["policy_check"]["allowed"] is True
+
+
+# ===========================================================================
+# 13c. counter offer carries forward previous canonical shipping terms
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_counter_offer_carries_forward_canonical_terms(
+    async_db_session,
+) -> None:
+    s = await _seed_setup(async_db_session)
+
+    await negotiation_service.start_or_continue(
+        async_db_session,
+        user_id=s.seller_user_id,
+        agent_id=s.seller_agent_id,
+        match_id=s.match_id,
+        price_cents=120000,
+        terms_delta={
+            "shipping_required": True,
+            "shipping_paid_by": "buyer",
+            "shipping_method_preference": "tracked_parcel",
+        },
+    )
+
+    counter = await negotiation_service.start_or_continue(
+        async_db_session,
+        user_id=s.buyer_user_id,
+        agent_id=s.buyer_agent_id,
+        match_id=s.match_id,
+        price_cents=110000,
+        message="Accetto tracciata, ma a 1100.",
+    )
+
+    terms = counter.last_turn["canonical_terms_snapshot"]
+    assert terms["item_price_cents"] == 110000
+    assert terms["shipping_required"] is True
+    assert terms["shipping_paid_by"] == "buyer"
+    assert terms["shipping_method_preference"] == "tracked_parcel"
+    assert terms["tracking_required"] is True
+
+
+# ===========================================================================
+# 13d. accept can pin latest proposal hash
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_accept_with_matching_proposal_hash_pins_terms(
+    async_db_session,
+) -> None:
+    s = await _seed_setup(async_db_session, buyer_tier=2)
+    result = await negotiation_service.start_or_continue(
+        async_db_session,
+        user_id=s.seller_user_id,
+        agent_id=s.seller_agent_id,
+        match_id=s.match_id,
+        price_cents=120000,
+        terms_delta={
+            "shipping_required": True,
+            "shipping_paid_by": "buyer",
+            "shipping_method_preference": "tracked_parcel",
+        },
+    )
+    proposal_hash = result.last_turn["proposal_hash"]
+
+    accept = await negotiation_service.accept_offer(
+        async_db_session,
+        user_id=s.buyer_user_id,
+        agent_id=s.buyer_agent_id,
+        negotiation_id=result.negotiation_id,
+        proposal_hash=proposal_hash,
+    )
+
+    assert accept.proposal_hash == proposal_hash
+    assert accept.canonical_terms_snapshot["item_price_cents"] == 120000
+    assert accept.canonical_terms_snapshot["shipping_method_preference"] == "tracked_parcel"
+
+    nego = await async_db_session.get(Negotiation, result.negotiation_id)
+    await async_db_session.refresh(nego)
+    assert nego.state["accepted_proposal_hash"] == proposal_hash
+    assert (
+        nego.state["accepted_canonical_terms_snapshot"]["shipping_paid_by"]
+        == "buyer"
+    )
+    assert nego.state["turns"][-1]["accepted_proposal_hash"] == proposal_hash
+
+
+# ===========================================================================
+# 13e. accept rejects mismatched proposal hash
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_accept_rejects_mismatched_proposal_hash(
+    async_db_session,
+) -> None:
+    s = await _seed_setup(async_db_session, buyer_tier=2)
+    result = await negotiation_service.start_or_continue(
+        async_db_session,
+        user_id=s.seller_user_id,
+        agent_id=s.seller_agent_id,
+        match_id=s.match_id,
+        price_cents=120000,
+    )
+
+    with pytest.raises(negotiation_service.ProposalHashMismatch):
+        await negotiation_service.accept_offer(
+            async_db_session,
+            user_id=s.buyer_user_id,
+            agent_id=s.buyer_agent_id,
+            negotiation_id=result.negotiation_id,
+            proposal_hash="sha256:" + "0" * 64,
+        )
+
+
+# ===========================================================================
+# 13f. invalid terms delta is rejected
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_invalid_terms_delta_is_rejected(async_db_session) -> None:
+    s = await _seed_setup(async_db_session)
+
+    with pytest.raises(negotiation_service.InvalidTermsDelta):
+        await negotiation_service.start_or_continue(
+            async_db_session,
+            user_id=s.seller_user_id,
+            agent_id=s.seller_agent_id,
+            match_id=s.match_id,
+            price_cents=120000,
+            terms_delta={"shipping_method_preference": "drone"},
+        )
+
+
+# ===========================================================================
 # 14. reject marks negotiation + match rejected
 # ===========================================================================
 
@@ -926,6 +1115,11 @@ async def test_post_negotiations_happy_path(http_client, async_db_session) -> No
             "agent_id": s.seller_agent_id,
             "price_cents": 120000,
             "message": "first",
+            "terms_delta": {
+                "shipping_required": True,
+                "shipping_paid_by": "buyer",
+                "shipping_method_preference": "tracked_parcel",
+            },
         },
     )
     assert r.status_code == 200, r.text
@@ -933,6 +1127,12 @@ async def test_post_negotiations_happy_path(http_client, async_db_session) -> No
     assert body["created_new"] is True
     assert body["rounds_used"] == 1
     assert body["last_turn"]["price_cents"] == 120000
+    assert body["last_turn"]["schema_version"] == 2
+    assert body["last_turn"]["proposal_hash"].startswith("sha256:")
+    assert (
+        body["last_turn"]["canonical_terms_snapshot"]["shipping_method_preference"]
+        == "tracked_parcel"
+    )
 
 
 # ===========================================================================
@@ -1007,3 +1207,4 @@ async def test_get_negotiation_via_api(http_client, async_db_session) -> None:
     assert body["status"] == "active"
     assert len(body["turns"]) == 1
     assert body["turns"][0]["message"] == "hello"
+    assert body["turns"][0]["proposal_hash"].startswith("sha256:")

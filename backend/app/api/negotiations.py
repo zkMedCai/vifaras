@@ -43,10 +43,12 @@ class StartOrContinueRequest(BaseModel):
     agent_id: str
     price_cents: int = Field(gt=0)
     message: str | None = None
+    terms_delta: dict[str, Any] | None = None
 
 
 class AcceptRequest(BaseModel):
     agent_id: str
+    proposal_hash: str | None = None
 
 
 class RejectRequest(BaseModel):
@@ -55,11 +57,18 @@ class RejectRequest(BaseModel):
 
 
 class TurnPayload(BaseModel):
+    schema_version: int | None = None
     turn_number: int
     agent_id: str
     type: str
     price_cents: int
     message: str
+    public_message: str | None = None
+    terms_delta: dict[str, Any] | None = None
+    canonical_terms_snapshot: dict[str, Any] | None = None
+    proposal_hash: str | None = None
+    accepted_proposal_hash: str | None = None
+    policy_check: dict[str, Any] | None = None
     timestamp: str
 
 
@@ -78,6 +87,8 @@ class AcceptResponse(BaseModel):
     match_id: str
     agreed_price_cents: int
     next_step: str
+    proposal_hash: str | None = None
+    canonical_terms_snapshot: dict[str, Any] | None = None
 
 
 class RejectResponse(BaseModel):
@@ -95,6 +106,8 @@ class NegotiationStateResponse(BaseModel):
     is_final_round: bool
     final_status: str | None
     agreed_price_cents: int | None
+    accepted_proposal_hash: str | None = None
+    accepted_canonical_terms_snapshot: dict[str, Any] | None = None
     turns: list[TurnPayload]
     started_at: datetime
     closed_at: datetime | None
@@ -141,6 +154,10 @@ def _state_to_response(nego) -> NegotiationStateResponse:
         is_final_round=bool(state.get("is_final_round")),
         final_status=state.get("final_status"),
         agreed_price_cents=state.get("agreed_price_cents"),
+        accepted_proposal_hash=state.get("accepted_proposal_hash"),
+        accepted_canonical_terms_snapshot=state.get(
+            "accepted_canonical_terms_snapshot"
+        ),
         turns=turns,
         started_at=nego.started_at,
         closed_at=nego.closed_at,
@@ -180,6 +197,7 @@ async def start_or_continue_endpoint(
             match_id=body.match_id,
             price_cents=body.price_cents,
             message=body.message,
+            terms_delta=body.terms_delta,
         )
     except negotiation_service.NegotiationError as exc:
         raise _to_http(exc) from exc
@@ -209,6 +227,7 @@ async def accept_endpoint(
             user_id=user.user_id,
             agent_id=body.agent_id,
             negotiation_id=negotiation_id,
+            proposal_hash=body.proposal_hash,
         )
     except negotiation_service.NegotiationError as exc:
         raise _to_http(exc) from exc
@@ -217,6 +236,8 @@ async def accept_endpoint(
         match_id=result.match_id,
         agreed_price_cents=result.agreed_price_cents,
         next_step=result.next_step,
+        proposal_hash=result.proposal_hash,
+        canonical_terms_snapshot=result.canonical_terms_snapshot,
     )
 
 

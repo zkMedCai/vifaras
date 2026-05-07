@@ -3130,6 +3130,7 @@ Risultati:
 python3 -m compileall -q backend/app/api/deals.py backend/app/services/audit_service.py backend/app/services/deal_message_service.py backend/app/services/deal_trade_window_service.py backend/app/models/schema.py backend/tests/test_deal.py
 uv run pytest backend/tests/test_deal.py::test_pending_deal_trade_window_is_locked backend/tests/test_deal.py::test_confirmed_deal_trade_window_is_available backend/tests/test_deal.py::test_non_party_cannot_open_trade_window backend/tests/test_deal.py::test_seller_can_mark_trade_window_shipped backend/tests/test_deal.py::test_buyer_cannot_mark_trade_window_shipped backend/tests/test_deal.py::test_buyer_can_mark_trade_window_delivered backend/tests/test_deal.py::test_trade_window_completion_requires_delivered_and_completes_deal
 uv run pytest backend/tests/test_deal.py
+uv run pytest backend/tests/test_agent_state.py backend/tests/test_orchestrator.py
 git diff --check
 ```
 
@@ -3195,3 +3196,62 @@ Risultati:
 
 - Compileall verde.
 - `backend/tests/test_deal.py`: 54 passed.
+
+---
+
+## FASE 10.1.4.6 — Structured Natural Negotiation Turns — 2026-05-07
+
+### Backend
+
+- `Negotiation.state["turns"]` ora supporta `schema_version=2` mantenendo
+  retrocompatibilita con `price_cents` e `message`.
+- `send_offer` / `send_counter_offer` accettano `terms_delta` strutturato.
+- Ogni proposta genera lato server:
+  - `public_message`
+  - `terms_delta` normalizzato
+  - `canonical_terms_snapshot`
+  - `proposal_hash`
+  - `policy_check`
+- Campi V0 nei termini canonici:
+  - `item_price_cents`
+  - `currency`
+  - `shipping_required`
+  - `shipping_paid_by`
+  - `shipping_method_preference`
+  - `tracking_required`
+  - `insurance_required`
+- `accept_offer` accetta `proposal_hash` opzionale e, se presente, lo valida
+  contro l'ultima proposta canonica.
+- In caso di accept vengono salvati:
+  - `accepted_proposal_hash`
+  - `accepted_canonical_terms_snapshot`
+- Tool layer aggiornato per passare `terms_delta` e `proposal_hash`.
+- API negotiations aggiornata per esporre i nuovi campi nei turni e nella
+  risposta accept.
+- Agent state / inbox espongono i nuovi campi dei turni agli agenti.
+
+### Test
+
+- Proposta strutturata crea snapshot canonico e hash.
+- Controfferta eredita i termini canonici precedenti e cambia il prezzo.
+- Accept con `proposal_hash` corretto pinna i termini accettati.
+- Accept con `proposal_hash` errato fallisce con `proposal_hash_mismatch`.
+- `terms_delta` invalido fallisce con `invalid_terms_delta`.
+- API e tool layer passano e ritornano i nuovi campi.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app
+uv run pytest backend/tests/test_negotiation.py backend/tests/test_tool_layer.py
+uv run pytest backend/tests/test_deal.py
+git diff --check
+```
+
+Risultati:
+
+- Compileall verde.
+- `backend/tests/test_negotiation.py backend/tests/test_tool_layer.py`: 59 passed.
+- Regression con `backend/tests/test_deal.py`: 113 passed complessivi sui tre
+  file mirati.
+- Agent state/orchestrator regression: 49 passed.
