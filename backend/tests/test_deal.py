@@ -74,6 +74,7 @@ from app.core.security import create_access_token
 from app.models.schema import (
     AuditLog,
     Deal,
+    DealShippingSelection,
     DealSignatureDraft,
     Intent,
     Match,
@@ -148,6 +149,8 @@ async def _seed_intent(
     user_id: str,
     side: str,
     seed_text: str = "macbook",
+    category: str = "electronics_laptops",
+    hard_constraints: dict[str, Any] | None = None,
     reservation_eur: float = 1000,
     ideal_eur: float = 1100,
 ) -> str:
@@ -160,12 +163,12 @@ async def _seed_intent(
         side=side,
         title=f"intent-{intent_id[:6]}",
         description=seed_text,
-        category="electronics_laptops",
+        category=category,
         description_embedding=embedding_service._fake_embedding(seed_text),
         reservation_price_cents=int(reservation_eur * 100),
         ideal_price_cents=int(ideal_eur * 100),
         currency="EUR",
-        hard_constraints={},
+        hard_constraints=hard_constraints or {},
         soft_preferences={},
         status="active",
         expires_at=now + timedelta(days=14),
@@ -192,7 +195,13 @@ async def _seed_match(db, *, buy_intent_id: str, sell_intent_id: str) -> str:
     return m.id
 
 
-async def _seed_pending_deal(db) -> DealSetup:
+async def _seed_pending_deal(
+    db,
+    *,
+    seller_offer_cents: int = 120000,
+    category: str = "electronics_laptops",
+    hard_constraints: dict[str, Any] | None = None,
+) -> DealSetup:
     """Run accept_offer to produce a pending Deal. Returns full setup."""
     seller_id, seller_agent, _ = await setup_active_mandate_async(
         db, email=f"sell-{uuid.uuid4().hex[:6]}@x.com"
@@ -204,6 +213,8 @@ async def _seed_pending_deal(db) -> DealSetup:
         db,
         user_id=seller_id,
         side="sell",
+        category=category,
+        hard_constraints=hard_constraints,
         reservation_eur=1000,
         ideal_eur=1200,
     )
@@ -211,6 +222,8 @@ async def _seed_pending_deal(db) -> DealSetup:
         db,
         user_id=buyer_id,
         side="buy",
+        category=category,
+        hard_constraints=hard_constraints,
         reservation_eur=1500,
         ideal_eur=1100,
     )
@@ -223,7 +236,7 @@ async def _seed_pending_deal(db) -> DealSetup:
         user_id=seller_id,
         agent_id=seller_agent,
         match_id=match_id,
-        price_cents=120000,
+        price_cents=seller_offer_cents,
     )
     accept = await negotiation_service.accept_offer(
         db,
@@ -259,6 +272,23 @@ async def _confirm_deal(db, setup: DealSetup) -> None:
             draft_id=draft.draft_id,
             assertion=WebAuthnAssertionPayload(**_fake_assertion()),
         )
+
+
+async def _select_shipping_method(
+    client,
+    *,
+    deal_id: str,
+    user_id: str,
+    method_code: str = "insured_tracked_parcel",
+    paid_by: str = "buyer",
+) -> dict[str, Any]:
+    _bearer(client, user_id, tier=2)
+    response = await client.post(
+        f"/api/deals/{deal_id}/shipping-method",
+        json={"method_code": method_code, "paid_by": paid_by},
+    )
+    assert response.status_code == 200
+    return response.json()
 
 
 def _bearer(client, user_id: str, tier: int) -> None:
@@ -1100,7 +1130,9 @@ async def test_confirmed_deal_trade_window_is_available(
     assert body["deal_id"] == s.deal_id
     assert body["status"] == deal_trade_window_service.TRADE_WINDOW_STATUS_OPEN
     assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_PENDING
-    assert body["next_required_action"] == "seller_prepare_shipping"
+    assert body["next_required_action"] == "select_shipping_method"
+    assert body["shipping_required_action"] == "select_shipping_method"
+    assert body["selected_shipping_method"] is None
     assert body["tracking_reference"] is None
     assert body["shipped_at"] is None
     assert body["delivered_at"] is None
@@ -1134,6 +1166,292 @@ async def test_non_party_cannot_open_trade_window(
 
 
 # ===========================================================================
+# 29d-1. shipping options are locked before confirmation
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_pending_deal_cannot_get_shipping_options(
+    async_db_session, http_client
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/shipping-options")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "deal_not_confirmed"
+
+
+# ===========================================================================
+# 29d-2. confirmed party can read shipping options
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_confirmed_deal_party_can_get_shipping_options(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/shipping-options")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deal_id"] == s.deal_id
+    assert body["agreed_price_cents"] == 120000
+    assert body["currency"] == "EUR"
+    assert body["selected_method"] is None
+    assert {option["code"] for option in body["options"]} >= {
+        "pickup",
+        "untracked_letter",
+        "registered_letter",
+        "tracked_parcel",
+        "insured_tracked_parcel",
+    }
+
+
+# ===========================================================================
+# 29d-3. non-party cannot read shipping options
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_non_party_cannot_get_shipping_options(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    outsider, _, _ = await setup_active_mandate_async(
+        async_db_session, email=f"ship-out-{uuid.uuid4().hex[:6]}@x.com"
+    )
+    _bearer(http_client, outsider, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/shipping-options")
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "not_party_to_deal"
+
+
+# ===========================================================================
+# 29d-4. low-value small category allows untracked letter
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_low_value_small_category_includes_untracked_letter(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(
+        async_db_session,
+        seller_offer_cents=2000,
+        category="pokemon_cards",
+    )
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/shipping-options")
+
+    assert response.status_code == 200
+    options = {option["code"]: option for option in response.json()["options"]}
+    assert options["untracked_letter"]["allowed"] is True
+    assert options["untracked_letter"]["recommended"] is True
+
+
+# ===========================================================================
+# 29d-5. value >= 25 EUR disables untracked letter
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_over_25_eur_disables_untracked_letter(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(
+        async_db_session,
+        seller_offer_cents=2500,
+        category="pokemon_cards",
+    )
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/shipping-options")
+
+    assert response.status_code == 200
+    options = {option["code"]: option for option in response.json()["options"]}
+    assert options["untracked_letter"]["allowed"] is False
+    assert options["untracked_letter"]["disabled_reason"] == "tracking_required_over_25_eur"
+
+
+# ===========================================================================
+# 29d-6. electronics recommends tracked parcel
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_electronics_defaults_to_tracked_parcel_recommended(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(
+        async_db_session,
+        seller_offer_cents=12000,
+        category="electronics_gaming",
+    )
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.seller_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/shipping-options")
+
+    assert response.status_code == 200
+    options = {option["code"]: option for option in response.json()["options"]}
+    assert options["tracked_parcel"]["recommended"] is True
+    assert options["tracked_parcel"]["allowed"] is True
+    assert options["tracked_parcel"]["insurance_available"] is True
+    assert options["untracked_letter"]["allowed"] is False
+
+
+# ===========================================================================
+# 29d-7. party can select an allowed shipping method
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_can_select_allowed_shipping_method(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.post(
+        f"/api/deals/{s.deal_id}/shipping-method",
+        json={"method_code": "insured_tracked_parcel", "paid_by": "buyer"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_method"]["method_code"] == "insured_tracked_parcel"
+    assert body["selected_method"]["paid_by"] == "buyer"
+
+    selected = await async_db_session.scalar(
+        select(DealShippingSelection).where(
+            DealShippingSelection.deal_id == s.deal_id
+        )
+    )
+    assert selected is not None
+    assert selected.method_code == "insured_tracked_parcel"
+
+
+# ===========================================================================
+# 29d-8. selecting a disabled method fails
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_selecting_disabled_shipping_method_fails(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(
+        async_db_session,
+        seller_offer_cents=2500,
+        category="pokemon_cards",
+    )
+    await _confirm_deal(async_db_session, s)
+    _bearer(http_client, s.buyer_user_id, tier=2)
+
+    response = await http_client.post(
+        f"/api/deals/{s.deal_id}/shipping-method",
+        json={"method_code": "untracked_letter", "paid_by": "buyer"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "shipping_method_not_allowed"
+
+
+# ===========================================================================
+# 29d-9. selected method appears in trade-window
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_selected_shipping_method_appears_in_trade_window(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.buyer_user_id
+    )
+    _bearer(http_client, s.seller_user_id, tier=2)
+
+    response = await http_client.get(f"/api/deals/{s.deal_id}/trade-window")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_shipping_method"]["method_code"] == "insured_tracked_parcel"
+    assert body["next_required_action"] == "prepare_shipment"
+    assert body["shipping_required_action"] == "prepare_shipment"
+
+
+# ===========================================================================
+# 29d-10. repeated same selection is idempotent
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_repeated_same_shipping_selection_is_idempotent(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+
+    first = await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.buyer_user_id
+    )
+    second = await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.buyer_user_id
+    )
+
+    assert first["selected_method"]["method_code"] == "insured_tracked_parcel"
+    assert second["selected_method"]["method_code"] == "insured_tracked_parcel"
+    selections = (
+        await async_db_session.scalars(
+            select(DealShippingSelection).where(
+                DealShippingSelection.deal_id == s.deal_id
+            )
+        )
+    ).all()
+    assert len(selections) == 1
+
+
+# ===========================================================================
+# 29d-11. non-party cannot select shipping method
+# ===========================================================================
+
+
+@pytest.mark.db
+async def test_non_party_cannot_select_shipping_method(
+    async_db_session, http_client, webauthn_ok
+) -> None:
+    s = await _seed_pending_deal(async_db_session)
+    await _confirm_deal(async_db_session, s)
+    outsider, _, _ = await setup_active_mandate_async(
+        async_db_session, email=f"ship-select-out-{uuid.uuid4().hex[:6]}@x.com"
+    )
+    _bearer(http_client, outsider, tier=2)
+
+    response = await http_client.post(
+        f"/api/deals/{s.deal_id}/shipping-method",
+        json={"method_code": "tracked_parcel", "paid_by": "buyer"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "not_party_to_deal"
+
+
+# ===========================================================================
 # 29e. seller can mark shipped with tracking placeholder
 # ===========================================================================
 
@@ -1144,6 +1462,9 @@ async def test_seller_can_mark_trade_window_shipped(
 ) -> None:
     s = await _seed_pending_deal(async_db_session)
     await _confirm_deal(async_db_session, s)
+    await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.seller_user_id
+    )
     _bearer(http_client, s.seller_user_id, tier=2)
 
     response = await http_client.post(
@@ -1154,6 +1475,7 @@ async def test_seller_can_mark_trade_window_shipped(
     assert response.status_code == 200
     body = response.json()
     assert body["shipping_status"] == deal_trade_window_service.SHIPPING_STATUS_SHIPPED
+    assert body["selected_shipping_method"]["method_code"] == "insured_tracked_parcel"
     assert body["tracking_reference"] == "GLS-123456"
     assert body["shipped_at"] is not None
     assert body["next_required_action"] == "wait_for_buyer_delivery"
@@ -1184,6 +1506,9 @@ async def test_buyer_cannot_mark_trade_window_shipped(
 ) -> None:
     s = await _seed_pending_deal(async_db_session)
     await _confirm_deal(async_db_session, s)
+    await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.seller_user_id
+    )
     _bearer(http_client, s.buyer_user_id, tier=2)
 
     response = await http_client.post(
@@ -1206,6 +1531,9 @@ async def test_buyer_can_mark_trade_window_delivered(
 ) -> None:
     s = await _seed_pending_deal(async_db_session)
     await _confirm_deal(async_db_session, s)
+    await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.seller_user_id
+    )
 
     _bearer(http_client, s.seller_user_id, tier=2)
     shipped = await http_client.post(
@@ -1254,6 +1582,11 @@ async def test_trade_window_completion_requires_delivered_and_completes_deal(
     )
     assert too_early.status_code == 409
     assert too_early.json()["detail"]["code"] == "invalid_trade_window_transition"
+
+    await _select_shipping_method(
+        http_client, deal_id=s.deal_id, user_id=s.seller_user_id
+    )
+    _bearer(http_client, s.seller_user_id, tier=2)
 
     shipped = await http_client.post(
         f"/api/deals/{s.deal_id}/trade-window/action",

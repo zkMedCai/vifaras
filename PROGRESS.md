@@ -3139,3 +3139,59 @@ Risultati:
 - 7 test Trade Window mirati verdi.
 - `backend/tests/test_deal.py`: 43 passed.
 - `git diff --check` verde.
+
+---
+
+## FASE 10.1.4.5 — Shipping Options V0 — 2026-05-07
+
+### Backend
+
+- Aggiunta tabella `deal_shipping_selections` per la scelta strutturata del
+  metodo di spedizione senza duplicare il lifecycle logistico gia presente su
+  `deals.shipping_status`.
+- Aggiunta migrazione Alembic
+  `6b4f2c91a0d2_deal_shipping_selection.py`.
+- Aggiunto policy service deterministico:
+  `app/services/deal_shipping_policy_service.py`.
+- Regole V0 hard-coded per:
+  - `pickup`
+  - `untracked_letter`
+  - `registered_letter`
+  - `tracked_parcel`
+  - `insured_tracked_parcel`
+- Aggiunti endpoint:
+  - `GET /api/deals/{deal_id}/shipping-options`
+  - `POST /api/deals/{deal_id}/shipping-method`
+- `GET /api/deals/{deal_id}/trade-window` ora include:
+  - `selected_shipping_method`
+  - `shipping_required_action`
+  - `next_required_action` aggiornato su `select_shipping_method` prima della
+    preparazione spedizione.
+- `mark_shipped` richiede un metodo di spedizione gia selezionato.
+- Audit aggiunto:
+  - `shipping_method_selected`
+
+### Test
+
+- Pending deal non puo leggere shipping options.
+- Party su deal confermato puo leggere shipping options.
+- Non-party non puo leggere o selezionare shipping options.
+- Low-value card deal abilita `untracked_letter`.
+- Sopra 25 EUR `untracked_letter` viene disabilitata con reason.
+- Electronics sotto soglia alta raccomanda `tracked_parcel`.
+- Selezione metodo consentito persistita e idempotente.
+- Metodo disabilitato fallisce con `shipping_method_not_allowed`.
+- Metodo selezionato appare nella Trade Window.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app
+uv run pytest backend/tests/test_deal.py
+git diff --check
+```
+
+Risultati:
+
+- Compileall verde.
+- `backend/tests/test_deal.py`: 54 passed.

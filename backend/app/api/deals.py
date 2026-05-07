@@ -16,6 +16,7 @@ Ten endpoints, all `tier ≥ 2`:
 from __future__ import annotations
 
 import base64
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Literal
 
@@ -30,6 +31,7 @@ from app.core.security import CurrentUser, require_tier
 from app.services import (
     deal_message_service,
     deal_service,
+    deal_shipping_policy_service,
     deal_trade_window_service,
 )
 from app.services.mandate_service import WebAuthnAssertionPayload
@@ -118,6 +120,22 @@ class DealListResponse(BaseModel):
     offset: int
 
 
+class SelectedShippingMethodResponse(BaseModel):
+    method_code: str
+    method_label: str
+    method_description: str
+    price_cents: int
+    currency: str
+    paid_by: Literal["buyer", "seller", "included"]
+    tracking_required: bool
+    insurance_available: bool
+    insurance_required: bool
+    recommended: bool
+    risk_level: str
+    selected_by_user_id: str
+    selected_at: datetime
+
+
 class TradeWindowResponse(BaseModel):
     deal_id: str
     status: str
@@ -128,6 +146,8 @@ class TradeWindowResponse(BaseModel):
     expires_at: datetime | None
     shipping_status: str
     next_required_action: str
+    shipping_required_action: str
+    selected_shipping_method: SelectedShippingMethodResponse | None
     tracking_reference: str | None
     shipped_at: datetime | None
     delivered_at: datetime | None
@@ -137,6 +157,34 @@ class TradeWindowResponse(BaseModel):
 class TradeWindowActionRequest(BaseModel):
     action: Literal["mark_shipped", "mark_delivered", "mark_completed"]
     tracking_reference: str | None = Field(default=None, max_length=120)
+
+
+class ShippingOptionResponse(BaseModel):
+    code: str
+    label: str
+    description: str
+    price_cents: int
+    currency: str
+    tracking_required: bool
+    insurance_available: bool
+    insurance_required: bool
+    recommended: bool
+    allowed: bool
+    disabled_reason: str | None
+    risk_level: Literal["low", "medium", "high"]
+
+
+class ShippingOptionsResponse(BaseModel):
+    deal_id: str
+    agreed_price_cents: int
+    currency: str
+    selected_method: SelectedShippingMethodResponse | None
+    options: list[ShippingOptionResponse]
+
+
+class SelectShippingMethodRequest(BaseModel):
+    method_code: str = Field(min_length=1, max_length=50)
+    paid_by: Literal["buyer", "seller", "included"] = "buyer"
 
 
 class SendMessageRequest(BaseModel):
@@ -214,10 +262,26 @@ def _trade_window_to_response(state) -> TradeWindowResponse:
         expires_at=state.expires_at,
         shipping_status=state.shipping_status,
         next_required_action=state.next_required_action,
+        shipping_required_action=state.shipping_required_action,
+        selected_shipping_method=state.selected_shipping_method,
         tracking_reference=state.tracking_reference,
         shipped_at=state.shipped_at,
         delivered_at=state.delivered_at,
         completed_at=state.completed_at,
+    )
+
+
+def _shipping_options_to_response(state) -> ShippingOptionsResponse:
+    return ShippingOptionsResponse(
+        deal_id=state.deal_id,
+        agreed_price_cents=state.agreed_price_cents,
+        currency=state.currency,
+        selected_method=(
+            asdict(state.selected_method)
+            if state.selected_method is not None
+            else None
+        ),
+        options=[asdict(option) for option in state.options],
     )
 
 
@@ -305,6 +369,45 @@ async def trade_window_action_endpoint(
     except deal_service.DealError as exc:
         raise _to_http(exc) from exc
     return _trade_window_to_response(state)
+
+
+@router.get("/{deal_id}/shipping-options", response_model=ShippingOptionsResponse)
+@limiter.limit(lambda: settings.rate_limit_user_read, key_func=user_key)
+async def get_shipping_options_endpoint(
+    request: Request,
+    deal_id: str,
+    user: CurrentUser = Depends(require_tier(2)),
+    db: AsyncSession = Depends(get_db),
+) -> ShippingOptionsResponse:
+    try:
+        state = await deal_shipping_policy_service.get_shipping_options_for_user(
+            db, user_id=user.user_id, deal_id=deal_id
+        )
+    except deal_service.DealError as exc:
+        raise _to_http(exc) from exc
+    return _shipping_options_to_response(state)
+
+
+@router.post("/{deal_id}/shipping-method", response_model=ShippingOptionsResponse)
+@limiter.limit(lambda: settings.rate_limit_post_strict, key_func=user_key)
+async def select_shipping_method_endpoint(
+    request: Request,
+    deal_id: str,
+    body: SelectShippingMethodRequest,
+    user: CurrentUser = Depends(require_tier(2)),
+    db: AsyncSession = Depends(get_db),
+) -> ShippingOptionsResponse:
+    try:
+        state = await deal_shipping_policy_service.select_shipping_method_for_user(
+            db,
+            user_id=user.user_id,
+            deal_id=deal_id,
+            method_code=body.method_code,
+            paid_by=body.paid_by,
+        )
+    except deal_service.DealError as exc:
+        raise _to_http(exc) from exc
+    return _shipping_options_to_response(state)
 
 
 @router.post("/{deal_id}/sign/draft", response_model=SignDraftResponse)

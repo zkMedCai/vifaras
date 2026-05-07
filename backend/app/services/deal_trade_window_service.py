@@ -8,15 +8,15 @@ an unbounded workflow container.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.schema import Deal, Intent
-from app.services import audit_service, deal_service
+from app.models.schema import Deal, DealShippingSelection, Intent
+from app.services import audit_service, deal_service, deal_shipping_policy_service
 
 TRADE_WINDOW_STATUS_OPEN: Final[str] = "trade_window_open"
 TRADE_WINDOW_STATUS_COMPLETED: Final[str] = "trade_window_completed"
@@ -53,6 +53,8 @@ class TradeWindowState:
     expires_at: datetime | None
     shipping_status: str
     next_required_action: str
+    shipping_required_action: str
+    selected_shipping_method: dict[str, Any] | None
     tracking_reference: str | None
     shipped_at: datetime | None
     delivered_at: datetime | None
@@ -83,15 +85,26 @@ def _trade_window_status(deal: Deal) -> str:
     return TRADE_WINDOW_STATUS_OPEN
 
 
-def _next_required_action(*, deal: Deal, user_id: str) -> str:
+async def _selected_shipping_for_deal(
+    db: AsyncSession, *, deal_id: str
+) -> DealShippingSelection | None:
+    return await db.scalar(
+        select(DealShippingSelection).where(DealShippingSelection.deal_id == deal_id)
+    )
+
+
+def _next_required_action(
+    *,
+    deal: Deal,
+    user_id: str,
+    selected_shipping_method: dict[str, Any] | None,
+) -> str:
     status = _shipping_status(deal)
     role = _role_for_user(deal=deal, user_id=user_id)
     if status == SHIPPING_STATUS_PENDING:
-        return (
-            "seller_prepare_shipping"
-            if role == "seller"
-            else "wait_for_seller_shipping"
-        )
+        if selected_shipping_method is None:
+            return "select_shipping_method"
+        return "prepare_shipment" if role == "seller" else "wait_for_seller_shipping"
     if status == SHIPPING_STATUS_SHIPPED:
         return (
             "buyer_confirm_delivery"
@@ -165,6 +178,18 @@ async def _state_from_deal(
 ) -> TradeWindowState:
     buy_intent = await db.get(Intent, deal.buy_intent_id)
     sell_intent = await db.get(Intent, deal.sell_intent_id)
+    selected = await _selected_shipping_for_deal(db, deal_id=deal.id)
+    selected_shipping_method = deal_shipping_policy_service.selection_to_method(selected)
+    selected_shipping_dict = (
+        asdict(selected_shipping_method)
+        if selected_shipping_method is not None
+        else None
+    )
+    next_required_action = _next_required_action(
+        deal=deal,
+        user_id=user_id,
+        selected_shipping_method=selected_shipping_dict,
+    )
 
     return TradeWindowState(
         deal_id=deal.id,
@@ -177,7 +202,9 @@ async def _state_from_deal(
         confirmed_at=deal.confirmed_at,
         expires_at=None,
         shipping_status=_shipping_status(deal),
-        next_required_action=_next_required_action(deal=deal, user_id=user_id),
+        next_required_action=next_required_action,
+        shipping_required_action=next_required_action,
+        selected_shipping_method=selected_shipping_dict,
         tracking_reference=deal.tracking_reference,
         shipped_at=deal.shipped_at,
         delivered_at=deal.delivered_at,
@@ -228,6 +255,11 @@ async def apply_trade_window_action(
         if current != SHIPPING_STATUS_PENDING:
             raise InvalidTradeWindowTransition(
                 f"cannot mark shipped from shipping_status={current!r}"
+            )
+        selected_shipping = await _selected_shipping_for_deal(db, deal_id=deal.id)
+        if selected_shipping is None:
+            raise InvalidTradeWindowTransition(
+                "cannot mark shipped before a shipping method is selected"
             )
         deal.shipping_status = SHIPPING_STATUS_SHIPPED
         deal.shipped_at = now

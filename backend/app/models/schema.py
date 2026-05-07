@@ -471,6 +471,39 @@ class Deal(Base):
     idempotency_key = Column(Text, unique=True, nullable=False)
 
 
+class DealShippingSelection(Base):
+    """Structured shipping method selected inside the Trade Window.
+
+    `Deal.shipping_status` remains the single source of truth for the
+    operational lifecycle. This table stores the selected method and the
+    deterministic V0 policy snapshot used when the user selected it.
+    """
+
+    __tablename__ = "deal_shipping_selections"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    deal_id = Column(UUID(as_uuid=False), ForeignKey("deals.id"), nullable=False, unique=True)
+
+    method_code = Column(String(50), nullable=False)
+    method_label = Column(Text, nullable=False)
+    method_description = Column(Text, nullable=False)
+    price_cents = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False, default="EUR", server_default=text("'EUR'"))
+    paid_by = Column(String(10), nullable=False)
+
+    tracking_required = Column(Boolean, nullable=False)
+    insurance_available = Column(Boolean, nullable=False)
+    insurance_required = Column(Boolean, nullable=False)
+    recommended = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    risk_level = Column(String(10), nullable=False)
+
+    selected_by_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    selected_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+    updated_at = Column(DateTime, nullable=True)
+    policy_snapshot = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+
+
 class DealSignatureDraft(Base):
     """Pending WebAuthn-bound signature draft for a Deal action (5.3).
 

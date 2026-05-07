@@ -93,6 +93,7 @@ class DealActions:
     TRADE_SHIPPING_MARKED: Final[str] = "trade_shipping_marked"
     TRADE_DELIVERED: Final[str] = "trade_delivered"
     TRADE_COMPLETED: Final[str] = "trade_completed"
+    SHIPPING_METHOD_SELECTED: Final[str] = "shipping_method_selected"
     DISPUTE: Final[str] = "dispute_deal"
     COMPLETE: Final[str] = "complete_deal"
     CANCEL: Final[str] = "cancel_deal"
