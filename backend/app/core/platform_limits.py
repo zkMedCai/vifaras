@@ -81,6 +81,10 @@ V0_DEFAULT_ALLOWED_ACTIONS: Final[tuple[str, ...]] = (
     "send_message",
     "read_inbox",
     "check_state",
+    "check_capital_mandate",
+    "evaluate_flip_opportunity",
+    "accept_offer_under_capital_mandate",
+    "list_capital_positions",
 )
 
 

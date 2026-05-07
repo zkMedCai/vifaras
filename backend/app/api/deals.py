@@ -96,6 +96,12 @@ class DealDetailResponse(BaseModel):
     status: str
     buyer_signed_at: datetime | None
     seller_signed_at: datetime | None
+    buyer_authorization_method: str | None = None
+    seller_authorization_method: str | None = None
+    buyer_capital_mandate_id: str | None = None
+    seller_capital_mandate_id: str | None = None
+    buyer_authorized_at: datetime | None = None
+    seller_authorized_at: datetime | None = None
     expires_at: datetime
     confirmed_at: datetime | None
     cancelled_at: datetime | None
@@ -231,6 +237,12 @@ def _deal_to_detail(deal) -> DealDetailResponse:
         status=deal.status,
         buyer_signed_at=deal.buyer_signed_at,
         seller_signed_at=deal.seller_signed_at,
+        buyer_authorization_method=deal.buyer_authorization_method,
+        seller_authorization_method=deal.seller_authorization_method,
+        buyer_capital_mandate_id=deal.buyer_capital_mandate_id,
+        seller_capital_mandate_id=deal.seller_capital_mandate_id,
+        buyer_authorized_at=deal.buyer_authorized_at,
+        seller_authorized_at=deal.seller_authorized_at,
         expires_at=deal.expires_at,
         confirmed_at=deal.confirmed_at,
         cancelled_at=deal.cancelled_at,

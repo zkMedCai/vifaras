@@ -61,6 +61,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.schema import Agent, Mandate, User
 from app.services import (
     agent_state_service,
+    capital_ledger_service,
+    capital_mandate_service,
+    capital_mandate_verifier,
     inbox_service,
     intent_service,
     match_service,
@@ -195,6 +198,68 @@ AGENT_TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["negotiation_id"],
+        },
+    },
+    {
+        "name": "check_capital_mandate",
+        "description": (
+            "Verifica se esiste un mandato budget operativo attivo per "
+            "l'agente e ritorna budget disponibile, limiti e categorie."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "evaluate_flip_opportunity",
+        "description": (
+            "Valuta deterministicamente se un'opportunità di acquisto/rivendita "
+            "rientra nel mandato capitale attivo."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "match_id": {"type": "string"},
+                "intent_id": {"type": "string"},
+                "expected_buy_price_cents": {"type": "integer", "minimum": 1},
+                "expected_resale_price_cents": {"type": "integer", "minimum": 1},
+                "category": {"type": "string"},
+                "rationale": {"type": "string", "maxLength": 500},
+            },
+            "required": [
+                "expected_buy_price_cents",
+                "expected_resale_price_cents",
+                "category",
+            ],
+        },
+    },
+    {
+        "name": "accept_offer_under_capital_mandate",
+        "description": (
+            "Accetta un'offerta usando il mandato capitale operativo, senza "
+            "step-up deal-by-deal se rientra in budget e limiti."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "negotiation_id": {"type": "string"},
+                "proposal_price_cents": {"type": "integer", "minimum": 1},
+                "expected_resale_price_cents": {"type": "integer", "minimum": 1},
+                "category": {"type": "string"},
+                "reason": {"type": "string", "maxLength": 500},
+                "proposal_hash": {"type": "string"},
+            },
+            "required": [
+                "negotiation_id",
+                "proposal_price_cents",
+                "category",
+            ],
+        },
+    },
+    {
+        "name": "list_capital_positions",
+        "description": "Lista le posizioni aperte/chiuse del mandato capitale.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
         },
     },
     {
@@ -391,18 +456,19 @@ class AsyncToolHandler:
         try:
             data = await method(params)
         except Exception as exc:
+            error_code = getattr(exc, "code", "execution_error")
             await self.verifier.record_usage_async(
                 mandate,
                 tool_name,
                 params,
                 success=False,
                 result={"error": str(exc)},
-                error_code="execution_error",
+                error_code=error_code,
             )
             return ToolResult(
                 status="error",
                 error=str(exc),
-                error_code="execution_error",
+                error_code=error_code,
             )
 
         # 3. Record usage on success.
@@ -428,6 +494,12 @@ class AsyncToolHandler:
             "send_offer": self._send_offer,
             "send_counter_offer": self._send_counter_offer,
             "accept_offer": self._accept_offer,
+            "check_capital_mandate": self._check_capital_mandate,
+            "evaluate_flip_opportunity": self._evaluate_flip_opportunity,
+            "accept_offer_under_capital_mandate": (
+                self._accept_offer_under_capital_mandate
+            ),
+            "list_capital_positions": self._list_capital_positions,
             "reject_offer": self._reject_offer,
             "check_state": self._check_state,
             "read_inbox": self._read_inbox,
@@ -557,6 +629,189 @@ class AsyncToolHandler:
             "next_step": result.next_step,
             "proposal_hash": result.proposal_hash,
             "canonical_terms_snapshot": result.canonical_terms_snapshot,
+        }
+
+    async def _check_capital_mandate(self, params: dict) -> dict:
+        user_id = await self._get_user_id()
+        active = await capital_mandate_service.get_active_capital_mandate(
+            self.db, user_id=user_id, agent_id=self.agent_id
+        )
+        if active.mandate is None:
+            return {"active": False}
+        mandate = active.mandate
+        return {
+            "active": True,
+            "capital_mandate_id": mandate.id,
+            "budget_total": mandate.budget_total_cents,
+            "available_budget": active.budget_state["available_cents"],
+            "expires_at": mandate.expires_at.isoformat() + "Z",
+            "allowed_categories": mandate.allowed_categories,
+            "max_single_purchase": mandate.max_single_purchase_cents,
+            "max_open_positions": mandate.max_open_positions,
+            "risk_level": mandate.risk_level,
+            "positions_summary": active.positions_summary,
+        }
+
+    async def _evaluate_flip_opportunity(self, params: dict) -> dict:
+        return await capital_mandate_verifier.evaluate_buy_opportunity(
+            self.db,
+            agent_id=self.agent_id,
+            expected_buy_price_cents=int(params["expected_buy_price_cents"]),
+            expected_resale_price_cents=(
+                int(params["expected_resale_price_cents"])
+                if params.get("expected_resale_price_cents") is not None
+                else None
+            ),
+            category=params.get("category"),
+        )
+
+    async def _accept_offer_under_capital_mandate(self, params: dict) -> dict:
+        user_id = await self._get_user_id()
+        from app.models.schema import Intent, Match, Negotiation
+        from app.services import deal_service
+
+        active = await capital_mandate_service.get_active_capital_mandate(
+            self.db, user_id=user_id, agent_id=self.agent_id
+        )
+        if active.mandate is None:
+            raise capital_mandate_verifier.NoActiveCapitalMandate(
+                f"agent {self.agent_id!r} has no active capital mandate"
+            )
+
+        nego = await self.db.get(Negotiation, params["negotiation_id"])
+        if nego is None:
+            raise negotiation_service.NegotiationNotFound(
+                f"negotiation {params['negotiation_id']!r} not found"
+            )
+        turns = (nego.state or {}).get("turns") or []
+        if not turns:
+            raise negotiation_service.NoOfferToAccept("no offer to accept")
+        latest_terms = turns[-1].get("canonical_terms_snapshot") or {}
+        latest_price = int(
+            latest_terms.get("item_price_cents")
+            or turns[-1].get("price_cents")
+            or 0
+        )
+        proposal_price = int(params["proposal_price_cents"])
+        if latest_price != proposal_price:
+            raise negotiation_service.ProposalHashMismatch(
+                "proposal_price_cents does not match the latest offer"
+            )
+
+        match = await self.db.get(Match, nego.match_id)
+        if match is None:
+            raise negotiation_service.MatchNotFoundForNegotiation(
+                f"match {nego.match_id!r} not found"
+            )
+        buy_intent = await self.db.get(Intent, match.buy_intent_id)
+        sell_intent = await self.db.get(Intent, match.sell_intent_id)
+        if buy_intent is None or sell_intent is None:
+            raise negotiation_service.MatchNotFoundForNegotiation(
+                "match references missing intent"
+            )
+        is_buyer_side = buy_intent.user_id == user_id
+        is_seller_side = sell_intent.user_id == user_id
+        if not is_buyer_side and not is_seller_side:
+            raise negotiation_service.AgentNotPartyToMatch(
+                "agent owner is not party to match"
+            )
+
+        expected_resale = (
+            int(params["expected_resale_price_cents"])
+            if params.get("expected_resale_price_cents") is not None
+            else None
+        )
+        category = params.get("category") or sell_intent.category or buy_intent.category
+        if is_buyer_side:
+            await capital_mandate_verifier.authorize_auto_buy(
+                self.db,
+                agent_id=self.agent_id,
+                amount_cents=proposal_price,
+                expected_resale_price_cents=expected_resale,
+                category=category,
+            )
+        else:
+            await capital_mandate_verifier.authorize_auto_sell(
+                self.db,
+                agent_id=self.agent_id,
+                category=category,
+            )
+
+        accepted = await negotiation_service.accept_offer(
+            self.db,
+            user_id=user_id,
+            agent_id=self.agent_id,
+            negotiation_id=params["negotiation_id"],
+            proposal_hash=params.get("proposal_hash"),
+        )
+        if accepted.deal_id is None:
+            raise RuntimeError("accept_offer did not create a deal")
+
+        authorization = await deal_service.authorize_deal_side_with_capital_mandate(
+            self.db,
+            user_id=user_id,
+            agent_id=self.agent_id,
+            deal_id=accepted.deal_id,
+            capital_mandate_id=active.mandate.id,
+            expected_resale_price_cents=expected_resale,
+            category=category,
+            reason=params.get("reason") or "accept_offer_under_capital_mandate",
+        )
+        refreshed = await capital_ledger_service.compute_budget_state(
+            self.db, capital_mandate_id=active.mandate.id
+        )
+        return {
+            "deal_id": accepted.deal_id,
+            "agreed_price_cents": accepted.agreed_price_cents,
+            "capital_mandate_id": active.mandate.id,
+            "authorization_method": "capital_mandate",
+            "authorized_role": authorization.role,
+            "deal_confirmed": authorization.deal_confirmed,
+            "confirmed_at": (
+                authorization.confirmed_at.isoformat() + "Z"
+                if authorization.confirmed_at is not None
+                else None
+            ),
+            "position_id": authorization.position_id,
+            "budget_state": refreshed.to_dict(),
+            "next_step": (
+                "trade_window_open"
+                if authorization.deal_confirmed
+                else "counterparty_signature_required"
+            ),
+        }
+
+    async def _list_capital_positions(self, params: dict) -> dict:
+        user_id = await self._get_user_id()
+        active = await capital_mandate_service.get_active_capital_mandate(
+            self.db, user_id=user_id, agent_id=self.agent_id
+        )
+        if active.mandate is None:
+            return {"positions": []}
+        rows = await capital_mandate_service.list_positions_for_user(
+            self.db,
+            user_id=user_id,
+            capital_mandate_id=active.mandate.id,
+        )
+        status = params.get("status")
+        if status:
+            rows = [row for row in rows if row.status == status]
+        return {
+            "positions": [
+                {
+                    "position_id": row.id,
+                    "status": row.status,
+                    "source_buy_deal_id": row.source_buy_deal_id,
+                    "resale_sell_deal_id": row.resale_sell_deal_id,
+                    "item_snapshot": row.item_snapshot,
+                    "purchase_price_cents": row.purchase_price_cents,
+                    "expected_resale_price_cents": row.expected_resale_price_cents,
+                    "expected_profit_cents": row.expected_profit_cents,
+                    "expected_margin_bps": row.expected_margin_bps,
+                    "created_at": row.created_at.isoformat() + "Z",
+                }
+                for row in rows
+            ]
         }
 
     async def _reject_offer(self, params: dict) -> dict:

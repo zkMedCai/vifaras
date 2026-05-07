@@ -69,6 +69,10 @@ _TOOL_SPAN_NAMES: dict[str, str] = {
     "send_counter_offer": "agent.negotiation",
     "reject_offer": "agent.negotiation",
     "accept_offer": "agent.signing",
+    "accept_offer_under_capital_mandate": "agent.signing",
+    "check_capital_mandate": "agent.capital",
+    "evaluate_flip_opportunity": "agent.capital",
+    "list_capital_positions": "agent.capital",
 }
 
 
@@ -441,7 +445,7 @@ class AgentOrchestrator:
         Personalised: mandate limits / remaining capacity / pseudonym
         get interpolated. The prompt teaches Claude:
           1. Who it is (agent for a verified user).
-          2. The 9 tools and their result shape.
+          2. The available tools and their result shape.
           3. The 4 ToolResult statuses and the right reaction.
           4. Negotiation strategy + when to stop.
         """
@@ -482,12 +486,16 @@ class AgentOrchestrator:
 4. Step-up is normal. The user signs offline; you cannot sign anything yourself.
 5. Never include personally identifying information (names, addresses, phone numbers) in offer messages — communication is pseudonymous.
 
-# THE 9 TOOLS
+# THE TOOLS
 - `create_intent` — post a new buy/sell intent
 - `search_matches` — find compatible counterparts for one of your intents
 - `send_offer` — start a negotiation with a matched counterpart
 - `send_counter_offer` — respond to an offer with a counter-proposal
 - `accept_offer` — finalize a negotiation (creates a pending Deal)
+- `check_capital_mandate` — inspect any active operational budget mandate
+- `evaluate_flip_opportunity` — check if a buy/resale opportunity fits capital policy
+- `accept_offer_under_capital_mandate` — accept using an active capital mandate when within limits
+- `list_capital_positions` — inspect inventory/positions opened under capital mandate
 - `reject_offer` — definitively decline a negotiation
 - `read_inbox` — read recent events since last tick
 - `check_state` — re-read your full state (use sparingly; already provided)

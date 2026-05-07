@@ -98,6 +98,7 @@ class Agent(Base):
 
     user = relationship("User", back_populates="agents")
     mandates = relationship("Mandate", back_populates="agent")
+    capital_mandates = relationship("CapitalMandate", back_populates="agent")
 
 
 class Mandate(Base):
@@ -138,6 +139,7 @@ class Mandate(Base):
     
     user = relationship("User", back_populates="mandates")
     agent = relationship("Agent", back_populates="mandates")
+    capital_mandates = relationship("CapitalMandate", back_populates="base_mandate")
 
 
 class MandateDraft(Base):
@@ -178,6 +180,152 @@ class MandateDraft(Base):
 
     __table_args__ = (
         Index("ix_mandate_drafts_user_expires", "user_id", "expires_at"),
+    )
+
+
+class CapitalMandate(Base):
+    """Operational capital mandate layered on top of the base agent mandate.
+
+    V0 is policy/authorization/ledger only: no custody, wallet, PSP, escrow,
+    payout, refund, or promised return lives in this table.
+    """
+
+    __tablename__ = "capital_mandates"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+    base_mandate_id = Column(UUID(as_uuid=False), ForeignKey("mandates.id"), nullable=False)
+
+    status = Column(
+        String(20),
+        nullable=False,
+        default="active",
+        server_default=text("'active'"),
+    )
+    # draft | active | paused | expired | revoked | settled
+
+    budget_total_cents = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False, default="EUR", server_default=text("'EUR'"))
+    starts_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    duration_days = Column(Integer, nullable=False, default=30, server_default=text("30"))
+
+    max_single_purchase_cents = Column(BigInteger, nullable=False)
+    max_open_positions = Column(Integer, nullable=False)
+    max_daily_deals = Column(Integer, nullable=True)
+    min_expected_margin_bps = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    max_total_loss_cents = Column(BigInteger, nullable=True)
+    risk_level = Column(String(10), nullable=False, default="medium", server_default=text("'medium'"))
+
+    auto_buy = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    auto_sell = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    auto_relist = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    requires_manual_approval = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+
+    allowed_categories = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    forbidden_categories = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    geo_scope = Column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    constraints = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+
+    signature = Column(JSONB, nullable=False)
+    canonical_payload = Column(Text, nullable=False)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+    activated_at = Column(DateTime, nullable=True)
+    paused_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revocation_reason = Column(Text, nullable=True)
+    settled_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
+    agent = relationship("Agent", back_populates="capital_mandates")
+    base_mandate = relationship("Mandate", back_populates="capital_mandates")
+
+    __table_args__ = (
+        Index("ix_capital_mandates_user_status", "user_id", "status"),
+        Index("ix_capital_mandates_agent_status", "agent_id", "status"),
+    )
+
+
+class CapitalMandateDraft(Base):
+    """Pending passkey signature draft for an operational capital mandate."""
+
+    __tablename__ = "capital_mandate_drafts"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+    base_mandate_id = Column(UUID(as_uuid=False), ForeignKey("mandates.id"), nullable=False)
+
+    canonical_payload = Column(LargeBinary, nullable=False)
+    challenge = Column(LargeBinary, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    consumed = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_capital_mandate_drafts_user_expires", "user_id", "expires_at"),
+    )
+
+
+class CapitalPosition(Base):
+    """Inventory/position skeleton for items operated under a capital mandate."""
+
+    __tablename__ = "capital_positions"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    capital_mandate_id = Column(UUID(as_uuid=False), ForeignKey("capital_mandates.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+
+    source_buy_deal_id = Column(UUID(as_uuid=False), ForeignKey("deals.id"), nullable=True)
+    resale_sell_deal_id = Column(UUID(as_uuid=False), ForeignKey("deals.id"), nullable=True)
+    item_snapshot = Column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+
+    status = Column(String(40), nullable=False, default="opportunity_found", server_default=text("'opportunity_found'"))
+    purchase_price_cents = Column(BigInteger, nullable=True)
+    expected_resale_price_cents = Column(BigInteger, nullable=True)
+    expected_profit_cents = Column(BigInteger, nullable=True)
+    expected_margin_bps = Column(Integer, nullable=True)
+    realized_sale_price_cents = Column(BigInteger, nullable=True)
+    realized_profit_cents = Column(BigInteger, nullable=True)
+    risk_score = Column(Numeric(5, 2), nullable=True)
+    confidence = Column(Numeric(5, 2), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+    updated_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_capital_positions_mandate_status", "capital_mandate_id", "status"),
+        Index("ix_capital_positions_user_status", "user_id", "status"),
+    )
+
+
+class CapitalLedgerEntry(Base):
+    """Append-only operational ledger for budget reservations and PnL events."""
+
+    __tablename__ = "capital_ledger_entries"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    capital_mandate_id = Column(UUID(as_uuid=False), ForeignKey("capital_mandates.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=False)
+    agent_id = Column(UUID(as_uuid=False), ForeignKey("agents.id"), nullable=False)
+    deal_id = Column(UUID(as_uuid=False), ForeignKey("deals.id"), nullable=True)
+    position_id = Column(UUID(as_uuid=False), ForeignKey("capital_positions.id"), nullable=True)
+
+    type = Column(String(40), nullable=False)
+    amount_cents = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False, default="EUR", server_default=text("'EUR'"))
+    reason = Column(Text, nullable=False)
+    entry_metadata = Column("metadata", JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    idempotency_key = Column(Text, nullable=False, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_capital_ledger_mandate_created", "capital_mandate_id", "created_at"),
+        Index("ix_capital_ledger_user_created", "user_id", "created_at"),
     )
 
 
@@ -432,6 +580,16 @@ class Deal(Base):
     buyer_signed_at = Column(DateTime, nullable=True)
     seller_signature = Column(JSONB, nullable=True)
     seller_signed_at = Column(DateTime, nullable=True)
+
+    # Autonomous Capital Mandate authorization. These fields do not pretend
+    # to be WebAuthn signatures; they record explicit policy authorization
+    # for one side when a valid capital mandate covers the action.
+    buyer_authorization_method = Column(String(20), nullable=True)
+    seller_authorization_method = Column(String(20), nullable=True)
+    buyer_capital_mandate_id = Column(UUID(as_uuid=False), ForeignKey("capital_mandates.id"), nullable=True)
+    seller_capital_mandate_id = Column(UUID(as_uuid=False), ForeignKey("capital_mandates.id"), nullable=True)
+    buyer_authorized_at = Column(DateTime, nullable=True)
+    seller_authorized_at = Column(DateTime, nullable=True)
 
     status = Column(
         String(20),

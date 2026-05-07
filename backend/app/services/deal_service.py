@@ -55,6 +55,7 @@ from app.core import canonicalization
 from app.core.config import settings
 from app.core.logging import log
 from app.models.schema import (
+    CapitalMandate,
     Deal,
     DealSignatureDraft,
     Intent,
@@ -155,6 +156,11 @@ class CannotCancelConfirmedDeal(DealError):
     http_status = 409
 
 
+class DealCapitalMandateInvalid(DealError):
+    code = "deal_capital_mandate_invalid"
+    http_status = 422
+
+
 # ---------------------------------------------------------------------------
 # Output dataclasses
 # ---------------------------------------------------------------------------
@@ -177,6 +183,17 @@ class SignSubmitResult:
     signed_at: datetime
     deal_confirmed: bool
     confirmed_at: datetime | None
+
+
+@dataclass
+class CapitalDealAuthorizationResult:
+    deal_id: str
+    role: str
+    authorized_at: datetime
+    capital_mandate_id: str
+    deal_confirmed: bool
+    confirmed_at: datetime | None
+    position_id: str | None
 
 
 @dataclass
@@ -238,6 +255,24 @@ def _has_signed(deal: Deal, role: str) -> bool:
     if role == "buyer":
         return deal.buyer_signature is not None
     return deal.seller_signature is not None
+
+
+def _side_authorized(deal: Deal, role: str) -> bool:
+    if role == "buyer":
+        return deal.buyer_signature is not None or (
+            deal.buyer_authorization_method == "capital_mandate"
+            and deal.buyer_capital_mandate_id is not None
+            and deal.buyer_authorized_at is not None
+        )
+    return deal.seller_signature is not None or (
+        deal.seller_authorization_method == "capital_mandate"
+        and deal.seller_capital_mandate_id is not None
+        and deal.seller_authorized_at is not None
+    )
+
+
+def _deal_fully_authorized(deal: Deal) -> bool:
+    return _side_authorized(deal, "buyer") and _side_authorized(deal, "seller")
 
 
 def _build_canonical_payload(
@@ -371,8 +406,8 @@ async def _create_signature_draft(
         )
 
     role = _role_for_user(deal=deal, user_id=user_id)
-    if kind == "sign" and _has_signed(deal, role):
-        raise AlreadySigned(f"{role} already signed deal {deal.id}")
+    if kind == "sign" and _side_authorized(deal, role):
+        raise AlreadySigned(f"{role} already authorized deal {deal.id}")
 
     user = await db.get(User, user_id)
     if user is None:  # pragma: no cover — FK invariant
@@ -518,8 +553,8 @@ async def submit_signature(
         db, user_id=user_id, draft_id=draft_id, expected_kind="sign"
     )
     role = draft.role  # set at draft creation time, authoritative
-    if _has_signed(deal, role):
-        raise AlreadySigned(f"{role} already signed")
+    if _side_authorized(deal, role):
+        raise AlreadySigned(f"{role} already authorized")
 
     new_sign_count = _verify_webauthn(
         assertion=assertion,
@@ -538,9 +573,7 @@ async def submit_signature(
         deal.seller_signature = sig_blob
         deal.seller_signed_at = signed_at
 
-    deal_confirmed = (
-        deal.buyer_signature is not None and deal.seller_signature is not None
-    )
+    deal_confirmed = _deal_fully_authorized(deal)
     if deal_confirmed:
         deal.status = "confirmed"
         deal.confirmed_at = signed_at
@@ -639,6 +672,233 @@ async def submit_signature(
         signed_at=signed_at,
         deal_confirmed=deal_confirmed,
         confirmed_at=deal.confirmed_at if deal_confirmed else None,
+    )
+
+
+async def _deal_category(
+    db: AsyncSession, *, deal: Deal, fallback_category: str | None
+) -> str:
+    if fallback_category:
+        return fallback_category
+    sell_intent = await db.get(Intent, deal.sell_intent_id)
+    if sell_intent is not None and sell_intent.category:
+        return sell_intent.category
+    buy_intent = await db.get(Intent, deal.buy_intent_id)
+    if buy_intent is not None and buy_intent.category:
+        return buy_intent.category
+    return "unknown"
+
+
+async def authorize_deal_side_with_capital_mandate(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    agent_id: str,
+    deal_id: str,
+    capital_mandate_id: str,
+    expected_resale_price_cents: int | None = None,
+    category: str | None = None,
+    reason: str | None = None,
+) -> CapitalDealAuthorizationResult:
+    """Pre-authorize one deal side through an active CapitalMandate.
+
+    This does not create or spoof a WebAuthn signature. It records an
+    explicit `*_authorization_method='capital_mandate'` marker and leaves
+    the other side to sign or be separately capital-authorized.
+    """
+    from app.services import (
+        capital_ledger_service,
+        capital_mandate_verifier,
+        capital_position_service,
+    )
+
+    deal = await db.scalar(select(Deal).where(Deal.id == deal_id).with_for_update())
+    if deal is None:
+        raise DealNotFound(f"deal {deal_id!r} not found")
+    if deal.status != "pending_signatures":
+        raise DealNotPending(
+            f"deal in status {deal.status!r}, not 'pending_signatures'"
+        )
+
+    role = _role_for_user(deal=deal, user_id=user_id)
+    if _side_authorized(deal, role):
+        existing_capital_id = (
+            deal.buyer_capital_mandate_id
+            if role == "buyer"
+            else deal.seller_capital_mandate_id
+        )
+        authorized_at = (
+            deal.buyer_authorized_at if role == "buyer" else deal.seller_authorized_at
+        )
+        if existing_capital_id == capital_mandate_id and authorized_at is not None:
+            return CapitalDealAuthorizationResult(
+                deal_id=deal.id,
+                role=role,
+                authorized_at=authorized_at,
+                capital_mandate_id=capital_mandate_id,
+                deal_confirmed=_deal_fully_authorized(deal),
+                confirmed_at=deal.confirmed_at,
+                position_id=None,
+            )
+        raise AlreadySigned(f"{role} already authorized")
+
+    mandate = await db.get(CapitalMandate, capital_mandate_id)
+    if (
+        mandate is None
+        or mandate.user_id != user_id
+        or mandate.agent_id != agent_id
+    ):
+        raise DealCapitalMandateInvalid("capital mandate does not cover this actor")
+
+    resolved_category = await _deal_category(
+        db, deal=deal, fallback_category=category
+    )
+    if role == "buyer":
+        authorization = await capital_mandate_verifier.authorize_auto_buy(
+            db,
+            agent_id=agent_id,
+            amount_cents=int(deal.agreed_price_cents),
+            expected_resale_price_cents=expected_resale_price_cents,
+            category=resolved_category,
+        )
+    else:
+        authorization = await capital_mandate_verifier.authorize_auto_sell(
+            db,
+            agent_id=agent_id,
+            category=resolved_category,
+        )
+    if authorization.capital_mandate.id != capital_mandate_id:
+        raise DealCapitalMandateInvalid("a different active capital mandate applies")
+
+    authorized_at = _utcnow()
+    position_id: str | None = None
+    if role == "buyer":
+        deal.buyer_authorization_method = "capital_mandate"
+        deal.buyer_capital_mandate_id = capital_mandate_id
+        deal.buyer_authorized_at = authorized_at
+        await capital_ledger_service.reserve_budget(
+            db,
+            capital_mandate_id=capital_mandate_id,
+            amount_cents=int(deal.agreed_price_cents),
+            deal_id=deal.id,
+            idempotency_key=f"capital_reserve_{capital_mandate_id}_{deal.id}",
+            reason=reason or "auto_buy_deal_authorized",
+            metadata={"role": role, "category": resolved_category},
+        )
+        position = await capital_position_service.create_position_from_buy_deal(
+            db,
+            capital_mandate_id=capital_mandate_id,
+            deal_id=deal.id,
+            expected_resale_price_cents=expected_resale_price_cents,
+            category=resolved_category,
+        )
+        position_id = position.id
+    else:
+        deal.seller_authorization_method = "capital_mandate"
+        deal.seller_capital_mandate_id = capital_mandate_id
+        deal.seller_authorized_at = authorized_at
+
+    deal_confirmed = _deal_fully_authorized(deal)
+    if deal_confirmed:
+        deal.status = "confirmed"
+        deal.confirmed_at = authorized_at
+
+    await audit_service.log_intent_event(
+        db,
+        user_id=user_id,
+        agent_id=agent_id,
+        mandate_id=mandate.base_mandate_id,
+        action=audit_service.DealActions.CAPITAL_MANDATE_AUTHORIZED,
+        params={
+            "deal_id": deal.id,
+            "role": role,
+            "capital_mandate_id": capital_mandate_id,
+        },
+        result={
+            "deal_confirmed": deal_confirmed,
+            "authorization_method": "capital_mandate",
+            "position_id": position_id,
+        },
+        success=True,
+    )
+    if deal_confirmed:
+        await audit_service.log_intent_event(
+            db,
+            user_id=user_id,
+            action=audit_service.DealActions.CONFIRM,
+            params={
+                "deal_id": deal.id,
+                "agreed_price_cents": deal.agreed_price_cents,
+            },
+            result={"status": "confirmed"},
+            success=True,
+        )
+        await audit_service.log_intent_event(
+            db,
+            user_id=user_id,
+            action=audit_service.DealActions.CHAT_UNLOCKED,
+            params={"deal_id": deal.id},
+            result={"status": "confirmed"},
+            success=True,
+        )
+        await audit_service.log_intent_event(
+            db,
+            user_id=user_id,
+            action=audit_service.DealActions.TRADE_WINDOW_OPEN,
+            params={"deal_id": deal.id},
+            result={
+                "status": "trade_window_open",
+                "shipping_status": "shipping_pending",
+            },
+            success=True,
+        )
+
+    await db.commit()
+
+    if deal_confirmed:
+        from app.core.metrics import DEALS_SIGNED_TOTAL
+
+        DEALS_SIGNED_TOTAL.inc()
+
+    from app.services import notification_service
+
+    if deal_confirmed:
+        for recipient in (deal.buyer_user_id, deal.seller_user_id):
+            await notification_service.create_notification(
+                db,
+                user_id=recipient,
+                notification_type=notification_service.NotificationType.DEAL_CONFIRMED,
+                title="Deal confermato",
+                body=(
+                    "Entrambe le parti sono autorizzate. Apri la chat per "
+                    "coordinare la consegna."
+                ),
+                payload={
+                    "deal_id": deal.id,
+                    "agreed_price_cents": deal.agreed_price_cents,
+                },
+            )
+    else:
+        other_user_id = (
+            deal.seller_user_id if role == "buyer" else deal.buyer_user_id
+        )
+        await notification_service.create_notification(
+            db,
+            user_id=other_user_id,
+            notification_type=notification_service.NotificationType.DEAL_OTHER_PARTY_SIGNED,
+            title="L'altra parte ha autorizzato il deal",
+            body="Manca solo la tua firma per completare il deal.",
+            payload={"deal_id": deal.id, "role_authorized": role},
+        )
+
+    return CapitalDealAuthorizationResult(
+        deal_id=deal.id,
+        role=role,
+        authorized_at=authorized_at,
+        capital_mandate_id=capital_mandate_id,
+        deal_confirmed=deal_confirmed,
+        confirmed_at=deal.confirmed_at if deal_confirmed else None,
+        position_id=position_id,
     )
 
 

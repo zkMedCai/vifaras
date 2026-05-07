@@ -94,6 +94,7 @@ class DealActions:
     TRADE_DELIVERED: Final[str] = "trade_delivered"
     TRADE_COMPLETED: Final[str] = "trade_completed"
     SHIPPING_METHOD_SELECTED: Final[str] = "shipping_method_selected"
+    CAPITAL_MANDATE_AUTHORIZED: Final[str] = "capital_mandate_deal_authorized"
     DISPUTE: Final[str] = "dispute_deal"
     COMPLETE: Final[str] = "complete_deal"
     CANCEL: Final[str] = "cancel_deal"

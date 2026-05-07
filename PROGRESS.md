@@ -3255,3 +3255,81 @@ Risultati:
 - Regression con `backend/tests/test_deal.py`: 113 passed complessivi sui tre
   file mirati.
 - Agent state/orchestrator regression: 49 passed.
+
+---
+
+## FASE 10.1.5 — Autonomous Capital Mandate V0 — 2026-05-07
+
+### Backend
+
+- Aggiunti modelli persistenti:
+  - `CapitalMandate`
+  - `CapitalMandateDraft`
+  - `CapitalLedgerEntry`
+  - `CapitalPosition`
+- Aggiunta migration Alembic `9f3a1d2e4b6c_autonomous_capital_mandate`.
+- Implementato signing passkey per mandato capitale con payload canonico.
+- Implementata budget policy V0 30 giorni:
+  - budget totale;
+  - massimo per singolo acquisto;
+  - massimo posizioni aperte;
+  - categorie consentite/vietate;
+  - margine minimo atteso;
+  - stato active/paused/revoked/expired.
+- Aggiunti service dedicati:
+  - `capital_mandate_service.py`
+  - `capital_mandate_verifier.py`
+  - `capital_ledger_service.py`
+  - `capital_position_service.py`
+- Ledger operativo append-only per budget riservato/committed/PnL V0.
+- Deal pre-authorization esplicita via `capital_mandate`, separata dalle
+  firme WebAuthn:
+  - `buyer_authorization_method`
+  - `seller_authorization_method`
+  - `buyer_capital_mandate_id`
+  - `seller_capital_mandate_id`
+  - `*_authorized_at`
+- Conferma deal aggiornata: un lato e autorizzato se ha firma WebAuthn oppure
+  autorizzazione valida da capital mandate.
+- Tool agentici aggiunti:
+  - `check_capital_mandate`
+  - `evaluate_flip_opportunity`
+  - `accept_offer_under_capital_mandate`
+  - `list_capital_positions`
+- API `/api/capital-mandates` aggiunta per draft, submit, active/detail,
+  pause/resume/revoke, ledger e positions.
+- Nessun denaro reale mosso: niente PSP, escrow, custody, payout, refund o
+  wallet reale.
+
+### Test
+
+- Draft e submit mandato capitale.
+- Budget/duration cap.
+- Active mandate read model.
+- Pause, expire e revoke bloccano autorizzazione.
+- Auto-buy entro limiti autorizzato.
+- Max single purchase, categoria e budget insufficienti bloccati.
+- Ledger reservation e idempotency.
+- `accept_offer_under_capital_mandate` pre-autorizza buyer side.
+- Deal resta pending se l'altro lato non e autorizzato.
+- Deal conferma quando l'altro lato firma.
+- `accept_offer` standard invariato.
+- Ledger e positions esposti via API.
+
+### Verifica
+
+```bash
+python3 -m compileall -q backend/app
+uv run pytest backend/tests/test_capital_mandate.py
+uv run pytest backend/tests/test_mandate*.py backend/tests/test_deal.py backend/tests/test_capital_mandate.py
+uv run pytest backend/tests/test_tool_layer.py backend/tests/test_agent_state.py backend/tests/test_orchestrator.py
+git diff --check
+```
+
+Risultati:
+
+- Compileall verde.
+- `backend/tests/test_capital_mandate.py`: 22 passed.
+- Regression mandate/deal/capital: 134 passed.
+- Tool layer / agent state / orchestrator: 75 passed.
+- `git diff --check` verde.

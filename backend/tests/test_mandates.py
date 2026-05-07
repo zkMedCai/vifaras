@@ -164,9 +164,9 @@ async def test_draft_creation_with_default_limits(
     assert payload["limits"]["max_total_volume_eur_per_mandate"] == 500
     assert payload["limits"]["max_deals_per_day"] == 3
     assert payload["constraints"]["geo_scope"] == ["IT"]
-    # 9 actions in V0_DEFAULT_ALLOWED_ACTIONS
-    assert len(payload["scope"]["allowed_actions"]) == 9
+    assert len(payload["scope"]["allowed_actions"]) == 13
     assert "send_offer" in payload["scope"]["allowed_actions"]
+    assert "accept_offer_under_capital_mandate" in payload["scope"]["allowed_actions"]
     assert "delete_account" in payload["scope"]["forbidden_actions"]
 
     # Italian summary present
@@ -333,7 +333,11 @@ async def test_submit_with_invalid_signature_fails(
     assert submit_resp.json()["detail"]["code"] == "webauthn_verification_failed"
 
     # Nothing committed: no mandate, agent still pending, user still tier=1, draft not consumed.
-    mandates = (await async_db_session.scalars(select(Mandate))).all()
+    mandates = (
+        await async_db_session.scalars(
+            select(Mandate).where(Mandate.user_id == user_id)
+        )
+    ).all()
     assert mandates == []
     agent = await async_db_session.scalar(select(Agent).where(Agent.id == agent_id))
     assert agent.status == "pending_mandate"

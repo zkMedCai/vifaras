@@ -14,6 +14,7 @@ from app.api import (
     _test_endpoints,
     agents as agents_routes,
     auth as auth_routes,
+    capital_mandates as capital_mandate_routes,
     deals as deal_routes,
     health as health_routes,
     identity as identity_routes,
@@ -107,6 +108,7 @@ app.include_router(auth_routes.router)
 app.include_router(identity_routes.router)
 app.include_router(agents_routes.router)
 app.include_router(mandate_routes.router)
+app.include_router(capital_mandate_routes.router)
 app.include_router(step_up_routes.router)
 app.include_router(intent_routes.router)
 app.include_router(market_routes.router)

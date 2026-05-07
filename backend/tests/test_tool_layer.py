@@ -857,9 +857,9 @@ async def test_step_up_persists_across_handlers(async_db_session) -> None:
 # ===========================================================================
 
 
-def test_agent_tools_schema_has_9_tools() -> None:
-    """Sanity smoke: 9 tools in AGENT_TOOLS, all with required fields."""
-    assert len(AGENT_TOOLS) == 9
+def test_agent_tools_schema_has_13_tools() -> None:
+    """Sanity smoke: 13 tools in AGENT_TOOLS, all with required fields."""
+    assert len(AGENT_TOOLS) == 13
     names = {t["name"] for t in AGENT_TOOLS}
     expected = {
         "create_intent",
@@ -867,6 +867,10 @@ def test_agent_tools_schema_has_9_tools() -> None:
         "send_offer",
         "send_counter_offer",
         "accept_offer",
+        "check_capital_mandate",
+        "evaluate_flip_opportunity",
+        "accept_offer_under_capital_mandate",
+        "list_capital_positions",
         "reject_offer",
         "check_state",
         "read_inbox",
